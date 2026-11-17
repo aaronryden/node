@@ -427,58 +427,52 @@ IndirectHandle<HeapObject> CloneCowBackingStore(Isolate* isolate,
                                                 std::vector<IndirectHandle<HeapObject>>* keep_alive) {
   Tagged<Map> map = src->map();
   uint16_t instance_type = map->instance_type();
-  int src_size = src->SizeFromMap(map);
+
+  // FixedArrays are variable-size: their map's instance_size() reports the
+  // kVariableSizeSentinel (0), so the slot count is read from the object
+  // itself — exactly what HeapObject::SizeFromMap does internally for these
+  // maps — rather than derived from the map.
+  const int src_length =
+      UncheckedCast<FixedArrayBase>(
+          HeapObject::FromAddress(src->address()))->length();
+  const int header = FixedArrayBase::kHeaderSize;
+  const int payload = src_length * kTaggedSize;
+  if (src_length <= 0 || payload > kMaxRegularHeapObjectSize) {
+    return IndirectHandle<HeapObject>();
+  }
 
   Factory* factory = isolate->factory();
   IndirectHandle<HeapObject> result;
 
   if (instance_type == FIXED_DOUBLE_ARRAY_TYPE) {
-    int header = FixedArrayBase::kHeaderSize;
-    if (src_size <= header) return IndirectHandle<HeapObject>();
-    if (src_size > kMaxRegularHeapObjectSize) return IndirectHandle<HeapObject>();
-    uint32_t length =
-        static_cast<uint32_t>((src_size - header) / kSystemPointerSize);
     IndirectHandle<FixedArrayBase> copy =
-        indirect_handle(factory->NewFixedDoubleArrayWithHoles(length));
+        indirect_handle(factory->NewFixedDoubleArrayWithHoles(src_length));
+    keep_alive->push_back(copy);
+    result = IndirectHandle<HeapObject>(copy);
+  } else if (instance_type == PROPERTY_ARRAY_TYPE) {
+    DirectHandle<PropertyArray> direct_copy =
+        factory->NewPropertyArray(src_length);
+    IndirectHandle<PropertyArray> copy = indirect_handle(direct_copy, isolate);
     keep_alive->push_back(copy);
     result = IndirectHandle<HeapObject>(copy);
   } else {
-    int header = FixedArrayBase::kHeaderSize;
-    if (src_size <= header) return IndirectHandle<HeapObject>();
-    if (src_size > kMaxRegularHeapObjectSize) return IndirectHandle<HeapObject>();
-    uint32_t length =
-        static_cast<uint32_t>((src_size - header) / kTaggedSize);
-
-    if (instance_type == PROPERTY_ARRAY_TYPE) {
-      DirectHandle<PropertyArray> direct_copy =
-          factory->NewPropertyArray(length);
-      IndirectHandle<PropertyArray> copy = indirect_handle(direct_copy, isolate);
-      keep_alive->push_back(copy);
-      result = IndirectHandle<HeapObject>(copy);
-    } else {
-      // Allocate a FixedArray copy using TryNewFixedArray.
-      MaybeHandle<FixedArray> try_copy =
-          factory->TryNewFixedArray(length, AllocationType::kYoung);
-      if (try_copy.is_null()) return IndirectHandle<HeapObject>();
-      // De-handle the allocated fixed array, wrapping it as IndirectHandle.
-      Tagged<FixedArray> fixed_array_obj = *try_copy.ToHandleChecked();
-      IndirectHandle<FixedArray> copy =
-          indirect_handle(DirectHandle<FixedArray>(fixed_array_obj, isolate));
-      keep_alive->push_back(copy);
-      result = IndirectHandle<HeapObject>(copy);
-    }
+    MaybeHandle<FixedArray> try_copy =
+        factory->TryNewFixedArray(src_length, AllocationType::kYoung);
+    if (try_copy.is_null()) return IndirectHandle<HeapObject>();
+    Tagged<FixedArray> fixed_array_obj = *try_copy.ToHandleChecked();
+    IndirectHandle<FixedArray> copy =
+        indirect_handle(DirectHandle<FixedArray>(fixed_array_obj, isolate));
+    keep_alive->push_back(copy);
+    result = IndirectHandle<HeapObject>(copy);
   }
 
-  // Copy from the handles' current addresses: allocation above may have moved
-  // either object. Copy the minimum of source payload and destination capacity.
-  int header = FixedArrayBase::kHeaderSize;
-  int src_payload = src_size - header;
-  int dst_capacity = result->map()->instance_size() - header;
-  int copy_size = std::min(src_payload, dst_capacity);
-  if (copy_size > 0) {
+  // Byte-copy the payload. Both copies have identical length, so the source
+  // payload and the destination capacity match exactly. Allocation above may
+  // have moved either object, so addresses come from the handles.
+  if (payload > 0) {
     std::memcpy(reinterpret_cast<void*>(result->address() + header),
                 reinterpret_cast<const void*>(src->address() + header),
-                static_cast<size_t>(copy_size));
+                static_cast<size_t>(payload));
   }
   return result;
 }
@@ -548,6 +542,9 @@ IndirectHandle<HeapObject> CloneObjectInternal(
     std::vector<IndirectHandle<HeapObject>>& keep_alive,
     int& budget, bool& out_of_budget) {
   Address src_addr = src->address();
+
+  Tagged<Map> m = src->map();
+  uint16_t it = m->instance_type();
 
   if (budget <= 0) {
     out_of_budget = true;
@@ -696,13 +693,34 @@ IndirectHandle<HeapObject> CloneObjectInternal(
   }
 
   // ---- Final phase: no allocation from here on, so no object can move ----
+  // Backing stores (FixedArray/PropertyArray) reference cloned objects from
+  // their payload slots; the recorded offsets are measured from the copy's own
+  // address, so write them back here. JS objects handle their in-object fields
+  // and elements/properties in the block below.
+  if (is_backing_store) {
+    for (const auto& entry : redirects) {
+      const IndirectHandle<HeapObject>& clone = entry.result;
+      if (clone.is_null()) continue;
+      if (clone->address() == entry.original) continue;
+      // Use the same slot type the scanner recorded (ObjectSlot adapts to the
+      // pointer-compression width), so the write matches the slot size. A
+      // FullObjectSlot would store kSystemPointerSize bytes into kTaggedSize
+      // slots, overflowing into the next object's header.
+      ObjectSlot(entry.offset + copy->address()).store(*clone);
+    }
+  }
+
   if (is_js_root) {
     IndirectHandle<JSObject> copy_js = UncheckedCast<JSObject>(copy);
     for (const auto& entry : redirects) {
       const IndirectHandle<HeapObject>& clone = entry.result;
       if (clone.is_null()) continue;
       if (clone->address() == entry.original) continue;
-      FullObjectSlot(entry.offset + copy->address()).store(*clone);
+      // Use the same slot type the scanner recorded (ObjectSlot adapts to the
+      // pointer-compression width), so the write matches the slot size. A
+      // FullObjectSlot would store kSystemPointerSize bytes into kTaggedSize
+      // slots, overflowing into the next object's header.
+      ObjectSlot(entry.offset + copy->address()).store(*clone);
     }
 
     // Re-set elements and properties from redirect results.

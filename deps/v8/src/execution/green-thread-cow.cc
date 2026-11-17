@@ -205,7 +205,16 @@ Address GreenThreadCow::Clone(Isolate* isolate, GreenThread* gt,
                               Address obj_ptr) {
   HeapRefTable* table = gt ? gt->cow_ref_table() : nullptr;
   if (!table) return obj_ptr;
-  return table->CloneObject(isolate, obj_ptr);
+  // Hold the nesting guard across the whole deep clone. Applying cloned
+  // references into the copies (and the allocation-driven store checks) can
+  // re-enter the write barrier; without the guard the barrier would treat the
+  // clone's own stores as external writes and re-clone objects mid-flight,
+  // doubling the ref-table entries and corrupting the copy. This mirrors the
+  // guard CowCheckBeforeStore sets around its own CloneObject call.
+  g_cow_nesting_depth++;
+  Address copy = table->CloneObject(isolate, obj_ptr);
+  g_cow_nesting_depth--;
+  return copy;
 }
 
 // Helper: get the COW-enabled green thread for this execution context.
