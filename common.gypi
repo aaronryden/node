@@ -86,6 +86,12 @@
     'v8_use_perfetto': 0,
     'tsan%': 0,
 
+    # Enable green threads with copy-on-write heap isolation.
+    # Sets -DV8_ENABLE_GREEN_THREADS. When on, the scheduler swaps green
+    # threads on the embedding thread and every COW write barrier rewrites
+    # pointers to the thread-local heap copy.
+    'v8_enable_green_threads%': 1,
+
     ##### end V8 defaults #####
 
     'conditions': [

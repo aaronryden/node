@@ -492,7 +492,8 @@ enum class IsolateFieldId : uint8_t;
   V(allocate_buffer, "AllocateBuffer")                                         \
   EXTERNAL_REFERENCE_LIST_INTL(V)                                              \
   EXTERNAL_REFERENCE_LIST_SANDBOX(V)                                           \
-  EXTERNAL_REFERENCE_LIST_CET_SHADOW_STACK(V)
+  EXTERNAL_REFERENCE_LIST_CET_SHADOW_STACK(V)  \
+  EXTERNAL_REFERENCE_LIST_GREEN_THREADS(V)
 
 #ifdef V8_INTL_SUPPORT
 #define EXTERNAL_REFERENCE_LIST_INTL(V)                               \
@@ -536,6 +537,14 @@ enum class IsolateFieldId : uint8_t;
 #else
 #define EXTERNAL_REFERENCE_LIST_CET_SHADOW_STACK(V)
 #endif  // V8_ENABLE_CET_SHADOW_STACK
+
+#ifdef V8_ENABLE_GREEN_THREADS
+#define EXTERNAL_REFERENCE_LIST_GREEN_THREADS(V)                         \
+  V(green_thread_cow_clone_if_needed,                                    \
+    "GreenThreadCow::CowCloneForGeneratedCode")
+#else
+#define EXTERNAL_REFERENCE_LIST_GREEN_THREADS(V)
+#endif  // V8_ENABLE_GREEN_THREADS
 
 // An ExternalReference represents a C++ address used in the generated
 // code. All references to C++ functions and variables must be encapsulated

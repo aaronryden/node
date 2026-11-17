@@ -1258,6 +1258,53 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
 
       break;
     case kArchStoreWithWriteBarrier: {
+#if V8_ENABLE_GREEN_THREADS
+      // Green thread COW: check if the stored value needs cloning.
+      // If so, clone it and use the copy for the store.
+      // We call the COW helper before the store, save the original for
+      // the write barrier (GC bookkeeping still needs the original).
+      if (frame_access_state()->has_frame() &&
+          GreenThreadCow::IsolateCowCapable(isolate())) {
+        RecordWriteMode mode = RecordWriteModeField::decode(instr->opcode());
+        DCHECK_NE(mode, RecordWriteMode::kValueIsIndirectPointer);
+        AddressingMode addressing_mode =
+            AddressingModeField::decode(instr->opcode());
+        Register object = i.InputRegister(0);
+        Operand offset(0);
+        if (addressing_mode == kMode_MRI) {
+          offset = Operand(i.InputInt64(1));
+        } else {
+          DCHECK_EQ(addressing_mode, kMode_MRR);
+          offset = Operand(i.InputRegister(1));
+        }
+        Register original_value = i.InputRegister(2);
+
+        // x19 is callee-saved, safe to use without saving across CallCFunction.
+        // x0: COW input/output. x19: save original value for write barrier.
+        __ Mov(x0, original_value);              // x0 = original tagged addr (COW input)
+        __ Mov(x19, original_value);             // x19 = save for write barrier (callee-saved)
+        __ CallCFunction(
+            ExternalReference::green_thread_cow_clone_if_needed(), 1, 0,
+            SetIsolateDataSlots::kYes, nullptr);
+        // x0 = copy address (or original if not cloned)
+
+        auto ool = zone()->New<OutOfLineRecordWrite>(
+            this, object, offset, x19, mode, DetermineStubCallMode(),
+            &unwinding_info_writer_);
+        RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
+
+        // Store the (possibly cloned) value.
+        __ StoreTaggedField(x0, MemOperand(object, offset));
+        if (mode > RecordWriteMode::kValueIsIndirectPointer) {
+          __ JumpIfSmi(x0, ool->exit());
+        }
+        __ CheckPageFlag(object, MemoryChunk::kPointersFromHereAreInterestingMask,
+                         ne, ool->entry());
+        __ Bind(ool->exit());
+        break;
+      }
+      // Fall through to normal write barrier if no frame or COW inactive.
+#endif
       RecordWriteMode mode = RecordWriteModeField::decode(instr->opcode());
       // Indirect pointer writes must use a different opcode.
       DCHECK_NE(mode, RecordWriteMode::kValueIsIndirectPointer);
@@ -1293,6 +1340,7 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
       __ Bind(ool->exit());
       break;
     }
+
     case kArchStoreSkippedWriteBarrier: {
       AddressingMode addressing_mode =
           AddressingModeField::decode(instr->opcode());

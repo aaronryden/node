@@ -327,7 +327,11 @@
     'v8_advanced_bigint_algorithms%': 1,
 
     # Enable 256-bit long vector re-vectorization pass in WASM compilation pipeline.
-    'v8_enable_wasm_simd256_revec%' : 0
+    'v8_enable_wasm_simd256_revec%' : 0,
+
+    # Enable green threads with copy-on-write heap isolation.
+    # Sets -DV8_ENABLE_GREEN_THREADS.
+    'v8_enable_green_threads%': 1
   },
 
   'target_defaults': {
@@ -545,6 +549,9 @@
       }],
       ['v8_enable_wasm_simd256_revec==1', {
         'defines': ['V8_ENABLE_WASM_SIMD256_REVEC',],
+      }],
+      ['v8_enable_green_threads==1', {
+        'defines': ['V8_ENABLE_GREEN_THREADS',],
       }],
     ],  # conditions
     'defines': [

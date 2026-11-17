@@ -22,6 +22,10 @@
 #include "src/objects/heap-object.h"
 #include "src/objects/maybe-object-inl.h"
 
+#if V8_ENABLE_GREEN_THREADS
+#include "src/execution/green-thread-cow.h"
+#endif
+
 namespace v8::internal {
 
 // static
@@ -29,6 +33,11 @@ void WriteBarrier::CombinedWriteBarrierInternalForStickyMarkbits(
     Tagged<HeapObject> host, HeapObjectSlot slot, Tagged<HeapObject> value,
     WriteBarrierMode mode) {
   DCHECK(v8_flags.sticky_mark_bits.value());
+
+#if V8_ENABLE_GREEN_THREADS
+  // Copy-on-write: same as CombinedWriteBarrierInternal.
+  GreenThreadCow::COWWriteBarrierCheck(host, value, slot);
+#endif
 
   MemoryChunk* host_chunk = MemoryChunk::FromHeapObject(host);
   MemoryChunk* value_chunk = MemoryChunk::FromHeapObject(value);
@@ -53,7 +62,26 @@ void WriteBarrier::CombinedWriteBarrierInternal(Tagged<HeapObject> host,
                                                 HeapObjectSlot slot,
                                                 Tagged<HeapObject> value,
                                                 WriteBarrierMode mode) {
+#if V8_ENABLE_GREEN_THREADS
+  if (getenv("GT_DEBUG_STORE") != nullptr) {
+    ::fprintf(stderr, "[GTD] CombinedWriteBarrierInternal ENTER host=0x%lx host_type=%u value_type=%u mode=%d\n",
+              static_cast<unsigned long>(host.ptr()),
+              Cast<HeapObject>(host)->map()->instance_type(),
+              Cast<HeapObject>(value)->map()->instance_type(),
+              (int)mode);
+    ::fflush(stderr);
+  }
+#endif
   DCHECK_EQ(mode, UPDATE_WRITE_BARRIER);
+
+#if V8_ENABLE_GREEN_THREADS
+  // Copy-on-write: clone the value for the current green thread's heap view.
+  // Called after the store but before GC bookkeeping; rewrites the slot with
+  // the copy if a clone was produced.  The host parameter is used for
+  // provenance filtering — COW skips non-user host objects to avoid
+  // crashing on V8 internal writes during compilation/GC.
+  GreenThreadCow::COWWriteBarrierCheck(host, value, slot);
+#endif
 
   if constexpr (v8_flags.sticky_mark_bits.value()) {
     CombinedWriteBarrierInternalForStickyMarkbits(host, slot, value, mode);
@@ -91,8 +119,38 @@ inline WriteBarrierMode WriteBarrier::ComputeWriteBarrierModeForObject(
     return UPDATE_WRITE_BARRIER;
   }
   if (HeapLayout::InYoungGeneration(chunk, object)) {
+#if V8_ENABLE_GREEN_THREADS
+    if (getenv("GT_DEBUG_STORE") != nullptr) {
+      ::fprintf(stderr, "[GTD] young host 0x%lx host_type=%u cow_active=%u -> choosing mode\n",
+                static_cast<unsigned long>(object.ptr()),
+                Cast<HeapObject>(object)->map()->instance_type(),
+                (unsigned)GreenThreadCow::ActiveCount());
+      ::fflush(stderr);
+    }
+    // Copy-on-write heap isolation: a young host would normally be exempt
+    // from the write barrier (the generation optimization), which makes the
+    // interpreter and property-store path skip COW's clone check entirely and
+    // break heap isolation for green threads. While a green thread is active
+    // we therefore force the update barrier so Combined.WriteAllInternal runs
+    // GreenThreadCow::COWWriteBarrierCheck and clones on store. When no green
+    // thread is active (the common case) the generation fast path is kept, so
+    // COW adds no cost outside green-thread execution.
+    if (GreenThreadCow::ActiveCount() > 0) {
+      return UPDATE_WRITE_BARRIER;
+    }
+#endif
     return SKIP_WRITE_BARRIER_SCOPE;
   }
+#if V8_ENABLE_GREEN_THREADS
+  if (getenv("GT_DEBUG_STORE") != nullptr) {
+    MemoryChunk* oc = MemoryChunk::FromHeapObject(object);
+    ::fprintf(stderr, "[GTD] ComputeWriteBarrierModeForObject host=0x%lx young=%d cow_active=%u -> UPDATE\n",
+              static_cast<unsigned long>(object.ptr()),
+              (int)HeapLayout::InYoungGeneration(chunk, object),
+              (unsigned)GreenThreadCow::ActiveCount());
+    ::fflush(stderr);
+  }
+#endif
   return UPDATE_WRITE_BARRIER;
 }
 

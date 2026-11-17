@@ -1087,6 +1087,16 @@
             '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "\\"v8_base_without_compiler.*?v8_enable_snapshot_compression.*?sources \\+= ")',
           ],
         }],
+        # Green threads: the scheduler + COW write-barrier sources are appended
+        # inside an `if (v8_enable_green_threads)` block at the tail of the
+        # v8_base_without_compiler source set in BUILD.gn. GN-scraper has no
+        # notion of the gate, so scrape the appended list explicitly when the
+        # embedder enabled green threads (see common.gypi / features.gypi).
+        ['v8_enable_green_threads==1', {
+          'sources': [
+            '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "\\"v8_base_without_compiler.*?v8_enable_green_threads.*?sources \\+= ")',
+          ],
+        }],
         ['v8_enable_temporal_support==1', {
           'conditions': [
             ['node_shared_temporal_capi=="false"', {

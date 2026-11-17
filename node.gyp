@@ -93,6 +93,7 @@
       'src/encoding_binding.cc',
       'src/env.cc',
       'src/fs_event_wrap.cc',
+      'src/green_threads.cc',
       'src/handle_wrap.cc',
       'src/heap_utils.cc',
       'src/histogram.cc',
@@ -894,6 +895,7 @@
       'include_dirs': [
         'src',
         'deps/postject',
+        'deps/v8',
         '<(SHARED_INTERMEDIATE_DIR)' # for node_natives.h
       ],
       'dependencies': [
