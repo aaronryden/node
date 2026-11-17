@@ -321,7 +321,12 @@ std::optional<BailoutReason> GraphBuilder::Run() {
       case BasicBlock::kTailCall:
         break;
       case BasicBlock::kNone:
-        UNREACHABLE();
+        // The linear scheduler can leave a branch successor without a
+        // terminal control (e.g. the dropped IfFalse edge of
+        // SetNamedPropertyHandler). Emit a terminal Unreachable so the
+        // block terminates cleanly instead of hitting this
+        // INCOMPLETE-handle path.
+        __ Unreachable();
     }
     DCHECK_NULL(__ current_block());
 

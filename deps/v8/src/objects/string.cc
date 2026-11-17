@@ -1906,8 +1906,7 @@ bool String::SlowAsArrayIndex(uint32_t* index) {
   if (length <= kMaxCachedArrayIndexLength) {
     uint32_t field = EnsureRawHash();  // Force computation of hash code.
     if (!IsIntegerIndex(field)) return false;
-    *index = StringHasher::DecodeArrayIndexFromHashField(
-        field, HashSeed(EarlyGetReadOnlyRoots()));
+    *index = ArrayIndexValueBits::decode(field);
     return true;
   }
   if (length == 0 || length > kMaxArrayIndexSize) return false;
@@ -1921,8 +1920,7 @@ bool String::SlowAsIntegerIndex(size_t* index) {
   if (length <= kMaxCachedArrayIndexLength) {
     uint32_t field = EnsureRawHash();  // Force computation of hash code.
     if (!IsIntegerIndex(field)) return false;
-    *index = StringHasher::DecodeArrayIndexFromHashField(
-        field, HashSeed(EarlyGetReadOnlyRoots()));
+    *index = ArrayIndexValueBits::decode(field);
     return true;
   }
   if (length == 0 || length > kMaxIntegerIndexSize) return false;
