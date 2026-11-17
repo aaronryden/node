@@ -105,24 +105,11 @@ void GreenThread::FreeGreenThreadLocalStorage(GreenThread* gt) {
 // --- Current green thread accessors ---
 
 GreenThread* CurrentGreenThread() {
-  if (::getenv("GT_COW_DEBUG")) {
-    static int64_t g_seq = 0;
-    ::fprintf(stderr, "[GTDBG-GET#%05d] val=%p\n", ++g_seq, (void*)g_current_green_thread_);
-    ::fflush(stderr);
-  }
   return g_current_green_thread_;
 }
 
 void SetCurrentGreenThread(GreenThread* thread) {
   g_current_green_thread_ = thread;
-  GreenThread* __rb = g_current_green_thread_;
-  if (::getenv("GT_COW_DEBUG")) {
-    static int64_t g_seq = 0;
-    ::fprintf(stderr, "[GTDBG-SET#%05d] %sp=%p readback=%p os=%ld\n",
-              ++g_seq, (thread? "val=" : "CLEAR"), (void*)thread, (void*)__rb,
-              (long)pthread_self());
-    ::fflush(stderr);
-  }
 }
 
 }  // namespace internal

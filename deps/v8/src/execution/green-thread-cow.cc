@@ -409,6 +409,15 @@ Address GreenThreadCow::CowCloneForGeneratedCode(Address tagged_addr) {
     obj_ptr -= kHeapObjectTag;
   }
 
+  // A boxed double (HeapNumber) is stored inline as double bits by a
+  // double-representation field, not as a heap-object reference; cloning and
+  // returning a redirect for it would corrupt that field. Skip it here so the
+  // original operand is written through unchanged (mirrors the guard in
+  // COWWriteBarrierCheck).
+  if (HeapObject::FromAddress(obj_ptr)->map()->instance_type() == HEAP_NUMBER_TYPE) {
+    return tagged_addr;
+  }
+
   // Check and clone if needed.
   Address copy_addr = CowCheckBeforeStore(isolate, obj_ptr);
 
@@ -496,6 +505,18 @@ void GreenThreadCow::COWWriteBarrierCheck(Tagged<HeapObject> host,
   // compile-time "false" and IsHeapObject() to compile-time "true", so the
   // usual IsHeapObject(value) overload is always-true here and useless.
   if (HAS_SMI_TAG(value.ptr())) return;
+
+  // A boxed double (HeapNumber) is never stored as a heap-object reference:
+  // JSObject::WriteToField stores its bit pattern inline into a
+  // double-representation property field and consumes the HeapNumber only via
+  // value_as_bits(). There is therefore no reference to isolate, yet the slot
+  // rewrite below would overwrite that field's inline double bits with a
+  // heap-object pointer, corrupting the object's storage invariant (the next
+  // WriteToField / property access then dereferences the garbage pointer and
+  // crashes). Such stores only reach this barrier because
+  // ComputeWritesModeForObject forces UPDATE_WRITE_BARRIER for young hosts
+  // while a green thread is active; skip cloning them here.
+  if (value->map()->instance_type() == HEAP_NUMBER_TYPE) return;
 
   if (!gt || !gt->cow_enabled()) return;
 

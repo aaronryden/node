@@ -62,16 +62,6 @@ void WriteBarrier::CombinedWriteBarrierInternal(Tagged<HeapObject> host,
                                                 HeapObjectSlot slot,
                                                 Tagged<HeapObject> value,
                                                 WriteBarrierMode mode) {
-#if V8_ENABLE_GREEN_THREADS
-  if (getenv("GT_DEBUG_STORE") != nullptr) {
-    ::fprintf(stderr, "[GTD] CombinedWriteBarrierInternal ENTER host=0x%lx host_type=%u value_type=%u mode=%d\n",
-              static_cast<unsigned long>(host.ptr()),
-              Cast<HeapObject>(host)->map()->instance_type(),
-              Cast<HeapObject>(value)->map()->instance_type(),
-              (int)mode);
-    ::fflush(stderr);
-  }
-#endif
   DCHECK_EQ(mode, UPDATE_WRITE_BARRIER);
 
 #if V8_ENABLE_GREEN_THREADS
@@ -120,13 +110,6 @@ inline WriteBarrierMode WriteBarrier::ComputeWriteBarrierModeForObject(
   }
   if (HeapLayout::InYoungGeneration(chunk, object)) {
 #if V8_ENABLE_GREEN_THREADS
-    if (getenv("GT_DEBUG_STORE") != nullptr) {
-      ::fprintf(stderr, "[GTD] young host 0x%lx host_type=%u cow_active=%u -> choosing mode\n",
-                static_cast<unsigned long>(object.ptr()),
-                Cast<HeapObject>(object)->map()->instance_type(),
-                (unsigned)GreenThreadCow::ActiveCount());
-      ::fflush(stderr);
-    }
     // Copy-on-write heap isolation: a young host would normally be exempt
     // from the write barrier (the generation optimization), which makes the
     // interpreter and property-store path skip COW's clone check entirely and
@@ -141,16 +124,6 @@ inline WriteBarrierMode WriteBarrier::ComputeWriteBarrierModeForObject(
 #endif
     return SKIP_WRITE_BARRIER_SCOPE;
   }
-#if V8_ENABLE_GREEN_THREADS
-  if (getenv("GT_DEBUG_STORE") != nullptr) {
-    MemoryChunk* oc = MemoryChunk::FromHeapObject(object);
-    ::fprintf(stderr, "[GTD] ComputeWriteBarrierModeForObject host=0x%lx young=%d cow_active=%u -> UPDATE\n",
-              static_cast<unsigned long>(object.ptr()),
-              (int)HeapLayout::InYoungGeneration(chunk, object),
-              (unsigned)GreenThreadCow::ActiveCount());
-    ::fflush(stderr);
-  }
-#endif
   return UPDATE_WRITE_BARRIER;
 }
 
