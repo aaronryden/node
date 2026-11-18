@@ -2462,11 +2462,12 @@ MaybeHandle<JSObject> JSObject::New(DirectHandle<JSFunction> constructor,
 // static
 MaybeDirectHandle<JSObject> JSObject::NewWithMap(
     Isolate* isolate, DirectHandle<Map> initial_map,
-    DirectHandle<AllocationSite> site, NewJSObjectType new_js_object_type) {
+    DirectHandle<AllocationSite> site, NewJSObjectType new_js_object_type,
+    AllocationType allocation) {
   constexpr int initial_capacity = PropertyDictionary::kInitialCapacity;
   DirectHandle<JSObject> result =
       isolate->factory()->NewFastOrSlowJSObjectFromMap(
-          initial_map, initial_capacity, AllocationType::kYoung, site,
+          initial_map, initial_capacity, allocation, site,
           new_js_object_type);
   return result;
 }

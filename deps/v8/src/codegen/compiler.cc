@@ -80,6 +80,21 @@
 namespace v8 {
 namespace internal {
 
+#if V8_ENABLE_GREEN_THREADS
+// Cooperating hook defined in src/execution/green-thread-cow.cc.
+//
+// GreenThreadCOWSuspendedConcurrentGC() returns true while a copy-on-write
+// green-thread view is active. The single-execution-thread CoW model rewrites
+// the shared heap only on the embedding thread; a concurrently scheduled Maglev
+// job would instead be executed on a background worker after the drain, reading
+// and marking shared SharedFunctionInfo / feedback-vector state that the view is
+// cloning (a torn read). Gating the scheduling decision here (rather than only
+// the background worker's own bail) means no concurrent Maglev job is created
+// while a view is active, so there is nothing to defer or drain. See
+// Heap::ShouldUseBackgroundThreads for the full rationale.
+bool GreenThreadCOWSuspendedConcurrentGC();
+#endif
+
 namespace {
 
 constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
@@ -1244,7 +1259,14 @@ MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
   auto job = maglev::MaglevCompilationJob::New(isolate, function, osr_offset);
 
   if (IsConcurrent(mode) &&
-      !isolate->maglev_concurrent_dispatcher()->is_enabled()) {
+      (!isolate->maglev_concurrent_dispatcher()->is_enabled() ||
+       // While a CoW green-thread view is active the shared heap is being
+       // rewritten solely on the embedding thread; concurrent Maglev would
+       // compile on a background worker against the heap the view is cloning
+       // (torn SharedFunctionInfo / feedback-vector reads -> crash). Fall back
+       // to synchronous compilation, which runs on the embedding thread and
+       // therefore always reads a consistent view.
+       GreenThreadCOWSuspendedConcurrentGC())) {
     mode = ConcurrencyMode::kSynchronous;
   }
 

@@ -451,13 +451,22 @@ IndirectHandle<HeapObject> CloneCowBackingStore(Isolate* isolate,
     result = IndirectHandle<HeapObject>(copy);
   } else if (instance_type == PROPERTY_ARRAY_TYPE) {
     DirectHandle<PropertyArray> direct_copy =
-        factory->NewPropertyArray(src_length);
+        factory->NewPropertyArray(src_length, AllocationType::kOld);
     IndirectHandle<PropertyArray> copy = indirect_handle(direct_copy, isolate);
     keep_alive->push_back(copy);
     result = IndirectHandle<HeapObject>(copy);
   } else {
+    // Allocate the copy in OLD_SPACE. A CoW copy is a live object the owning
+    // green thread holds pointers to while its body is *executing* (the GTs run
+    // cooperatively on the embedding thread, so a young GC can run mid-body).
+    // A nursery-allocated copy would then be evacuated/moved by the scavenger,
+    // and RedirectWordsLocked can only rewrite the GT's saved (suspended)
+    // registers/stack, not a live register of a running body -- leaving a
+    // dangling pointer to the moved-away address. Old-space copies are never
+    // touched by the scavenger; only compaction moves them, and that runs at a
+    // world safepoint where the owning GT is suspended and redirected.
     MaybeHandle<FixedArray> try_copy =
-        factory->TryNewFixedArray(src_length, AllocationType::kYoung);
+        factory->TryNewFixedArray(src_length, AllocationType::kOld);
     if (try_copy.is_null()) return IndirectHandle<HeapObject>();
     Tagged<FixedArray> fixed_array_obj = *try_copy.ToHandleChecked();
     IndirectHandle<FixedArray> copy =
@@ -506,11 +515,16 @@ IndirectHandle<HeapObject> AllocateCowCopy(Isolate* isolate,
   // backing dictionary is not supported yet.
   if (map->is_dictionary_map()) return IndirectHandle<HeapObject>();
 
-  // Allocate a fresh JSObject with the same map.
+  // Allocate a fresh JSObject with the same map in OLD_SPACE (see the comment
+  // on CloneCowBackingStore): a nursery copy can be scavenger-moved while the
+  // owning green thread is mid-body, leaving it with a dangling pointer that
+  // the GC redirect cannot fix for a running body.
   DirectHandle<Map> map_handle(map, isolate);
   DirectHandle<AllocationSite> site;
-  MaybeDirectHandle<JSObject> maybe_copy =
-      JSObject::NewWithMap(isolate, map_handle, site);
+  MaybeDirectHandle<JSObject> maybe_copy = JSObject::NewWithMap(
+      isolate, map_handle, site,
+      NewJSObjectType::kMaybeEmbedderFieldsAndNoApiWrapper,
+      AllocationType::kOld);
   if (maybe_copy.is_null()) return IndirectHandle<HeapObject>();
 
   IndirectHandle<JSObject> copy(indirect_handle(maybe_copy.ToHandleChecked(),

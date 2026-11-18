@@ -704,6 +704,14 @@ class ScavengerPromotedObjectVisitor final
   friend class Scavenger;
 };
 
+// CoW suspension-barrier hooks (defined in execution/green-thread-cow.cc).
+// RegisterCOWGCWorker() returns false (worker must not touch the heap) when a
+// green-thread view is already active, so a background GC worker launched just
+// before a view activates bails rather than racing the embedding thread's
+// in-place slot rewrites.
+bool RegisterCOWGCWorker();
+void UnregisterCOWGCWorker();
+
 class ScavengerJobTask : public v8::JobTask {
  public:
   ScavengerJobTask(
@@ -720,7 +728,7 @@ class ScavengerJobTask : public v8::JobTask {
 
  private:
   void ProcessItems(JobDelegate* delegate, Scavenger* scavenger);
-  void ConcurrentScavengePages(Scavenger* scavenger);
+  void ConcurrentScavengePages(Scavenger* scavenger, bool embedding_joining_thread);
 
   Heap* const heap_;
 
@@ -759,8 +767,23 @@ void ScavengerJobTask::Run(JobDelegate* delegate) {
   // available and the cage base is set correctly for multi-cage mode.
   SetCurrentIsolateScope isolate_scope(heap_->isolate());
 
-  estimate_concurrency_.fetch_add(1, std::memory_order_relaxed);
+  // Register with the CoW suspension barrier before touching the heap. A view
+  // may have activated between the concurrent-GC scheduling decision and this
+  // worker reaching Run(); in that case a *background* worker bails so it never
+  // reads a slot the embedding thread is mid-rewrite for a green-thread view.
+  // The embedding (joining) thread, by contrast, owns the view and is the sole
+  // thread permitted to touch the heap under the CoW single-execution-thread
+  // model, so it runs the serial scavenging itself instead of bailing. The
+  // matching UnregisterCOWGCWorker() below is called only when a background
+  // worker actually registered, keeping the barrier's drain counter exact so
+  // JoinCOWGCWorkers() on the 0->1 boundary never waits on a worker that has
+  // already aborted.
+  const bool is_embedding_joining_thread = delegate->IsJoiningThread();
+  if (!is_embedding_joining_thread && !RegisterCOWGCWorker()) {
+    return;
+  }
 
+  estimate_concurrency_.fetch_add(1, std::memory_order_relaxed);
   Scavenger* scavenger = (*scavengers_)[delegate->GetTaskId()].get();
   if (delegate->IsJoiningThread()) {
     TRACE_GC_WITH_FLOW(heap_->tracer(),
@@ -773,6 +796,12 @@ void ScavengerJobTask::Run(JobDelegate* delegate) {
         GCTracer::Scope::SCAVENGER_BACKGROUND_SCAVENGE_PARALLEL,
         ThreadKind::kBackground, trace_id_, TRACE_EVENT_FLAG_FLOW_IN);
     ProcessItems(delegate, scavenger);
+  }
+
+  // A background worker registered above, so it must unregister to keep the
+  // barrier drain counter exact; the embedding joining thread never registered.
+  if (!is_embedding_joining_thread) {
+    UnregisterCOWGCWorker();
   }
 }
 
@@ -795,7 +824,7 @@ void ScavengerJobTask::ProcessItems(JobDelegate* delegate,
   {
     TimedScope scope(&scavenging_time);
 
-    ConcurrentScavengePages(scavenger);
+    ConcurrentScavengePages(scavenger, delegate->IsJoiningThread());
     scavenger->Process(delegate);
   }
   if (V8_UNLIKELY(v8_flags.trace_parallel_scavenge)) {
@@ -806,8 +835,20 @@ void ScavengerJobTask::ProcessItems(JobDelegate* delegate,
   }
 }
 
-void ScavengerJobTask::ConcurrentScavengePages(Scavenger* scavenger) {
+void ScavengerJobTask::ConcurrentScavengePages(Scavenger* scavenger,
+                                               bool embedding_joining_thread) {
+  // Re-check the CoW suspension barrier before scanning. A background worker
+  // must not touch a heap page while a CoW view is active (it would read a
+  // slot the embedding thread is mid-rewrite); it bails before the loop. The
+  // embedding (joining) thread owns the view and is the sole heap touch, so it
+  // performs the old-to-new page scanning itself.
+  if (!embedding_joining_thread && !heap_->ShouldUseBackgroundThreads()) {
+    return;
+  }
   while (remaining_memory_chunks_.load(std::memory_order_relaxed) > 0) {
+    if (!embedding_joining_thread && !heap_->ShouldUseBackgroundThreads()) {
+      return;
+    }
     std::optional<size_t> index = generator_.GetNext();
     if (!index) {
       return;

@@ -1270,33 +1270,76 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         AddressingMode addressing_mode =
             AddressingModeField::decode(instr->opcode());
         Register object = i.InputRegister(0);
+        Register offset_reg = no_reg;
         Operand offset(0);
         if (addressing_mode == kMode_MRI) {
           offset = Operand(i.InputInt64(1));
         } else {
           DCHECK_EQ(addressing_mode, kMode_MRR);
-          offset = Operand(i.InputRegister(1));
+          offset_reg = i.InputRegister(1);
+          offset = Operand(offset_reg);
         }
         Register original_value = i.InputRegister(2);
 
-        // x19 is callee-saved, safe to use without saving across CallCFunction.
-        // x0: COW input/output. x19: save original value for write barrier.
-        __ Mov(x0, original_value);              // x0 = original tagged addr (COW input)
-        __ Mov(x19, original_value);             // x19 = save for write barrier (callee-saved)
+        // Preserve the store operands and the clone result across the COW
+        // clone call.
+        //
+        // CallCFunction hands the clone the original tagged address in x0 and
+        // returns the copy in x0, so x0 is the ABI arg/result slot. The
+        // register allocator may, however, assign `object` (the store base) to
+        // x0 itself; that slot is then overwritten with the clone input and the
+        // clone result, so the object can no longer be recovered from x0
+        // afterwards. The intervening clone call clobbers `object`/`offset_reg`
+        // wherever they live too, so the store below would otherwise write to a
+        // bogus address. Pin `object` and the (register-form) `offset_reg` to
+        // the stack before the clone and restore them afterwards so the store
+        // always sees the correct operands.
+        //
+        // The clone result is carried in a callee-saved register chosen to not
+        // alias `object`/`offset_reg`, rather than left in x0. Carrying it in
+        // x0 would let the operand restore below (which rewrites x0 when
+        // object == x0) clobber the copy; a callee-saved slot survives both the
+        // clone call (callee-saved regs are preserved by the ABI) and the
+        // operand restore (which never touches the chosen register). That
+        // register also doubles as the value of the record-write barrier, which
+        // must record the copy that now sits in the slot.
+        const Register kCopyCandidates[] = {x19, x20, x21, x22, x23,
+                                            x24, x25, x26, x27};
+        Register copy_reg = kCopyCandidates[0];
+        for (Register cand : kCopyCandidates) {
+          if (cand != object && cand != offset_reg) {
+            copy_reg = cand;
+            break;
+          }
+        }
+        RegList saved_ops;
+        saved_ops.set(object);
+        if (offset_reg != no_reg) saved_ops.set(offset_reg);
+        __ MaybeSaveRegisters(saved_ops);
+
+        // x0: COW input = original tagged address.
+        __ Mov(x0, original_value);
         __ CallCFunction(
             ExternalReference::green_thread_cow_clone_if_needed(), 1, 0,
             SetIsolateDataSlots::kYes, nullptr);
-        // x0 = copy address (or original if not cloned)
+        // x0 = copy address (or original if not cloned).
+
+        // Stash the copy in the disjoint callee-saved register before restoring
+        // the operands.
+        __ Mov(copy_reg, x0);
+
+        // Recover the store operands (may rewrite x0 when object == x0).
+        __ MaybeRestoreRegisters(saved_ops);
 
         auto ool = zone()->New<OutOfLineRecordWrite>(
-            this, object, offset, x19, mode, DetermineStubCallMode(),
+            this, object, offset, copy_reg, mode, DetermineStubCallMode(),
             &unwinding_info_writer_);
         RecordTrapInfoIfNeeded(zone(), this, opcode, instr, __ pc_offset());
 
         // Store the (possibly cloned) value.
-        __ StoreTaggedField(x0, MemOperand(object, offset));
+        __ StoreTaggedField(copy_reg, MemOperand(object, offset));
         if (mode > RecordWriteMode::kValueIsIndirectPointer) {
-          __ JumpIfSmi(x0, ool->exit());
+          __ JumpIfSmi(copy_reg, ool->exit());
         }
         __ CheckPageFlag(object, MemoryChunk::kPointersFromHereAreInterestingMask,
                          ne, ool->entry());

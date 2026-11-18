@@ -28,6 +28,19 @@
 namespace v8 {
 namespace internal {
 
+// Cooperating CoW suspension-barrier hooks defined in
+// src/execution/green-thread-cow.cc. GreenThreadCOWSuspendedConcurrentGC()
+// returns true while a copy-on-write green-thread view is active; a background
+// Maglev worker must not read the shared heap it is rewriting.
+// RegisterCOWGCWorker()/UnregisterCOWGCWorker() count in-flight workers so the
+// embedding thread can drain them on the 0 -> 1 view boundary.
+bool GreenThreadCOWSuspendedConcurrentGC();
+bool RegisterCOWGCWorker();
+void UnregisterCOWGCWorker();
+
+// The CoW barrier diagnostic printer, defined in execution/green-thread-cow.cc.
+extern void GreenThreadDiag(const char* fmt, ...);
+
 namespace compiler {
 
 void JSHeapBroker::AttachLocalIsolateForMaglev(
@@ -266,6 +279,18 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
     if (incoming_queue()->IsEmpty() && destruction_queue()->IsEmpty()) {
       return;
     }
+
+    // Register with the CoW suspension barrier before touching the shared
+    // heap. A view may have activated between EnqueueJob and this worker
+    // reaching Run(); if so, bail (the pending job stays queued for the view's
+    // end) so we never compile against the heap the embedding thread is
+    // rewriting -- the MaglevGraphLabeller walks SharedFunctionInfo / Map /
+    // Code objects that a concurrent view rewrite leaves torn. The drain on the
+    // 0 -> 1 boundary counts this worker and waits for us here.
+    if (!RegisterCOWGCWorker()) {
+      return;
+    }
+
     TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"), "V8.MaglevTask");
     base::FlushDenormalsScope flush_denormals_scope(
         isolate()->flush_denormals());
@@ -273,7 +298,11 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
     DCHECK(local_isolate.heap()->IsParked());
 
     std::unique_ptr<MaglevCompilationJob> job_to_destruct;
-    while (!delegate->ShouldYield()) {
+    // Poll the suspension flag each iteration: a view may have activated after
+    // the previous job finished. Bailing leaves the queued job for the view's
+    // end instead of racing the rewrite mid-compilation.
+    while (!delegate->ShouldYield() &&
+           !GreenThreadCOWSuspendedConcurrentGC()) {
       std::unique_ptr<MaglevCompilationJob> job;
       if (incoming_queue()->Dequeue(&job)) {
         DCHECK_NOT_NULL(job);
@@ -305,6 +334,10 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
         break;
       }
     }
+    GreenThreadDiag(
+        "maglev-unregister suspended=%d",
+        (int)GreenThreadCOWSuspendedConcurrentGC());
+    UnregisterCOWGCWorker();
   }
 
   size_t GetMaxConcurrency(size_t worker_count) const override {
@@ -363,6 +396,15 @@ void MaglevConcurrentDispatcher::EnqueueJob(
 }
 
 void MaglevConcurrentDispatcher::FinalizeFinishedJobs() {
+  // While a CoW view is active, defer finalizing the concurrently-compiled
+  // jobs still queued here. They are installed/disposed against the shared
+  // heap the embedding thread is rewriting (torn handles -> EXC_BAD_ACCESS),
+  // exactly as the baseline compiler defers InstallBatch(). The jobs stay in
+  // the outgoing queue and finalize once the view ends and a new batch
+  // completes and re-raises the maglev-install interrupt.
+  if (GreenThreadCOWSuspendedConcurrentGC()) {
+    return;
+  }
   HandleScope handle_scope(isolate_);
   while (!outgoing_queue_.IsEmpty()) {
     std::unique_ptr<MaglevCompilationJob> job;

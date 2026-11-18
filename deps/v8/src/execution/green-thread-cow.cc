@@ -4,7 +4,12 @@
 
 #include "src/execution/green-thread-cow.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdarg>
+#include <cstdlib>
 #include <cstdio>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -55,6 +60,71 @@ namespace {
 std::mutex g_cow_capable_isolates_mutex;
 std::unordered_set<Isolate*> g_cow_capable_isolates;
 }  // namespace
+
+// ================================================================
+// Diagnostic subsystem (opt-in; gated on V8_GREEN_THREADS_DEBUG)
+//
+// Green-thread copy-on-write (CoW) heap isolation assumes a single execution
+// thread: the embedding thread rewrites heap slots in place to build a green
+// thread's private view, while V8's GC runs on that same thread. Node embeds
+// V8 with concurrent GC / baseline-compiler workers on separate OS threads, so
+// those workers can race the embedding thread's rewrites. This subsystem logs
+// the CoW view lifecycle and every concurrent-work suspension decision to
+// stderr, so those races can be observed and triaged.
+//
+// The gate is a direct getenv() compare so the disabled path costs only a
+// pointer compare; when the environment variable is unset no formatting or I/O
+// occurs. This is a permanent, zero-cost-until-set diagnostic, not a
+// temporary debugging aid to be reverted.
+// ================================================================
+namespace {
+
+// Process-wide gate. A direct getenv() compare over the disabled path is
+// negligible (a libc `environ` lookup, no syscall) and, crucially, race-free:
+// this hook is reachable from background GC/compilation workers, so a cached
+// bool written lazily under contention would itself be a data race. When the
+// environment variable is unset, GreenThreadDiag() performs no formatting or
+// I/O.
+inline bool GreenThreadDebugEnabled() {
+  return std::getenv("V8_GREEN_THREADS_DEBUG") != nullptr;
+}
+
+// Monotonically increasing sequence number so interleaved worker output stays
+// ordered on the log for a given process.
+std::atomic<uint64_t> g_diag_line{0};
+
+// The diagnostic printer itself is defined out-of-line below (outside the
+// anonymous namespace) so it has external linkage and can be called from other
+// translation units (baseline/maglev workers), not just here.
+
+// Bounds diagnostics emitted from the hot concurrency-decision path: only one
+// in every kDiagSuspensionInterval observations of an active CoW view is
+// printed, so a busy GC burst cannot flood stderr.
+static constexpr uint64_t kDiagSuspensionInterval = 1000;
+std::atomic<uint64_t> g_diag_suspension_count{0};
+
+// Rate-limit for the (noisier) barrier-register/bail join lines.
+static constexpr uint64_t kDiagBarrierInterval = 200;
+std::atomic<uint64_t> g_diag_barrier_bail{0};
+
+}  // namespace
+
+// Emits a single "[green-threads] #<n> <msg>" line to stderr, gated on the
+// V8_GREEN_THREADS_DEBUG environment variable so the disabled path performs no
+// work at all. Defined out-of-line (not in the anonymous namespace above) so it
+// has external linkage and can be shared with the baseline/maglev workers, which
+// opt into the same diagnostics.
+void GreenThreadDiag(const char* fmt, ...) {
+  if (!GreenThreadDebugEnabled()) return;
+  uint64_t n = g_diag_line.fetch_add(1, std::memory_order_relaxed);
+  va_list args;
+  va_start(args, fmt);
+  char buf[512];
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  fprintf(stderr, "[green-threads] #%llu %s\n",
+          static_cast<unsigned long long>(n), buf);
+}
 
 // Returns true when `instance_type` identifies an internal V8 backing-store
 // container: the dictionary `properties` FixedArray (FIXED_ARRAY_TYPE), the
@@ -161,6 +231,147 @@ static void UnregisterCOWRootsProvider(Heap* heap) {
   }
 }
 
+// Heap cooperative-override hook. Returns true while at least one copy-on-write
+// green thread is active (g_cow_active_count > 0).
+//
+// The CoW design assumes a single execution thread, but Node enables V8's
+// concurrent GC worker threads (young-GC scavenger, mark-compact markers,
+// array-buffer sweeper) that run on separate OS threads and mutate the same
+// heap the embedding thread rewrites for a green thread's isolated view.
+// Concurrent GC racing those in-place slot rewrites reads torn/freed pointers
+// (an EXC_BAD_ACCESS in Scavenger::EvacuateObject). The heap's
+// ShouldUseBackgroundThreads() consults this hook so that while a view is
+// active it returns false, forcing every concurrent-GC worker path to fall
+// back to serial execution on the embedding thread. Once the last view is
+// torn down the active count drops to zero and concurrency is restored.
+//
+// g_cow_active_count is a coarse, global "any CoW green thread is running"
+// flag (bumped in Initialize, dropped in Teardown). Over-suspending concurrent
+// GC across isolates is always safe: it only costs GC throughput, never
+// correctness -- precisely the trade-off the single-execution-thread CoW
+// model makes.
+bool GreenThreadCOWSuspendedConcurrentGC() {
+  const bool suspended = GreenThreadCow::ActiveCount() != 0;
+  if (suspended) {
+    // Rate-limit: print at most one suspension line per interval of observed
+    // active views, so a long GC burst does not flood the diagnostic log.
+    if (g_diag_suspension_count.fetch_add(1, std::memory_order_relaxed) %
+            kDiagSuspensionInterval == 0) {
+      GreenThreadDiag(
+          "concurrent GC/compiler suspended while %u CoW view(s) active",
+          GreenThreadCow::ActiveCount());
+    }
+  }
+  return suspended;
+}
+
+// ================================================================
+// Concurrent-GC worker suspension & drain barrier (Option A)
+//
+// The guard in Heap::ShouldUseBackgroundThreads() (see below) gates only the
+// one-time decision to schedule a concurrent-GC worker when a GC job is
+// enqueued. A worker launched while no CoW view is active keeps running through
+// its job -- e.g. ScavengerJobTask::ConcurrentScavengePages re-checks nothing --
+// and races the embedding thread's in-place CoW slot rewrites once the next
+// green-thread view activates, reading a torn Map pointer (an EXC_BAD_ACCESS in
+// Scavenger::EvacuateObject). This barrier closes that gap without a full
+// stop-the-world:
+//
+//   * A GC worker registers on entry / unregisters on exit, so the embedding
+//     thread knows exactly how many workers are in flight.
+//   * The worker polls the suspension flag at each coarse heap-access boundary
+//     and bails immediately once a view is active.
+//   * On the view's 0 -> 1 boundary the embedding thread spins (with brief
+//     condition-variable waits) until every in-flight worker has drained, then
+//     lets the CoW rewrites begin. Because a freshly scheduled worker also bails
+//     at entry, and the guard suppresses new concurrent-GC jobs while a view is
+//     active, no worker ever touches the heap during a view.
+//
+// RegisterCOWGCWorker()/UnregisterCOWGCWorker() are called from V8's heap worker
+// translation units; JoinCOWGCWorkers() is called from Initialize().
+
+// In-flight concurrent-GC worker count for the suspension barrier, guarded by
+// g_cow_gc_barrier_mutex. Guarding it (rather than using a lock-free atomic) is
+// what closes the check-then-act gap: a worker's registration commits to
+// touching the heap, and the embedding thread's drain observes "no worker in
+// flight" -- both must happen under the same lock so they are mutually
+// exclusive. Once the drain observes an empty set under the lock, no worker can
+// commit heap access afterwards, so the embedding thread may begin CoW rewrites.
+static int g_cow_gc_inflight_workers = 0;
+static std::mutex g_cow_gc_barrier_mutex;
+static std::condition_variable g_cow_gc_barrier_cv;
+
+// Register the calling GC worker with the suspension barrier. Returns true if
+// concurrent GC may proceed, false if a CoW view is already active and the
+// worker must not touch the heap. The suspension check and the commit
+// (++inflight) happen atomically under the barrier mutex, so JoinCOWGCWorkers()
+// can never observe "no worker in flight" and then have a worker register and
+// race the view.
+bool RegisterCOWGCWorker() {
+  std::lock_guard<std::mutex> lock(g_cow_gc_barrier_mutex);
+  if (GreenThreadCow::ActiveCount() != 0) {
+    // Rate-limited: at most one bail per kDiagBarrierInterval views, so a GC or
+    // compile burst during a long view does not flood the log.
+    if (g_diag_barrier_bail.fetch_add(1, std::memory_order_relaxed) %
+            kDiagBarrierInterval == 0) {
+      GreenThreadDiag(
+          "RegisterCOWGCWorker BAIL active=%d inflight=%d",
+          (unsigned)GreenThreadCow::ActiveCount(),
+          g_cow_gc_inflight_workers);
+    }
+    return false;
+  }
+  ++g_cow_gc_inflight_workers;
+  return true;
+}
+
+// Unregister a worker accepted by RegisterCOWGCWorker. Notifies the embedding
+// thread's drain loop once the last in-flight worker has drained.
+void UnregisterCOWGCWorker() {
+  std::lock_guard<std::mutex> lock(g_cow_gc_barrier_mutex);
+  int remaining = --g_cow_gc_inflight_workers;
+  if (remaining == 0) {
+    g_cow_gc_barrier_cv.notify_all();
+  }
+}
+
+// Drain (spin with brief condition-variable waits) until no GC worker registered
+// with the barrier is in flight. Called on the CoW view's 0 -> 1 boundary, after
+// the suspension flag is set. The lock is held across the whole check, so a
+// worker cannot register after the drain observes an empty set, and in-flight
+// workers observe suspension at their next heap-access boundary and bail, so the
+// drain always terminates.
+void JoinCOWGCWorkers() {
+  std::unique_lock<std::mutex> lock(g_cow_gc_barrier_mutex);
+  if (g_cow_gc_inflight_workers != 0 &&
+      g_diag_barrier_bail.load(std::memory_order_relaxed) % kDiagBarrierInterval ==
+          0) {
+    GreenThreadDiag(
+        "JoinCOWGCWorkers START inflight=%d active=%d",
+        g_cow_gc_inflight_workers, (unsigned)GreenThreadCow::ActiveCount());
+  }
+  int polls = 0;
+  int stuck_logs = 0;
+  const int kMaxStuckLogs = 8;
+  g_cow_gc_barrier_cv.wait_for(
+      lock, std::chrono::milliseconds(1), [&] {
+        if (g_cow_gc_inflight_workers > 0 && stuck_logs < kMaxStuckLogs) {
+          if (++stuck_logs % 500 == 0 || polls <= 1) {
+            GreenThreadDiag("JoinCOWGCWorkers: STUCK drained in=%d polls, "
+                            "inflight=%d",
+                            polls, g_cow_gc_inflight_workers);
+          }
+        }
+        if (++polls % 2000 == 0 && stuck_logs >= kMaxStuckLogs) {
+          GreenThreadDiag("JoinCOWGCWorkers: STILL stuck polls=%d inflight=%d",
+                          polls, g_cow_gc_inflight_workers);
+        }
+        return g_cow_gc_inflight_workers == 0;
+      });
+  GreenThreadDiag("JoinCOWGCWorkers: drained polls=%d inflight=%d", polls,
+                  g_cow_gc_inflight_workers);
+}
+
 void GreenThreadCow::SetIsolateCowCapable(Isolate* isolate) {
   if (isolate == nullptr) return;
   std::lock_guard<std::mutex> lock(g_cow_capable_isolates_mutex);
@@ -196,6 +407,15 @@ void GreenThreadCow::Initialize(GreenThread* gt) {
     RegisterCOWRootsProvider(gt->isolate()->heap());
   }
   g_cow_active_count.fetch_add(1, std::memory_order_release);
+  // Drain any in-flight concurrent-GC workers (launched while no view was
+  // active) before this view's CoW rewrites begin. Workers observe suspension
+  // at their next heap-access boundary and bail; a freshly scheduled worker
+  // bails at entry. This turns the point-in-time guard into a real
+  // "no GC worker runs while a view is active" guarantee on the activation
+  // boundary rather than only on the scheduling decision.
+  JoinCOWGCWorkers();
+  GreenThreadDiag("CoW view initialized (active count now %u)",
+                  GreenThreadCow::ActiveCount());
 }
 
 void GreenThreadCow::Teardown(GreenThread* gt) {
@@ -206,6 +426,8 @@ void GreenThreadCow::Teardown(GreenThread* gt) {
       g_cow_active_count.load(std::memory_order_relaxed);
   UnrecordCOWGreenThread(gt);
   g_cow_active_count.fetch_sub(1, std::memory_order_acq_rel);
+  GreenThreadDiag("CoW view torn down (active count now %u)",
+                  GreenThreadCow::ActiveCount());
   if (previous_count == 1) {
     UnregisterCOWRootsProvider(gt->isolate()->heap());
   }
