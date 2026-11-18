@@ -37,6 +37,16 @@
 // The fix skips HeapNumber values in both COWWriteBarrierCheck and
 // CowCloneForGeneratedCode, so such stores write through unchanged.
 //
+// A second, related corruption affects internal backing-store values (the
+// FixedArray dictionary `properties`, the property-descriptor FixedArray, and
+// double arrays) that V8 allocates and links into an object during the
+// interpreter's dictionary/map transitions. Those containers are V8-owned, not
+// user values: cloning one and rewriting the owner's properties slot to the
+// copy orphans V8's dictionary machinery, leaving a stale pointer that a GC
+// marks pass then dereferences (SIGBUS). The fix likewise skips CoW cloning of
+// internal backing-store values (FIXED_ARRAY, PROPERTY_ARRAY,
+// FIXED_DOUBLE_ARRAY) on the store path, mirroring the HeapNumber guard.
+//
 // Isolation note: green threads run under "Model A" recursive scheduling on the
 // embedding thread inside this same isolate/context. That races with both
 // node:test's subtest bookkeeping (subtests silently collapse) and common's
@@ -132,6 +142,44 @@ const assert = require('node:assert/strict');
   });
   assert.ok(Number.isInteger(r.shared), 'scenario 5: shared address is an integer');
   assert.ok(Number.isInteger(r.copy), 'scenario 5: copy address is an integer');
+}
+
+// 6. Dictionary-mode object restore. This is the regression for the copy-on-write
+//    corruption of internal backing-store values: when a fast object grows many
+//    string-keyed fields the interpreter transitions it to dictionary mode, and
+//    V8 allocates/links internal FixedArray-backed containers (the 'properties'
+//    dictionary, the 'named' lookup table, a property-descriptor FixedArray).
+//    Those internal containers are *not* user values -- they are V8-owned by
+//    construction -- yet the CoW barrier previously cloned them and rewrote the
+//    owner's properties slot to the copy, orphaning V8's dictionary machinery.
+//    The next GC/marks pass then dereferenced the stale backing store and
+//    SIGBUSed (confirmed empirically: ~1266 backing-store clones, 516x
+//    FIXED_ARRAY, 746x PROPERTY_ARRAY, 4x FIXED_DOUBLE_ARRAY, on the interpreter
+//    store path; exit 138).
+//
+//    The fix skips CoW cloning of internal backing-store values (FIXED_ARRAY,
+//    PROPERTY_ARRAY, FIXED_DOUBLE_ARRAY) on the store path, mirroring the
+//    HeapNumber write-through guard. This scenario reproduces the corruption by
+//    spawning a dictionary-transitioning workload repeatedly with periodic GC.
+{
+  const results = [];
+  for (let iter = 0; iter < 400; iter++) {
+    const r = g.spawn(() => {
+      const m = {};
+      for (let i = 0; i < 5; i++) m['f' + i] = (i + 1) * 1.5e11;
+      m.nested = { x: 42, y: 7e12 };
+      m.arr = [1e13, 2e13, 3e13];
+      return m.f0 + m.f1 + m.f2 + m.f3 + m.nested.x + m.arr[0];
+    });
+    results.push(r);
+    if (iter % 40 === 0 && globalThis.gc) globalThis.gc();
+  }
+  // A corrupted double backing store surfaces as NaN. If any restore below
+  // returned a corrupted double, the reduction is NaN and this fails.
+  for (const r of results) {
+    assert.ok(Number.isFinite(r), 'scenario 6: dictionary restore intact, no NaN leak');
+  }
+  assert.equal(results.length, 400, 'scenario 6: all dictionary restores returned');
 }
 
 console.error('green_threads COW regression: all scenarios passed');

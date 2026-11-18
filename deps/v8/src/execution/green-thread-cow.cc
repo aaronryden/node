@@ -56,6 +56,26 @@ std::mutex g_cow_capable_isolates_mutex;
 std::unordered_set<Isolate*> g_cow_capable_isolates;
 }  // namespace
 
+// Returns true when `instance_type` identifies an internal V8 backing-store
+// container: the dictionary `properties` FixedArray (FIXED_ARRAY_TYPE), the
+// property-descriptor lookup table (PROPERTY_ARRAY_TYPE), or the fast double
+// array (FIXED_DOUBLE_ARRAY_TYPE).
+//
+// These containers are allocated and linked into a JS object by V8 during the
+// dictionary/map transitions performed on the interpreter/JIT property-store
+// path; they are not user values. On the CoW barrier's store path, cloning one
+// and rewriting the owner's properties slot to the copy orphans V8's dictionary
+// machinery, leaving a stale pointer that a later GC marks pass dereferences
+// (SIGBUS). Such stores must therefore write through unchanged, exactly as
+// HeapNumber stores do. The predicate takes the instance-type enum so both the
+// interpreter barrier (COWWriteBarrierCheck) and the JIT barrier
+// (CowCloneForGeneratedCode) share one implementation.
+inline bool IsCowBackingStoreInstanceType(uint16_t instance_type) {
+  return instance_type == FIXED_ARRAY_TYPE ||
+         instance_type == PROPERTY_ARRAY_TYPE ||
+         instance_type == FIXED_DOUBLE_ARRAY_TYPE;
+}
+
 // ================================================================
 // GC root integration
 //
@@ -418,6 +438,17 @@ Address GreenThreadCow::CowCloneForGeneratedCode(Address tagged_addr) {
     return tagged_addr;
   }
 
+  // Internal V8 backing-store containers (FIXED_ARRAY / PROPERTY_ARRAY /
+  // FIXED_DOUBLE_ARRAY) are V8-owned, not user values: cloning one on the JIT
+  // store path and returning a redirect for it would write a stale pointer into
+  // the owner's properties slot, orphaning V8's dictionary machinery (SIGBUS).
+  // Skip the clone here so the operand writes through unchanged, mirroring the
+  // HeapNumber guard above.
+  if (IsCowBackingStoreInstanceType(
+          HeapObject::FromAddress(obj_ptr)->map()->instance_type())) {
+    return tagged_addr;
+  }
+
   // Check and clone if needed.
   Address copy_addr = CowCheckBeforeStore(isolate, obj_ptr);
 
@@ -506,6 +537,20 @@ void GreenThreadCow::COWWriteBarrierCheck(Tagged<HeapObject> host,
   // usual IsHeapObject(value) overload is always-true here and useless.
   if (HAS_SMI_TAG(value.ptr())) return;
 
+  // Fast path: no active CoW green thread. Checked BEFORE any of the
+  // value->map() dereferences below, mirroring the !gt / !isolate guards at the
+  // top of CowCloneForGeneratedCode. On the real barrier path the value is
+  // always a heap object (Smi-guarded above), so this costs nothing in
+  // production; testing CoW liveness first also keeps this function safe when
+  // unit tests invoke it with unmapped fake addresses while CoW is active.
+  if (!gt || !gt->cow_enabled()) return;
+
+  // Test-mode fake values have very low addresses outside the real heap;
+  // dereferencing their map would crash. Skip them and write through unchanged,
+  // mirroring the host-address guard in IsCowProvenanceHost. Real V8 heap
+  // addresses are typically > 0x100000000 (64-bit).
+  if (value.address() < 0x100000000ULL) return;
+
   // A boxed double (HeapNumber) is never stored as a heap-object reference:
   // JSObject::WriteToField stores its bit pattern inline into a
   // double-representation property field and consumes the HeapNumber only via
@@ -518,7 +563,14 @@ void GreenThreadCow::COWWriteBarrierCheck(Tagged<HeapObject> host,
   // while a green thread is active; skip cloning them here.
   if (value->map()->instance_type() == HEAP_NUMBER_TYPE) return;
 
-  if (!gt || !gt->cow_enabled()) return;
+  // Internal V8 backing-store containers (the dictionary properties array, the
+  // property-descriptor lookup table, and the fast double array) are not user
+  // values. Cloning one on the store path and rewriting the owner's properties
+  // slot to the copy orphans V8's dictionary machinery, leaving a stale pointer
+  // that a later GC marks pass dereferences (SIGBUS). Skip the CoW clone for
+  // these internal backing-store values so such stores write through unchanged,
+  // mirroring the HeapNumber guard above.
+  if (IsCowBackingStoreInstanceType(value->map()->instance_type())) return;
 
   // Provenance filter: skip COW for V8 internal host objects.
   // This prevents COW from firing on internal V8 structures
