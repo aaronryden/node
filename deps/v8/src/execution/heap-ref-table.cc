@@ -445,8 +445,18 @@ IndirectHandle<HeapObject> CloneCowBackingStore(Isolate* isolate,
   IndirectHandle<HeapObject> result;
 
   if (instance_type == FIXED_DOUBLE_ARRAY_TYPE) {
+    // Allocate the backing store in OLD_SPACE, exactly like the JS-object and
+    // FixedArray/PropertyArray copies below. A CoW copy is held live by an
+    // executing green thread (bodies run cooperatively on the embedding thread),
+    // so a young/NEW_SPACE backing store would be scavenger-moved mid-body while
+    // the copy pointer sits in a live register the redirect cannot rewrite. A
+    // double-backed FixedDoubleArray (e.g. values of `parent.values`) is the
+    // failing case here: without this it is nursery-allocated and torn by the
+    // scavenger, leaving a dangling pointer; old-space makes it scavenger-stable.
+    Handle<FixedArrayBase> copy_handle =
+        factory->NewFixedDoubleArray(src_length, AllocationType::kOld);
     IndirectHandle<FixedArrayBase> copy =
-        indirect_handle(factory->NewFixedDoubleArrayWithHoles(src_length));
+        indirect_handle(DirectHandle<FixedArrayBase>(*copy_handle, isolate));
     keep_alive->push_back(copy);
     result = IndirectHandle<HeapObject>(copy);
   } else if (instance_type == PROPERTY_ARRAY_TYPE) {
