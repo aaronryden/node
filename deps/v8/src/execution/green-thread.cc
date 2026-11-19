@@ -10,6 +10,7 @@
 
 #include "src/base/platform/platform.h"
 #include "src/execution/isolate.h"
+#include "src/execution/isolate-inl.h"
 #include "src/execution/green-thread-scheduler.h"
 
 namespace v8 {
@@ -104,11 +105,32 @@ void GreenThread::FreeGreenThreadLocalStorage(GreenThread* gt) {
 
 // --- Current green thread accessors ---
 
+// Attribution is worker-local inside a green-thread isolate (invariant I1):
+// each OS worker stores its current GT in its own PerIsolateThreadData, so
+// several workers running concurrently in one green isolate never clobber a
+// shared slot. Isolate::CurrentPerIsolateThreadData() is a proper thread_local
+// (not the aliased plain symbol the process-global slot uses), so it is safe
+// to call from the write barrier on any worker. For any other isolate we fall
+// back to the process-wide g_current_green_thread_ slot, preserving the legacy
+// single-OS-thread (Model A) behavior byte-for-byte.
 GreenThread* CurrentGreenThread() {
+  Isolate* iso = Isolate::TryGetCurrent();
+  if (iso != nullptr && iso->is_green_thread_mode()) {
+    Isolate::PerIsolateThreadData* pd = Isolate::CurrentPerIsolateThreadData();
+    if (pd != nullptr) return pd->current_green_thread();
+  }
   return g_current_green_thread_;
 }
 
 void SetCurrentGreenThread(GreenThread* thread) {
+  Isolate* iso = Isolate::TryGetCurrent();
+  if (iso != nullptr && iso->is_green_thread_mode()) {
+    Isolate::PerIsolateThreadData* pd = Isolate::CurrentPerIsolateThreadData();
+    if (pd != nullptr) {
+      pd->set_current_green_thread(thread);
+      return;
+    }
+  }
   g_current_green_thread_ = thread;
 }
 

@@ -152,6 +152,7 @@ class PersistentHandlesList;
 class ReadOnlyArtifacts;
 class RegExpStack;
 class RootVisitor;
+class GreenThread;
 class SetupIsolateDelegate;
 class SharedStructTypeRegistry;
 class Simulator;
@@ -603,6 +604,13 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       return isolate_ == isolate && thread_id_ == thread_id;
     }
 
+    // Worker-local current-GT accessor (M2 multi-mutator entry). Green-thread
+    // isolates run several OS workers at once; stored per worker in
+    // PerIsolateThreadData so concurrent mutators keep separate CoW
+    // attribution. Non-green isolates use the g_current_green_thread_ fallback
+    // in green-thread.cc and never touch this slot.
+    GreenThread* current_green_thread() const { return current_green_thread_; }
+    void set_current_green_thread(GreenThread* gt) { current_green_thread_ = gt; }
    private:
     Isolate* isolate_;
     ThreadId thread_id_;
@@ -622,6 +630,17 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     // existing PerIsolateThreadData field's offset.
     EntryStackItem* entry_stack_ = nullptr;
 
+    // Current green thread attributed to THIS OS worker for THIS isolate.
+    //
+    // Multi-mutator entry (M2): green-thread isolates run with several OS
+    // worker threads active at once, and PerIsolateThreadData is keyed per-OS-
+    // thread, so storing the current GT here (per worker) keeps each worker's
+    // CoW attribution separate instead of a single process-global slot that a
+    // concurrent worker would clobber. Gated on green_thread_mode_ in the
+    // accessors (green-thread.cc), so non-green isolates keep using the shared
+    // g_current_green_thread_ path unchanged. Last member -> never shifts an
+    // existing PerIsolateThreadData field's offset.
+    GreenThread* current_green_thread_ = nullptr;
     friend class Isolate;
     friend class ThreadDataTable;
     friend class EntryStackItem;
