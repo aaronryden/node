@@ -171,6 +171,12 @@ build your debugging around a core dump.
 **lldb invocation (gotchas, all cost real debugging cycles):**
 - `lldb -b -c <file>` is WRONG: `-c` is `--core <file>`, *not* a command file.
   Use `-o "command"` flags for batch input.
+- **Batch needs `-k` past a stop.** In optimized builds `process launch` stops on the
+  `EXC_BAD_ACCESS`/`EXC_BREAKPOINT` and lldb then *exits* batch mode, so any `-o` `bt`,
+  `thread list`, or `register read` after it silently never runs — you only get the stop
+  line. Suffix every post-stop command with `-k` (keep-going), e.g.
+  `lldb -b out/Release/node -o 'env GT_SHARED_HEAP=1' -o 'process launch' -k 'thread list' -k 'thread select 1' -k 'bt 45' -k 'register read' -- out/Release/node`.
+  (The `env` command sets the var; `settings set target.env-vars …` fails at `run`.)
 - Detecting a "real" stop by grepping for your own `echo ===== STOP =====`
   marker is a **false positive** — that echo runs on every invocation (normal
   completion too). Detect a real stop via `grep -E "EXC_\|stop reason =\|Process .* stopped"`.

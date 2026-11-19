@@ -89,6 +89,7 @@ using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::HandleScope;
+using v8::EscapableHandleScope;
 using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
@@ -345,33 +346,30 @@ static void LiftEmbeddingGlobals(Isolate* embedding,
   }
 }
 
-static Local<Context> GetGreenContext(Isolate* embedding,
-                                      Local<Context> embedding_ctx) {
-  Local<Context> result;
-  if (g_green_ctx.IsEmpty()) {
-    v8::Isolate::Scope isolate_scope(g_green_isolate);
-    HandleScope scope(g_green_isolate);
-    Local<Context> ctx = Context::New(g_green_isolate);
-    Context::Scope ctx_scope(ctx);
-    LiftEmbeddingGlobals(embedding, embedding_ctx, ctx);
-    g_green_ctx.Reset(g_green_isolate, ctx);
-    result = Local<Context>::New(g_green_isolate, g_green_ctx);
-  } else {
-    v8::Isolate::Scope isolate_scope(g_green_isolate);
-    HandleScope scope(g_green_isolate);
-    result = Local<Context>::New(g_green_isolate, g_green_ctx);
-  }
-  return result;
+// Ensure the green context exists, creating it (and lifting embedding globals
+// into it) on first use. The context is stored in the durable persistent
+// g_green_ctx, so no returned handle can dangle: callers reference the context
+// through a Persistent only. This function owns the create+lift window and roots
+// the context in g_green_ctx before its own scope ends.
+static void EnsureGreenContext(Isolate* embedding, Local<Context> embedding_ctx) {
+  if (!g_green_ctx.IsEmpty()) return;
+  v8::Isolate::Scope isolate_scope(g_green_isolate);
+  HandleScope scope(g_green_isolate);
+  Local<Context> ctx = Context::New(g_green_isolate);
+  Context::Scope ctx_scope(ctx);
+  LiftEmbeddingGlobals(embedding, embedding_ctx, ctx);
+  g_green_ctx.Reset(g_green_isolate, ctx);
 }
 
 // Relocate an embedding-isolate function onto the green isolate by
 // re-parsing its source, so a green body runs as green Code and free
 // variables resolve against the lifted green global.
-static Local<Function> RelocateFunction(Isolate* emb_isolate,
-                                        Local<Function> emb_fn,
-                                        Local<Context> green_ctx) {
-  // Capture the source on the embedding isolate, then parse + evaluate it on
-  // the green isolate so the body runs as green Code.
+// Returns the relocated body rooted in a Persistent on the green isolate. The
+// caller owns this durable handle; no caller handle scope is required because
+// the function is rooted inside this function before its own scope ends.
+static std::unique_ptr<Persistent<Function>> RelocateFunction(Isolate* emb_isolate,
+                                                              Local<Function> emb_fn) {
+  // Capture the source on the embedding isolate.
   std::string src;
   {
     v8::Isolate::Scope isolate_scope(emb_isolate);
@@ -382,37 +380,26 @@ static Local<Function> RelocateFunction(Isolate* emb_isolate,
     src.assign(*src_utf8, src_utf8.length());
   }
   std::string program = "(function(){ return " + src + "; })();";
-  Local<Function> relocated;
-  {
-    // Compile + evaluate on the green isolate, so the body becomes green Code
-    // whose free variables resolve against the lifted green global. A fresh
-    // Isolate::Scope + HandleScope + Context::Scope are required here because
-    // callers (e.g. RunTasks) establish the green isolate/scope only for the
-    // duration of GetGreenContext, which has already returned by now.
-    // GreenGCPause suspends incremental marking across the compile + run so the
-    // heap cannot relocate/move the JSFunction the compiler holds in a
-    // DirectHandle.
-    GreenGCPause gc(g_green_isolate);
-    v8::Isolate::Scope isolate_scope(g_green_isolate);
-    HandleScope scope(g_green_isolate);
-    // Root per_ctx on `scope`, which stays active until the end of this block,
-    // so the freshly created context is kept alive across Script::Compile/Run
-    // below. It must NOT be created inside its own nested HandleScope whose
-    // destructor runs before per_ctx is used: CloseScope resets the handle
-    // store (and zaps the released slot), leaving per_ctx a dangling Local that
-    // the compile then dereferences (SEGV/aborted SFI). `isolate_scope` above
-    // already keeps g_green_isolate current, so the nested isolate/context
-    // scopes were redundant.
-    Local<Context> per_ctx = Context::New(g_green_isolate);
-    Context::Scope ctx_scope(per_ctx);
-    Local<Script> script = Script::Compile(
-        per_ctx, String::NewFromUtf8(g_green_isolate, program.c_str(),
+  // Compile + run on the green isolate in green_ctx -- the persistent context
+  // that owns the lifted embedding globals (not a fresh per-function context,
+  // which used to give every body a different native context and left the green
+  // isolate's current context torn for the second body dispatched on it). Free
+  // variables in the body therefore resolve against those lifted globals. The
+  // result is rooted in a Persistent before this scope ends, so no Local
+  // dangles.
+  GreenGCPause gc(g_green_isolate);
+  v8::Isolate::Scope isolate_scope(g_green_isolate);
+  HandleScope scope(g_green_isolate);
+  Local<Context> green_ctx = Local<Context>::New(g_green_isolate, g_green_ctx);
+  Context::Scope ctx_scope(green_ctx);
+  Local<Script> script = Script::Compile(
+      green_ctx, String::NewFromUtf8(g_green_isolate, program.c_str(),
                                      v8::NewStringType::kNormal)
-                     .ToLocalChecked())
-                               .ToLocalChecked();
-    relocated = Local<Function>::Cast(script->Run(per_ctx).ToLocalChecked());
-  }
-  return relocated;
+                    .ToLocalChecked())
+                              .ToLocalChecked();
+  Local<Function> relocated =
+      Local<Function>::Cast(script->Run(green_ctx).ToLocalChecked());
+  return std::make_unique<Persistent<Function>>(g_green_isolate, relocated);
 }
 
 // ====================================================================
@@ -563,7 +550,9 @@ struct GreenValueCopier {
 static Local<Context> ContextFor(Isolate* iso) {
   if (iso == g_green_isolate) {
     v8::Isolate::Scope isolate_scope(iso);
-    HandleScope scope(iso);
+    // No inner HandleScope: the Local is created in the caller's handle scope,
+    // which stays open while the caller reads the context. Returning from an
+    // inner scope would dangle the Local (the bug this removes).
     return Local<Context>::New(iso, g_green_ctx);
   }
   return iso->GetCurrentContext();
@@ -572,20 +561,27 @@ static Local<Context> ContextFor(Isolate* iso) {
 // Copy a value from `copier.src`'s heap to `copier.dst`'s heap. Reads the value
 // into a GreenIR tree while the source isolate is current, then rebuilds it
 // while the destination isolate is current.
-static Local<Value> CopyValueAcross(const GreenValueCopier& copier, Local<Value> value) {
+// Returns the rebuilt value rooted in a Persistent on the destination isolate.
+// Self-contained: the value is rooted here before this function's scope ends, so
+// no caller handle scope is required and the durable handle is simply moved into
+// the caller's storage.
+static std::unique_ptr<Persistent<Value>> CopyValueAcross(const GreenValueCopier& copier,
+                                                          Local<Value> value) {
+  // Phase 1: read the value into a GreenIR tree while the source isolate is
+  // current.
   {
     v8::Isolate::Scope isolate_src(copier.src);
     HandleScope scope_src(copier.src);
     Local<Context> ctx = ContextFor(copier.src);
     std::unordered_map<uint64_t, GreenIR*> by_addr;
     GreenIR* ir = GreenCapture(copier.src, ctx, value, by_addr);
-    // Phase 2: rebuild on the destination isolate.
+    // Phase 2: rebuild on the destination isolate and root it in a Persistent.
     {
       v8::Isolate::Scope isolate_dst(copier.dst);
       HandleScope scope_dst(copier.dst);
       Local<Value> rebuilt = GreenRebuild(copier.dst, ir, ContextFor(copier.dst));
       delete ir;
-      return rebuilt;
+      return std::make_unique<Persistent<Value>>(copier.dst, rebuilt);
     }
   }
 }
@@ -634,6 +630,36 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
 
   Local<Function> fn = Local<Function>::New(data->isolate, data->fn_p);
   Local<Value> recv = ctx->Global();
+
+   // [DEBUG] Per-dispatch green-isolate topmost-context introspection, gated on
+   // GT_DEBUG_NATIVECTX (a single getenv() on the disabled path).
+   //
+   // Invoke() reads isolate->native_context() == thread_local_top()->context_
+   // ->native_context() at execution.cc:379-384; the n>=2 spawnAll crash
+   // dereferences the native context's script_execution_callback slot on the
+   // SECOND dispatch while the FIRST reads it fine. This prints the topmost
+   // context (what native_context() resolves through) with its map word, so a
+   // stale topmost context for the 2nd body (garbage map => topmost-context
+   // reset bug, 'H-b') can be told apart from a healthy one whose native context
+   // then resolves corrupt ('H-a', use-after-free/dangling). Dispatch order
+   // distinguishes 1st from 2nd; ActiveCount shows both views live.
+   if (::getenv("GT_DEBUG_NATIVECTX")) {
+      // ctx is the topmost context Invoke() resolves native_context() through
+      // (execution.cc:379). If its map word is not a heap pointer / valid
+      // Context map for the 2nd dispatch, that is H-b (topmost context stale).
+      // A healthy topmost context that then resolves to a corrupt native
+      // context points at H-a
+      // (use-after-free/dangling). Dispatch order distinguishes 1st from 2nd
+      // on the same green isolate; ActiveCount shows both views live
+      Address ctx_addr = UntaggedObjectAddress(Local<Object>::Cast(ctx));
+      Address ctx_map = *(const Address*)ctx_addr;
+      ::fprintf(stderr,
+                "[GTDBG-NCTX] iter=%u iso=%p count=%u ctx=%p ctxmap=%p\n",
+                (unsigned)gt->iteration_count(), (void*)data->isolate,
+                (unsigned)vi::GreenThreadCow::ActiveCount(),
+                (void*)ctx_addr, (void*)ctx_map);
+      ::fflush(stderr);
+    }
 
   std::vector<Local<Value>> argv;
   argv.reserve(data->args_p.size());
@@ -727,7 +753,7 @@ vi::GreenThread* CreateGreenThread(vi::Isolate* isolate) {
 // A malformed `tasks` argument throws before any green thread is scheduled.
 Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
                       bool* threw_out) {
-  HandleScope scope(isolate);
+  EscapableHandleScope scope(isolate);
   const uint32_t n = tasks->Length();
   *threw_out = false;
 
@@ -756,7 +782,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       *threw_out = true;
       ThrowTypeError(isolate, "green_threads.spawnAll(tasks): "
                                    "each task must be an array [fn, ...args]");
-      return Array::New(isolate, 0);
+      return scope.Escape(Array::New(isolate, 0));
     }
     Local<Array> task = Local<Array>::Cast(item);
     // Narrowing Value -> Function needs As<S>() here: this stripped V8's
@@ -767,7 +793,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       *threw_out = true;
       ThrowTypeError(isolate, "green_threads.spawnAll(tasks): "
                                    "task[0] must be a function");
-      return Array::New(isolate, 0);
+      return scope.Escape(Array::New(isolate, 0));
     }
     fns.push_back(fn);
     task_arrays.push_back(task);
@@ -783,7 +809,11 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     // harness is never corrupted. COW clones land on the green heap too.
     green_isolate_ret = GetGreenIsolate(isolate);
     vi_isolate_for_gt = reinterpret_cast<vi::Isolate*>(green_isolate_ret);
-    Local<Context> green_ctx = GetGreenContext(isolate, ctx);
+    // Ensure the green context lives in the durable persistent g_green_ctx
+    // (creating it + lifting embedding globals on first use). Bodies and
+    // argument copies below each root their outputs in a Persistent, so nothing
+    // dangles across the isolate switch.
+    EnsureGreenContext(isolate, ctx);
     GreenValueCopier args_copier;
     args_copier.src = isolate;
     args_copier.dst = green_isolate_ret;
@@ -791,15 +821,24 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       Local<Array> task = task_arrays[i];
       GreenCallData* data = new GreenCallData();
       data->isolate = green_isolate_ret;
-      data->context_p.Reset(green_isolate_ret, green_ctx);
-      data->fn_p.Reset(green_isolate_ret,
-                        RelocateFunction(isolate, fns[i], green_ctx));
+      // context_p is rooted from the durable persistent g_green_ctx -- no green
+      // handle scope is needed.
+      data->context_p.Reset(green_isolate_ret, g_green_ctx);
+      // Relocate the body onto the green isolate. RelocateFunction returns a
+      // durable Persistent rooted inside itself, so no caller handle scope is
+      // needed; Reset copies that handle into data->fn_p (it is not a Persistent
+      // move, which does not exist for this build).
+      std::unique_ptr<Persistent<Function>> relocated =
+          RelocateFunction(isolate, fns[i]);
+      data->fn_p.Reset(green_isolate_ret, *relocated);
       const uint32_t argc = task->Length();
       for (uint32_t a = 1; a < argc; a++) {
+        // The argument is read on the embedding isolate; its Local is rooted in
+        // RunTasks's embedding scope, which stays open for the whole call.
         Local<Value> arg = task->Get(ctx, a).ToLocalChecked();
-        data->args_p.push_back(
-            std::make_unique<Persistent<Value>>(green_isolate_ret,
-                                                CopyValueAcross(args_copier, arg)));
+        // CopyValueAcross returns a durable Persistent rooted on the green
+        // isolate; move that handle into the argument vector.
+        data->args_p.push_back(CopyValueAcross(args_copier, arg));
       }
       datas.push_back(data);
     }
@@ -860,12 +899,11 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       }
       Local<Value> green_result =
           Local<Value>::New(green_isolate_ret, datas[i]->result_p);
-      Local<Value> emb_result = CopyValueAcross(out_copier, green_result);
-      // Root the embedding-isolate value in a Persistent now (while emb_result
-      // is still a valid handle) so it is immune to the green scope's teardown.
-      Persistent<Value> rooted;
-      rooted.Reset(isolate, emb_result);
-      results->Set(ctx, i, Local<Value>::New(isolate, rooted)).Check();
+      // CopyValueAcross returns a durable Persistent rooted on the embedding
+      // isolate; root the result row directly from it.
+      std::unique_ptr<Persistent<Value>> emb_result_p =
+          CopyValueAcross(out_copier, green_result);
+      results->Set(ctx, i, Local<Value>::New(isolate, *emb_result_p)).Check();
     }
   } else {
     for (uint32_t i = 0; i < m; i++) {
@@ -892,7 +930,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     delete data;
   }
 
-  return results;
+  return scope.Escape(results);
 }
 
 }  // namespace
