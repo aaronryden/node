@@ -599,6 +599,20 @@ IndirectHandle<HeapObject> CloneObjectInternal(
   // only for plain objects and arrays.
   const bool is_js_root = is_data_root;
 
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+  // [GT-COW-CLONE] Diagnostic: log every backing-store or dictionary object the
+  // deep clone touches, so an internal V8 array/dictionary that is wrongly
+  // cloned (and later GC-dereferenced) can be identified. Gated on GT_HEAP_DIAG.
+  if (::getenv("GT_HEAP_DIAG") && (is_backing_store || map->is_dictionary_map())) {
+    static int gt_cseq = 0;
+    fprintf(stderr,
+            "[GT-COW-CLONE] #%05d src=0x%tx it=%d dict=%d is_root=%d backing=%d\n",
+            gt_cseq++, reinterpret_cast<Address>(src->address()),
+            static_cast<int>(instance_type), (int)map->is_dictionary_map(),
+            (int)is_data_root, (int)is_backing_store);
+  }
+#endif
+
   if (!is_data_root && !is_backing_store &&
       !IsCowCloneableNestedType(instance_type)) {
     return src;  // Immutable or unsupported: share it.

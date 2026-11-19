@@ -3130,6 +3130,12 @@ bool Compiler::Compile(Isolate* isolate, DirectHandle<JSFunction> function,
   // which means we are compiling after a bytecode flush.
   // TODO(verwaest/mythria): Investigate if allocating feedback vector
   // immediately after a flush would be better.
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_HEAP_DIAG") != nullptr) {
+    ::fprintf(stderr, "[GT-PI3133] LB3133 is_compiled=%d\n",
+              (int)is_compiled_scope->is_compiled());
+  }
+#endif
   JSFunction::InitializeFeedbackCell(isolate, function, is_compiled_scope,
                                      true);
   function->ResetTieringRequests(isolate);
@@ -3427,6 +3433,12 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
                  .Build();
     // TODO(mythria): I don't think we need this here. PostInstantiation
     // already initializes feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI3436] LB3436 has_shared is_compiled=%d\n",
+                (int)is_compiled_scope.is_compiled());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, result, &is_compiled_scope,
                                        true);
     if (allow_eval_cache) {
@@ -3442,6 +3454,12 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
                  .Build();
     // TODO(mythria): I don't think we need this here. PostInstantiation
     // already initializes feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI3457] LB3457 else is_compiled=%d\n",
+                (int)is_compiled_scope.is_compiled());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, result, &is_compiled_scope,
                                        true);
     if (allow_eval_cache) {
@@ -4619,12 +4637,26 @@ void Compiler::PostInstantiation(Isolate* isolate,
                                  DirectHandle<JSFunction> function,
                                  IsCompiledScope* is_compiled_scope) {
   DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-PI] iso=%p jsfunc=%p shared=%p is_compiled=%d shared_valid=%d\n",
+              (void*)isolate, (void*)function.address(), (void*)shared.address(),
+              (int)is_compiled_scope->is_compiled(),
+              (int)(shared.address() != 0 && shared.address() != 0x100000000ull ? 1 : 0));
+  }
+#endif
 
   // If code is compiled to bytecode (i.e., isn't asm.js), then allocate a
   // feedback and check for optimized code.
   if (is_compiled_scope->is_compiled() && shared->HasBytecodeArray()) {
     // Don't reset budget if there is a closure feedback cell array already. We
     // are just creating a new closure that shares the same feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI4648] LB4648 is_compiled=%d has_bc=%d\n",
+                (int)is_compiled_scope->is_compiled(), (int)shared->HasBytecodeArray());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, function, is_compiled_scope,
                                        false);
   }

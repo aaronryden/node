@@ -146,6 +146,23 @@ inline bool IsCowBackingStoreInstanceType(uint16_t instance_type) {
          instance_type == FIXED_DOUBLE_ARRAY_TYPE;
 }
 
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+// Diagnostic-only: map an instance-type enum to a short name for [GT-COW-*]
+// logs. Production code never calls this (GtTypeName is only read under
+// GT_HEAP_DIAG).
+static const char* GtTypeName(uint16_t it) {
+  switch (it) {
+    case JS_OBJECT_TYPE: return "JS_OBJECT";
+    case JS_ARRAY_TYPE: return "JS_ARRAY";
+    case HEAP_NUMBER_TYPE: return "HEAP_NUMBER";
+    case FIXED_ARRAY_TYPE: return "FIXED_ARRAY";
+    case PROPERTY_ARRAY_TYPE: return "PROPERTY_ARRAY";
+    case FIXED_DOUBLE_ARRAY_TYPE: return "FIXED_DOUBLE_ARRAY";
+    default: return "OTHER";
+  }
+}
+#endif
+
 // ================================================================
 // GC root integration
 //
@@ -671,6 +688,16 @@ Address GreenThreadCow::CowCloneForGeneratedCode(Address tagged_addr) {
     return tagged_addr;
   }
 
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+  // [GT-COW-JIT] Diagnostic: log JIT store-barrier operands. Gated on
+  // GT_HEAP_DIAG.
+  if (::getenv("GT_HEAP_DIAG")) {
+    static int gt_jseq = 0;
+    fprintf(stderr, "[GT-COW-JIT] #%05d val=%s\n", gt_jseq++,
+            GtTypeName(HeapObject::FromAddress(obj_ptr)->map()->instance_type()));
+  }
+#endif
+
   // Check and clone if needed.
   Address copy_addr = CowCheckBeforeStore(isolate, obj_ptr);
 
@@ -772,6 +799,18 @@ void GreenThreadCow::COWWriteBarrierCheck(Tagged<HeapObject> host,
   // mirroring the host-address guard in IsCowProvenanceHost. Real V8 heap
   // addresses are typically > 0x100000000 (64-bit).
   if (value.address() < 0x100000000ULL) return;
+
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+  // [GT-COW-STORE] Diagnostic: log every interpreter store barrier hit with the
+  // host and value instance types, so the object that corrupts a CoW copy can be
+  // traced. Gated on GT_HEAP_DIAG.
+  if (::getenv("GT_HEAP_DIAG")) {
+    static int gt_iseq = 0;
+    fprintf(stderr, "[GT-COW-STORE] #%05d host=%s val=%s\n", gt_iseq++,
+            GtTypeName(host->map()->instance_type()),
+            GtTypeName(value->map()->instance_type()));
+  }
+#endif
 
   // A boxed double (HeapNumber) is never stored as a heap-object reference:
   // JSObject::WriteToField stores its bit pattern inline into a

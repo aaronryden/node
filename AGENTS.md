@@ -233,9 +233,8 @@ matching the other copies. One-line, well-commented fix; cow → 20/20, 40×40 a
 60×60 stay green.
 
 **Do NOT re-add the deferral (historical lesson).** The old deferral gated
-`Heap::HandleGCRequest` across 5 files and *regressed* the very case it aimed to fix.
-Before adding any new mechanism, confirm the target actually fails without it —
-revert-first measurements are the cheapest root-cause analysis here. Don't re-add it.
+`Heap::HandleGCRequest` across 5 files and *regressed* the very case it aimed to
+fix. Don't re-add it.
 
 ## Why
 

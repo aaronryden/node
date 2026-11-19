@@ -228,6 +228,24 @@ int InterruptBudgetFor(Isolate* isolate, std::optional<CodeKind> code_kind,
 int TieringManager::InterruptBudgetFor(
     Isolate* isolate, Tagged<JSFunction> function,
     std::optional<CodeKind> override_active_tier) {
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_HEAP_DIAG") != nullptr) {
+    // Diagnostic: capture the JSFunction + its shared() at the crash entry so
+    // the caller can correlate whether function->shared() itself resolves to a
+    // zombie (uninitialized / CoW-unpublished) SFI here vs. a good one.
+    Tagged<SharedFunctionInfo> s = function->shared();
+    Address s_raw = reinterpret_cast<Address*>(s.address())[0];
+    fprintf(stderr,
+            "[GT-IBF] iso=%p function=0x%tx shared=0x%tx shared_raw_map=0x%tx "
+            "kind=%d is_compiled=%d has_bc=%d unpub=%d\n",
+            (void*)isolate, (unsigned long long)function.address(),
+            (unsigned long long)s.address(), (unsigned long long)s_raw,
+            (int)s->kind(), (int)s->is_compiled(),
+            (int)s->HasBytecodeArray(),
+            (int)s->HasUnpublishedTrustedData(isolate));
+    fflush(stderr);
+  }
+#endif
   DCHECK(function->shared()->is_compiled());
   const int bytecode_length =
       function->shared()->GetBytecodeArray(isolate)->length();

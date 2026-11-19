@@ -596,6 +596,9 @@ Handle<String> JSFunction::GetName(Isolate* isolate,
 void JSFunction::EnsureClosureFeedbackCellArray(
     Isolate* isolate, DirectHandle<JSFunction> function) {
   DCHECK(function->shared()->is_compiled());
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_PI") != nullptr) { ::fprintf(stderr, "[GTDBG-ECFA] iso=%p heap=%p jsf=%p sf=%p gc=%d\n",(void*)isolate,(void*)isolate->heap(),(void*)function->address(),(void*)function->shared().address(),(int)isolate->heap()->gc_state()); }
+#endif
   DCHECK(function->shared()->HasFeedbackMetadata());
 #if V8_ENABLE_WEBASSEMBLY
   if (function->shared()->HasAsmWasmData()) return;
@@ -623,9 +626,15 @@ void JSFunction::EnsureClosureFeedbackCellArray(
 
   DirectHandle<ClosureFeedbackCellArray> feedback_cell_array =
       ClosureFeedbackCellArray::New(isolate, shared);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_PI") != nullptr) { ::fprintf(stderr, "[GTDBG-ECFA3] iso=%p heap=%p jsf=%p sf=%p gc=%d\n",(void*)isolate,(void*)isolate->heap(),(void*)function->address(),(void*)function->shared().address(),(int)isolate->heap()->gc_state()); }
+#endif
   if (allocate_new_feedback_cell) {
     DirectHandle<FeedbackCell> feedback_cell =
         isolate->factory()->NewOneClosureCell(feedback_cell_array);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_PI") != nullptr) { ::fprintf(stderr, "[GTDBG-ECFA4] iso=%p heap=%p jsf=%p sf=%p gc=%d mapped=%p\n",(void*)isolate,(void*)isolate->heap(),(void*)function->address(),(void*)function->shared().address(),(int)isolate->heap()->gc_state(),(void*)*(void**)function->address()); }
+#endif
     // This is a rare case where we copy the dispatch entry from a JSFunction
     // to its FeedbackCell instead of the other way around.
     // TODO(42204201): investigate whether this can be avoided so that we only
@@ -644,6 +653,9 @@ void JSFunction::EnsureClosureFeedbackCellArray(
   // Initialize the interrupt budget when initializing the feedback cell with
   // the closure feedback cell for the first time, whether the feedback cell
   // itself is new or not.
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_PI") != nullptr) { ::fprintf(stderr, "[GTDBG-ECFA2] iso=%p heap=%p jsf=%p sf=%p gc=%d\n",(void*)isolate,(void*)isolate->heap(),(void*)function->address(),(void*)function->shared().address(),(int)isolate->heap()->gc_state()); }
+#endif
   function->SetInterruptBudget(isolate, BudgetModification::kReset);
 }
 

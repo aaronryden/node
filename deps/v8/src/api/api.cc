@@ -1883,6 +1883,13 @@ ScriptCompiler::StreamedSource::~StreamedSource() = default;
 Local<Script> UnboundScript::BindToCurrentContext() {
   auto function_info = Utils::OpenDirectHandle(this);
   i::Isolate* i_isolate = i::Isolate::Current();
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-BIND] iso=%p this=%p api_ext=%p\n",
+              (void*)i_isolate, (void*)this,
+              (void*)i_isolate->api_external_references());
+  }
+#endif
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   i::DirectHandle<i::JSFunction> function =
       i::Factory::JSFunctionBuilder{i_isolate, function_info,

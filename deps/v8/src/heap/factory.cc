@@ -4899,6 +4899,13 @@ Handle<JSFunction> Factory::JSFunctionBuilder::Build() {
   // below can fail to initialize the feedback vector.
   IsCompiledScope is_compiled_scope(sfi_->is_compiled_scope(isolate_));
   Handle<JSFunction> result = BuildRaw(code);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-BIND] iso=%p jsfunc=%p shared=%p sfi=%p\n",
+              (void*)isolate_, (void*)(*result).ptr(),
+              (void*)(*result)->shared().ptr(), (void*)(*sfi_).ptr());
+  }
+#endif
 
   if (code->kind() == CodeKind::BASELINE) {
     JSFunction::EnsureFeedbackVector(isolate_, result, &is_compiled_scope);

@@ -3738,6 +3738,17 @@ bool MarkCompactCollector::ProcessOldBytecodeSFI(
   const bool bytecode_already_decompiled =
       flushing_candidate->HasUncompiledData(isolate);
   if (!bytecode_already_decompiled) {
+    if (::getenv("GT_GC_DIAG")) {
+      Tagged<Object> d = flushing_candidate->GetTrustedData(isolate);
+      fprintf(stderr,
+              "[GT-PROC] ProcessOldBytecodeSFI SFI=0x%tx data=0x%tx "
+              "has_bc=%d has_uncompiled=%d kind=%d\n",
+              flushing_candidate->address(), d.ptr(),
+              flushing_candidate->HasBytecodeArray() ? 1 : 0,
+              bytecode_already_decompiled ? 1 : 0,
+              flushing_candidate->kind());
+      fflush(stderr);
+    }
     // Check if the bytecode is still live.
     Tagged<BytecodeArray> bytecode =
         flushing_candidate->GetBytecodeArrayForGC(isolate);
