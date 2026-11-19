@@ -6182,12 +6182,24 @@ void Isolate::Enter() {
   // Set the stack start for the main thread that enters the isolate.
   heap()->SetStackStart();
 
+  // Green-thread isolates allow several OS worker threads to be active at once,
+  // so each worker keeps its own EntryStackItem chain (in its per-OS-thread
+  // PerIsolateThreadData); every other isolate keeps the shared entry_stack_.
+  EntryStackItem* entry_stack =
+      (green_thread_mode_ && current_data != nullptr)
+          ? current_data->entry_stack_
+          : entry_stack_.load();
+
+  if (::getenv("GT_ENTER_DEBUG") && green_thread_mode_) {
+    ::fprintf(stderr, "[GTENTER] ENTER iso=%p tid=%d curdata=%p curiso=%p\n", (void*)this, (int)ThreadId::Current().ToInteger(), (void*)current_data, (void*)current_isolate);
+    ::fflush(stderr);
+  }
+
   if (current_data != nullptr) {
     current_isolate = current_data->isolate_;
     DCHECK_NOT_NULL(current_isolate);
     if (current_isolate == this) {
       DCHECK(Current() == this);
-      auto entry_stack = entry_stack_.load();
       DCHECK_NOT_NULL(entry_stack);
       DCHECK(entry_stack->previous_thread_data == nullptr ||
              entry_stack->previous_thread_data->thread_id() ==
@@ -6203,8 +6215,14 @@ void Isolate::Enter() {
   DCHECK(data->isolate_ == this);
 
   EntryStackItem* item =
-      new EntryStackItem(current_data, current_isolate, entry_stack_);
-  entry_stack_ = item;
+      new EntryStackItem(current_data, current_isolate, entry_stack);
+  if (green_thread_mode_) {
+    // Green-thread isolate: each OS worker owns its chain in its own
+    // PerIsolateThreadData so concurrent Enter/Exit never clobbers a sibling.
+    data->entry_stack_ = item;
+  } else {
+    entry_stack_ = item;
+  }
 
   SetIsolateThreadLocals(this, data);
 
@@ -6213,7 +6231,16 @@ void Isolate::Enter() {
 }
 
 void Isolate::Exit() {
-  auto current_entry_stack = entry_stack_.load();
+  // Green-thread isolate: load the worker's own per-thread chain head. Every
+  // other isolate keeps the shared entry_stack_ path.
+  EntryStackItem* current_entry_stack =
+      green_thread_mode_ ? CurrentPerIsolateThreadData()->entry_stack_
+                         : entry_stack_.load();
+
+  if (::getenv("GT_ENTER_DEBUG") && green_thread_mode_) {
+    ::fprintf(stderr, "[GTENTER] EXIT iso=%p tid=%d curdata=%p item=%p count=%d prev_iso=%p prevdata=%p\n", (void*)this, (int)ThreadId::Current().ToInteger(), (void*)CurrentPerIsolateThreadData(), (void*)current_entry_stack, current_entry_stack ? current_entry_stack->entry_count : -1, (void*)current_entry_stack->previous_isolate, (void*)current_entry_stack->previous_thread_data);
+    ::fflush(stderr);
+  }
   DCHECK_NOT_NULL(current_entry_stack);
   DCHECK(current_entry_stack->previous_thread_data == nullptr ||
          current_entry_stack->previous_thread_data->thread_id() ==
@@ -6231,7 +6258,12 @@ void Isolate::Exit() {
   DCHECK(CurrentPerIsolateThreadData()->isolate_ == this);
 
   // Pop the stack.
-  entry_stack_ = current_entry_stack->previous_item;
+  if (green_thread_mode_) {
+    CurrentPerIsolateThreadData()->entry_stack_ =
+        current_entry_stack->previous_item;
+  } else {
+    entry_stack_ = current_entry_stack->previous_item;
+  }
 
   PerIsolateThreadData* previous_thread_data =
       current_entry_stack->previous_thread_data;

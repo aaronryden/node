@@ -613,6 +613,15 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     Simulator* simulator_;
 #endif
 
+    // Head of this thread's EntryStackItem chain for a green-thread isolate.
+    // Green-thread isolates run with several OS worker threads active at once,
+    // and PerIsolateThreadData is keyed per-OS-thread, so each worker owns its
+    // own chain here: a worker's Exit() can never pop or free a sibling worker's
+    // item. Non-green isolates keep the shared Isolate::entry_stack_ path and
+    // never touch this slot. It is the last member so adding it never shifts an
+    // existing PerIsolateThreadData field's offset.
+    EntryStackItem* entry_stack_ = nullptr;
+
     friend class Isolate;
     friend class ThreadDataTable;
     friend class EntryStackItem;
@@ -799,6 +808,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   inline ThreadId thread_id() const {
     return thread_local_top()->thread_id_.load(std::memory_order_relaxed);
   }
+
+  // Green-thread isolates allow multiple OS worker threads to Enter/Exit the
+  // same isolate concurrently. The embedder sets this once, right after the
+  // isolate is created.
+  void set_green_thread_mode(bool mode) { green_thread_mode_ = mode; }
+  bool is_green_thread_mode() const { return green_thread_mode_; }
 
   void InstallConditionalFeatures(DirectHandle<NativeContext> context);
 
@@ -2957,6 +2972,16 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif
 
   bool is_frozen_ = false;
+
+  // Set by the embedder on a green-thread isolate to allow several OS worker
+  // threads to Enter/Exit the same isolate at once. When true, Enter/Exit keep
+  // each worker's EntryStackItem chain on its per-OS-thread PerIsolateThreadData
+  // instead of the shared entry_stack_. Every other isolate leaves this false and
+  // keeps the original single-threaded entry path byte-for-byte unchanged.
+  //
+  // Placed last (after every other data member) so adding it never shifts an
+  // existing isolate member's offset.
+  bool green_thread_mode_ = false;
 
   friend class GlobalSafepoint;
   friend class heap::HeapTester;

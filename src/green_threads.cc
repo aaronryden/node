@@ -50,6 +50,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <thread>
 
 #include "node_binding.h"
 #include "util.h"
@@ -245,6 +250,10 @@ static Isolate* GetGreenIsolate(Isolate* embedding) {
   Isolate::Initialize(isolate, params);
 
   g_green_isolate = isolate;
+  // Several OS worker threads will Enter/Exit this isolate concurrently, so mark
+  // it green-thread mode to route each worker's EntryStackItem chain onto its own
+  // PerIsolateThreadData (see Isolate::Enter/Exit).
+  g_green_isolate->SetGreenThreadMode(true);
   return isolate;
 }
 
@@ -1032,6 +1041,140 @@ void Spawn(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
+// green_threads.__concurrent_entry(n) -> { count, concurrent, results_ok }
+//
+// M1 architecture probe: proves that `n` OS worker threads can Enter the SAME
+// green isolate *simultaneously*, each holding a green entry frame. This
+// exercises the green_thread_mode_ entry path in Isolate::Enter/Exit -- per
+// worker keeps its own EntryStackItem chain in its PerIsolateThreadData, so the
+// change that makes concurrent multi-mutator entry possible (see
+// GT-OS-WORKER-POOL-PLAN.md).
+//
+// Each worker thread:
+//   1. Enters the green isolate (v8::Isolate::Scope), exercising Enter/Exit in
+//      green_thread_mode_. It records that GetCurrent()==green on this OS
+//      thread, i.e. the green entry frame (the per-thread entry_stack_ chain)
+//      is live.
+//   2. Reaches a rendezvous barrier and waits until all n workers have arrived.
+//      Serial (single-OS-thread) execution deadlocks at the barrier and the
+//      native side times out -> `concurrent` is false. Only n real OS threads
+//      arrive together, so `concurrent` is true.
+//   3. Exits (green_thread_mode_ path), keeping its own chain intact.
+//
+// This probe proves simultaneous ENTRY only. The barrier and the entry-frame
+// check touch no green-heap objects, so they cannot race the CoW machinery
+// (which is built around a single active JS mutator). Concurrent general-JS
+// execution -- heap access via inline caches, feedback vectors, and object
+// migration -- is an M2 / all-mutator-GC concern (invariants I3/I4) and is
+// deliberately not part of this bounded probe. Incremental marking is paused
+// (GreenGCPause) across setup + probe as an extra guard.
+void ConcurrentEntry(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope scope(isolate);
+  Local<Context> ctx = isolate->GetCurrentContext();
+
+  if (args.Length() < 1 || !args[0]->IsNumber()) {
+    ThrowTypeError(isolate,
+                   "green_threads.__concurrent_entry(n): the first argument "
+                   "must be a number");
+    return;
+  }
+  const int n = static_cast<int>(args[0]->NumberValue(ctx).ToChecked());
+  if (n < 1 || n > 64) {
+    ThrowTypeError(isolate,
+                   "green_threads.__concurrent_entry(n): n must be in [1, 64]");
+    return;
+  }
+
+  // Create (and mark green-thread mode) the shared green isolate + context on
+  // the embedding thread, before any worker runs.
+  Isolate* green = GetGreenIsolate(isolate);
+  EnsureGreenContext(isolate, ctx);
+
+  // Shared rendezvous state, referenced by every worker through pointers.
+  std::atomic<int> arrived{0};
+  std::atomic<bool> timed_out{false};
+  // char (not std::vector<bool>): vector<bool> is a bitfield whose
+  // read-modify-write is not safe for concurrent access to distinct elements,
+  // so each worker writes its own byte.
+  std::vector<char> got_result(static_cast<size_t>(n), 0);
+  std::vector<char> entry_live(static_cast<size_t>(n), 0);
+  const long long deadline_ns =
+      std::chrono::steady_clock::now().time_since_epoch().count() +
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::milliseconds(5000))
+          .count();
+  std::atomic<int>* arrived_p = &arrived;
+  std::atomic<bool>* timed_out_p = &timed_out;
+  std::vector<char>* got_p = &got_result;
+  std::vector<char>* live_p = &entry_live;
+
+  // Pause incremental marking across the whole probe as an extra guard so the
+  // barrier cannot observe a concurrent collection. This probe holds no green
+  // heap objects, so nothing else needs pausing.
+  {
+    v8::Isolate::Scope isolate_scope(green);
+    GreenGCPause gc(green);
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      const int idx = i;
+      workers.emplace_back([=]() {
+        // (1) Enter the green isolate: green_thread_mode_ keeps this worker's
+        // EntryStackItem chain on its own PerIsolateThreadData, so it cannot
+        // clobber a sibling worker's.
+        v8::Isolate::Scope scope(green);
+
+        // The green entry frame is live on this OS thread: Current() is the
+        // green isolate (its per-thread entry_stack_ chain was pushed by Enter).
+        (*live_p)[static_cast<size_t>(idx)] =
+            static_cast<char>(v8::Isolate::GetCurrent() == green);
+
+        // (2) Rendezvous barrier: every worker must arrive before any proceeds.
+        // Serial (single-OS-thread) execution deadlocks here -- worker 0 spins
+        // waiting for threads that can never be scheduled -- so the timeout
+        // fires and timed_out is set -> concurrent comes back false. Only n
+        // real OS threads arrive together, so concurrent is true.
+        (void)arrived_p->fetch_add(1, std::memory_order_seq_cst);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(5000);
+        while (arrived_p->load(std::memory_order_seq_cst) < n) {
+          if (std::chrono::steady_clock::now() >= deadline) {
+            timed_out_p->store(true, std::memory_order_seq_cst);
+            return;
+          }
+          std::this_thread::yield();
+        }
+        (*got_p)[static_cast<size_t>(idx)] = 1;
+
+        // scope destructor: Exit the green isolate (green_thread_mode_ path),
+        // popping this worker's own entry_stack_ chain.
+      });
+    }
+    for (std::thread& w : workers) w.join();
+  }
+  // Green scope exited + GC resumed; the embedding isolate is current again.
+
+  // Build the report on the embedding isolate.
+  bool all_reached = true;  // every worker reached the rendezvous
+  bool all_live = true;     // every worker held a live green entry frame
+  for (int i = 0; i < n; ++i) {
+    if (!got_result[static_cast<size_t>(i)]) all_reached = false;
+    if (!entry_live[static_cast<size_t>(i)]) all_live = false;
+  }
+  const bool concurrent = !timed_out.load(std::memory_order_seq_cst);
+  Local<Object> report = Object::New(isolate);
+  report->Set(ctx, String::NewFromUtf8(isolate, "count").ToLocalChecked(),
+              Number::New(isolate, static_cast<double>(n)));
+  report->Set(ctx, String::NewFromUtf8(isolate, "concurrent").ToLocalChecked(),
+              Boolean::New(isolate, concurrent));
+  report->Set(ctx,
+              String::NewFromUtf8(isolate, "results_ok").ToLocalChecked(),
+              Boolean::New(isolate, concurrent && all_reached && all_live));
+  args.GetReturnValue().Set(report);
+}
+
 // green_threads.yield()
 // Cooperative checkpoint: hands control to the next green thread and returns
 // when scheduling returns here. No-op when called outside a running green
@@ -1136,6 +1279,7 @@ void InitGreenThreads(Local<Object> exports,
   node::SetMethod(context, exports, "addrOf", AddrOf);
   node::SetMethod(context, exports, "cowCloneOf", CowCloneOf);
   node::SetMethod(context, exports, "__dbg", Dbg);
+  node::SetMethod(context, exports, "__concurrent_entry", ConcurrentEntry);
    node::SetMethod(context, exports, "__cowForce", CowForce);
   node::SetMethod(context, exports, "version",
                   [](const FunctionCallbackInfo<Value>& args) {

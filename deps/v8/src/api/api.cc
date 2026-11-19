@@ -10122,6 +10122,17 @@ void Isolate::Exit() {
   i_isolate->Exit();
 }
 
+void Isolate::SetGreenThreadMode(bool mode) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
+  i_isolate->set_green_thread_mode(mode);
+}
+
+bool Isolate::isGreenThreadMode() const {
+  i::Isolate* i_isolate =
+      reinterpret_cast<i::Isolate*>(const_cast<Isolate*>(this));
+  return i_isolate->is_green_thread_mode();
+}
+
 void Isolate::SetAbortOnUncaughtExceptionCallback(
     AbortOnUncaughtExceptionCallback callback) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
