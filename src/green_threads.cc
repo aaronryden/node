@@ -54,6 +54,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <thread>
 
 #include "node_binding.h"
@@ -1175,7 +1176,172 @@ void ConcurrentEntry(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(report);
 }
 
-// green_threads.yield()
+// Coarse green-mutator lock (M2a baseline). Serializes concurrent body execution
+// so at most ONE OS worker mutates the green heap's shared state (bump-pointer
+// allocator, cached Maps, and any GC) at a time. Concurrent object-literal
+// creation races here: 8 threads create objects of the same shape, resolve the
+// single cached Map, and mutate it via Map::InobjectSlackTrackingStep while their
+// young-space bump pointers collide -> EXC_BAD_ACCESS in Factory/Map stores.
+// True all-mutator parallelism (I3 stop-the-world GC + I4 serialized allocation)
+// is the later milestone; this lock is the "mutex-protected" phase the plan
+// anticipates and the safe correctness baseline N workers run behind. Kept
+// process-global: there is exactly one green isolate per process.
+static std::mutex g_green_mutator_lock;
+
+// green_threads.__m2_probe(n, fn0, ..., fn_{n-1}) -> { results: [..], all_ok: bool }
+//
+// M2 foundational probe: `n` OS worker threads run `n` self-contained allocating
+// CoW bodies SIMULTANEOUSLY in ONE green isolate. This is the first slice of the
+// all-mutator-GC work (GT-OS-WORKER-POOL-PLAN.md M2) and exercises two invariants
+// under real concurrent JS execution:
+//
+//   I1 (worker-local GT attribution). Each worker sets its own GT as the current
+//   green thread BEFORE running its body, so the CoW write barrier attributes
+//   every store to THIS worker's Thread -- not the process-global slot a sibling
+//   worker would clobber. Before M2 this slot was process-global (single
+//   embedding thread); see SetCurrentGreenThread/CurrentGreenThread.
+//
+//   I4 (per-GT CoW ownership). Each body allocates disjoint objects, so the only
+//   shared state is the green heap itself. A crash or wrong result here is a
+//   multi-mutator race, not a test bug.
+//
+// Bodies are self-contained (no embedding-scope closure): closure capture cannot
+// cross the isolate boundary, so a dependency-bearing body would fail for an
+// orthogonal reason. Forced GC while workers are active (I3) is a later slice;
+// this pass leaves allocation-driven (serial) GC alone so the I1/I4 signals are
+// isolated.
+void M2Probe(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  HandleScope scope(isolate);
+  Local<Context> ctx = isolate->GetCurrentContext();
+
+  if (args.Length() < 2 || !args[0]->IsNumber()) {
+    ThrowTypeError(isolate,
+                   "green_threads.__m2_probe(n, ...bodies): the first argument "
+                   "must be a worker count");
+    return;
+  }
+  const int n = static_cast<int>(args[0]->NumberValue(ctx).ToChecked());
+  if (n < 1 || n > 64) {
+    ThrowTypeError(isolate,
+                   "green_threads.__m2_probe(n, ...): n must be in [1, 64]");
+    return;
+  }
+  if (args.Length() - 1 < static_cast<int>(n)) {
+    ThrowTypeError(isolate,
+                   "green_threads.__m2_probe(n, ...): expected n body functions");
+    return;
+  }
+
+  // 1. Shared green isolate + context. Relocate + register every body on the
+  //    embedding thread (single writer, so g_gt_registry has no concurrent
+  //    writes); only after all setup do workers run.
+  Isolate* green = GetGreenIsolate(isolate);
+  EnsureGreenContext(isolate, ctx);
+
+  struct Work { vi::GreenThread* gt; GreenCallData* data; };
+  std::vector<Work> works;
+  works.reserve(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    Local<Function> emb_fn = Local<Function>::Cast(args[i + 1]);
+    std::unique_ptr<Persistent<Function>> relocated = RelocateFunction(isolate, emb_fn);
+
+    GreenCallData* data = new GreenCallData();
+    data->isolate = green;
+    data->context_p.Reset(green, g_green_ctx);
+    data->fn_p.Reset(green, *relocated);
+
+    vi::GreenThread* gt = CreateGreenThread(reinterpret_cast<vi::Isolate*>(green));
+    data->gt = gt;
+    g_gt_registry[gt] = data;
+    works.push_back(Work{gt, data});
+  }
+
+  // Warm up each body ONCE on this (single embedding) thread before any worker
+  // is spawned. First execution triggers JIT compilation: Compiler::Compile ->
+  // JSFunction::UpdateCode writes shared Code objects and the Code::flags_
+  // atomic. Concurrent workers hitting that exact path is the first M2 race
+  // (observed: multiple OS threads EXC_BAD_ACCESS in UpdateCode/Code::flags),
+  // because 8 threads cannot safely write Code state at once. After warmup the
+  // optimized Code is already set, so a worker's Builtins_CompileLazy only
+  // READS Code flags (safe concurrently) and never calls UpdateCode again.
+  // Bodies here are pure (allocate-local, return), so the discarded warmup
+  // run does not affect the concurrent results.
+  for (Work& w : works) {
+    vi::SetCurrentGreenThread(w.gt);
+    GreenJSEntry(reinterpret_cast<vi::Isolate*>(green), w.gt);
+  }
+
+  // 2. Run n workers concurrently. `ok` is written by every worker, so each
+  //    worker gets a private pointer into it (captured by value) to avoid the
+  //    [=} capture making a per-worker copy.
+  std::vector<char> ok(static_cast<size_t>(n), 0);
+  char* ok_p = ok.data();
+  {
+    v8::Isolate::Scope green_scope(green);
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      const int idx = i;
+      Work w = works[idx];
+      workers.emplace_back([=]() {
+        // (a) Enter the green isolate: green_thread_mode_ keeps this worker's
+        // entry chain on its own PerIsolateThreadData (M1).
+        v8::Isolate::Scope worker_scope(w.data->isolate);
+        // Acquire the green-mutator lock so this worker is the sole mutator on
+        // the green heap while its body runs. This serializes the young-space
+        // bump-pointer allocation and mutation of shared cached Maps (e.g.
+        // Map::InobjectSlackTrackingStep during object-literal creation), which
+        // otherwise race across the N workers -> EXC_BAD_ACCESS. Held across the
+        // whole GreenJSEntry call via RAII.
+        std::lock_guard<std::mutex> mutator_guard(g_green_mutator_lock);
+        // (b) Worker-local attribution (I1): set BEFORE the body so the CoW
+        // barrier attributes every store to THIS worker's GT.
+        vi::SetCurrentGreenThread(w.gt);
+        // (c) Run the body: GreenJSEntry switches to the green isolate and calls
+        // the body, setting data->result_p / data->threw.
+        GreenJSEntry(reinterpret_cast<vi::Isolate*>(green), w.gt);
+        ok_p[idx] = static_cast<char>(!w.data->threw && !w.data->result_p.IsEmpty());
+      });
+    }
+    for (std::thread& wt : workers) wt.join();
+  }
+
+  // 3. Copy results back to the embedding isolate.
+  Local<Array> results = Array::New(isolate, n);
+  bool all_ok = true;
+  {
+    v8::Isolate::Scope green_scope(green);
+    HandleScope green_handle_scope(green);
+    GreenValueCopier out_copier{green, isolate};  // green -> embedding
+    for (int i = 0; i < n; ++i) {
+      if (!ok_p[i]) {
+        all_ok = false;
+        continue;
+      }
+      Local<Value> green_result = Local<Value>::New(green, works[i].data->result_p);
+      std::unique_ptr<Persistent<Value>> emb = CopyValueAcross(out_copier, green_result);
+      results->Set(ctx, i, Local<Value>::New(isolate, *emb)).Check();
+    }
+  }
+
+  // 4. Teardown CoW + free per-worker state (mirrors RunTasks' cleanup).
+  for (Work& w : works) {
+    vi::GreenThreadCow::Teardown(w.gt);
+    g_gt_registry.erase(w.gt);
+    w.data->args_p.clear();
+    w.data->result_p.Reset();
+    w.data->fn_p.Reset();
+    delete w.data;
+    delete w.gt;
+  }
+
+  Local<Object> report = Object::New(isolate);
+  report->Set(ctx, String::NewFromUtf8(isolate, "results").ToLocalChecked(), results).Check();
+  report->Set(ctx, String::NewFromUtf8(isolate, "all_ok").ToLocalChecked(),
+              Boolean::New(isolate, all_ok)).Check();
+  args.GetReturnValue().Set(report);
+}
 // Cooperative checkpoint: hands control to the next green thread and returns
 // when scheduling returns here. No-op when called outside a running green
 // thread (there is nothing to yield to).
@@ -1280,6 +1446,7 @@ void InitGreenThreads(Local<Object> exports,
   node::SetMethod(context, exports, "cowCloneOf", CowCloneOf);
   node::SetMethod(context, exports, "__dbg", Dbg);
   node::SetMethod(context, exports, "__concurrent_entry", ConcurrentEntry);
+  node::SetMethod(context, exports, "__m2_probe", M2Probe);
    node::SetMethod(context, exports, "__cowForce", CowForce);
   node::SetMethod(context, exports, "version",
                   [](const FunctionCallbackInfo<Value>& args) {
