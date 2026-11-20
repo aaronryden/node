@@ -5,6 +5,10 @@
 #ifndef GREEN_THREADS_GC_H_
 #define GREEN_THREADS_GC_H_
 
+#include <functional>
+#include <string>
+#include <vector>
+
 #include <v8.h>
 
 namespace node {
@@ -40,6 +44,39 @@ class GreenGCPause final {
   v8::internal::Heap* heap_;
   bool was_running_;
 };
+
+// Discover the names of the variables the green body `emb_fn` captures from its
+// enclosing lexical scopes (its free variables), innermost-first.
+//
+// Defined in green_threads_gc.cc -- not green_threads.cc -- because it walks the
+// internal scope-info / context chain via js-function.h, which drags V8's
+// heap.h + V8 tracing/trace-event.h in. Keeping that here (the single TU allowed
+// to include V8's heap headers) leaves heap.h, and therefore V8's trace-event.h,
+// out of green_threads.cc, which must keep node's tracing/trace_event.h (see
+// GreenGCPause above). Returns plain std::string names only; all V8-internal
+// work -- reinterpretting the public handle, the context walk, and String
+// decoding -- happens entirely inside green_threads_gc.cc.
+std::vector<std::string> CaptureGreenClosureVars(v8::Isolate* emb_isolate,
+                                                 v8::Local<v8::Function> emb_fn);
+
+// Read the current values of the free variables `CaptureGreenClosureVars`
+// discovered for the green body `emb_fn` -- by those exact names -- from the
+// embedding closure-context chain, invoking `yield(name, value)` for each as a
+// public `v8::Local<v8::Value>` on the embedding isolate.
+//
+// A closure's free variables are the inlined locals of its context; the slot
+// index `var` of such a name (ScopeInfo::ContextInlinedLocalName) is exactly the
+// context-slot index (Context::Get) holding its bound value, so the value is
+// read directly with the internal Context::Get and bridged to a public handle
+// with Utils::Convert (the only internal->public bridge, no type check). The
+// value is yielded while the enclosing HandleScope keeps it rooted -- the caller
+// MUST consume it within the callback (e.g. structured-capture it) because no
+// Local is returned past this point. Captures carrying std::string + heap-owned
+// GreenIR pointers between the embedding and green passes keep no handle across
+// the isolate boundary.
+void CaptureGreenClosureValues(
+    v8::Isolate* emb_isolate, v8::Local<v8::Function> emb_fn,
+    const std::function<void(const std::string&, v8::Local<v8::Value>)>& yield);
 
 }  // namespace node
 

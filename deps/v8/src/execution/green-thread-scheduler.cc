@@ -235,8 +235,6 @@ void GreenScheduler::Yield() {
 //   2. If the current thread is complete, skip and pick a new one.
 //   3. Otherwise, run the green thread until it yields or completes.
 void GreenScheduler::ScheduleLoop() {
-  if (::getenv("GT_COW_DEBUG"))
-    ::fprintf(stderr, "[GTDBG-SCHED] ScheduleLoop start os=%ld\n", (long)pthread_self());
   while (true) {
     GreenThread* current = CurrentGreenThread();
     if (current == nullptr) {
@@ -244,12 +242,8 @@ void GreenScheduler::ScheduleLoop() {
       GreenThread* next = DequeueGlobal();
       if (next == nullptr) {
         // No more threads to run.
-        if (::getenv("GT_COW_DEBUG"))
-          ::fprintf(stderr, "[GTDBG-SCHED] ScheduleLoop queue empty -> break\n");
         break;
       }
-      if (::getenv("GT_COW_DEBUG"))
-        ::fprintf(stderr, "[GTDBG-SCHED] ScheduleLoop dequeue next=%p\n", (void*)next);
 
       GreenProcessor* p = GetOrCreateProcessor();
       p->set_current_thread(next);
@@ -277,6 +271,17 @@ void GreenScheduler::ScheduleLoop() {
 
     // Clear current so the next iteration picks a new thread.
     SetCurrentGreenThread(nullptr);
+  }
+
+  // The embedding runner frees every green thread once this drain returns, so
+  // detach from the last running thread here while it is still allocated.
+  // Otherwise GreenProcessor::current_thread_ would dangle: when a later spawn
+  // reuses this persistent scheduler, GreenProcessor::set_current_thread would
+  // dereference the freed thread in its "detach from old" step (a
+  // heap-use-after-free). Detaching now is safe because the last thread has
+  // only completed scheduling, not been destroyed.
+  if (GreenProcessor* p = GetOrCreateProcessor()) {
+    p->set_current_thread(nullptr);
   }
 }
 

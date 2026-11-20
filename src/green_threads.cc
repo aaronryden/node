@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <pthread.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <atomic>
@@ -68,6 +69,14 @@
 #include "src/execution/green-thread-scheduler.h"
 #include "src/execution/heap-ref-table.h"
 
+// NOTE: green_threads.cc deliberately does NOT include V8 object headers
+// (contexts.h, scope-info.h, js-function.h, string.h). Those pull V8's
+// heap.h -> tracing/trace-event.h, which collides with node's tracing/trace_event.h
+// (pulled below via env-inl.h -> node_internals.h). The internal closure
+// scope-walk that needs them now lives in green_threads_gc.cc (the single TU
+// allowed to include V8's heap headers), exposed here as the public-API
+// CaptureGreenClosureVars(). See green_threads_gc.h for the full rationale.
+
 // GreenGCPause (GC suspension across the green-compile + run window) is defined
 // in green_threads_gc.cc, a dedicated V8-context translation unit. Declaring it
 // here would pull V8's tracing/trace-event.h (via heap.h -> gc-tracer.h) into
@@ -85,6 +94,11 @@
 #include "node_v8_platform-inl.h"
 
 namespace node {
+// Forward declaration of the green `g` shell installer, defined below in node
+// scope. LiftEmbeddingGlobals (in the anonymous namespace) calls it, so this
+// lives here in node scope to match the definition's linkage/scope.
+static void InstallGreenGlobalsShell(v8::Local<v8::Context> green_ctx);
+
 namespace {
 
 namespace vi = v8::internal;
@@ -96,6 +110,7 @@ using v8::Function;
 using v8::FunctionCallbackInfo;
 using v8::HandleScope;
 using v8::EscapableHandleScope;
+using v8::FunctionTemplate;
 using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
@@ -116,6 +131,11 @@ struct GreenCallData {
   Isolate* isolate = nullptr;
   Persistent<Context> context_p;  // The context the body runs in.
   Persistent<Function> fn_p;      // The user's green-thread body.
+  // Isolate that owns fn_p's handle (the embedding isolate in every mode). The
+  // body is the embedding Function itself, so its Persistent can only be read
+  // back on that isolate -- GreenJSEntry recovers it there before switching to
+  // the green isolate/context for execution.
+  Isolate* fn_isolate = nullptr;
   // Arguments passed to the body. Each is stored as its own Persistent<Value>
   // cell, wrapped in a unique_ptr so the argument vector can grow (a
   // Persistent<Value> is non-copyable and cannot live in a std::vector by
@@ -354,6 +374,11 @@ static void LiftEmbeddingGlobals(Isolate* embedding,
       green_ctx->Global()->Set(green_ctx, name_key, lifted.ToLocalChecked()).Check();
     }
   }
+  // Provide the green `g` shell so a body that references the native binding as
+  // a free variable resolves it (native/function-bearing bindings are skipped by
+  // the closure lift -- see LiftCapturedValues -- because moving them across
+  // isolates would share an embedding SFI, an F1 cross-heap hazard).
+  InstallGreenGlobalsShell(green_ctx);
 }
 
 // Ensure the green context exists, creating it (and lifting embedding globals
@@ -370,6 +395,10 @@ static void EnsureGreenContext(Isolate* embedding, Local<Context> embedding_ctx)
   LiftEmbeddingGlobals(embedding, embedding_ctx, ctx);
   g_green_ctx.Reset(g_green_isolate, ctx);
 }
+
+static void LiftCapturedValues(Isolate* emb_isolate,
+                               Local<Function> emb_fn,
+                               Local<Context> green_ctx);
 
 // Relocate an embedding-isolate function onto the green isolate by
 // re-parsing its source, so a green body runs as green Code and free
@@ -402,6 +431,12 @@ static std::unique_ptr<Persistent<Function>> RelocateFunction(Isolate* emb_isola
   HandleScope scope(g_green_isolate);
   Local<Context> green_ctx = Local<Context>::New(g_green_isolate, g_green_ctx);
   Context::Scope ctx_scope(green_ctx);
+  // Lift captured closure values (module-scope `const`s like `vals`; native
+  // bindings like `g` are skipped) onto the green global by name, so the
+  // reparsed body's free variables resolve. Runs inside the ambient
+  // GreenGCPause above; pass 1 reads the embedding closure context, pass 2
+  // GreenRebuilds structured values onto green.
+  LiftCapturedValues(emb_isolate, emb_fn, green_ctx);
   Local<Script> script = Script::Compile(
       green_ctx, String::NewFromUtf8(g_green_isolate, program.c_str(),
                                      v8::NewStringType::kNormal)
@@ -553,10 +588,12 @@ struct GreenValueCopier {
 
 // Retrieve (creating it if necessary) the context to read a value on the given
 // isolate. In shared-heap mode the green isolate owns a green context; other
-// isolates use their current context. The green context is already the current
-// one on the green isolate when this is called from the copy loops, so the
-// Isolate::Scope below is a no-op switch -- it only guarantees the returned
-// handle belongs to the correct isolate.
+// isolates use their current context. NOTE: this returns a handle only -- it
+// does NOT make the context current on the isolate. Callers that build values
+// on `iso` must enter it themselves (CopyValueAcross installs a Context::Scope),
+// because single-arg V8 API constructors resolve their state from the isolate's
+// current context. Isolate::Scope below only switches the current isolate so the
+// returned handle belongs to the correct one.
 static Local<Context> ContextFor(Isolate* iso) {
   if (iso == g_green_isolate) {
     v8::Isolate::Scope isolate_scope(iso);
@@ -589,9 +626,132 @@ static std::unique_ptr<Persistent<Value>> CopyValueAcross(const GreenValueCopier
     {
       v8::Isolate::Scope isolate_dst(copier.dst);
       HandleScope scope_dst(copier.dst);
-      Local<Value> rebuilt = GreenRebuild(copier.dst, ir, ContextFor(copier.dst));
+      // Enter the destination context as current on the destination isolate
+      // BEFORE any API constructor runs. GreenRebuild calls single-arg
+      // constructors (Object::New, Undefined, Boolean, Number, String) that
+      // resolve their backing state from the isolate's *current* context, not
+      // from the `ctx` argument they are handed. With no context entered on the
+      // green isolate those reads resolve a null/garbage context -- its map
+      // word is 0xffffffffffffffff -- and SEGV. This is the crash behind an
+      // object argument to spawnAll/spawn and the M2 concurrency probe
+      // (stressBody's `parent` object), which copy values onto the green
+      // isolate. `dst_ctx` is rooted in scope_dst above, so it stays live for
+      // the whole rebuild and across this scope's teardown.
+      Local<Context> dst_ctx = ContextFor(copier.dst);
+      v8::Context::Scope ctx_scope(dst_ctx);
+      Local<Value> rebuilt = GreenRebuild(copier.dst, ir, dst_ctx);
       delete ir;
       return std::make_unique<Persistent<Value>>(copier.dst, rebuilt);
+    }
+  }
+}
+
+// Lift the embedding function's captured (free-variable) values onto the green
+// global by name, so the body reparsed by RelocateFunction resolves them. This
+// mirrors LiftEmbeddingGlobals: pass 1 runs on the embedding isolate and walks
+// emb_fn's closure-context chain to read each captured value; pass 2 runs on the
+// green isolate (inside the GreenGCPause RelocateFunction left suspended) and
+// GreenRebuilds the structured values onto green. Native bindings are skipped:
+// functions and bindings shaped like the `green_threads` exports can't be
+// structured-captured and are resolved on green via the green `g` shell.
+//
+// Both the captured free-variable NAMES and VALUES come from the closure-context
+// chain (JSFunction::context() -> Context::previous(), ScopeInfo::ContextInlined
+// LocalName -> Context::Get at the same slot). That walk needs V8's js-function.h
+// / scope-info.h / contexts.h, which drag heap.h + V8's tracing/trace-event.h in
+// -- so the walk lives in green_threads_gc.cc (the TU allowed to include V8's
+// heap headers, see green_threads_gc.h), which keeps green_threads.cc on the
+// public API. CaptureGreenClosureValues returns the captured values by name,
+// bridged to public Local<Value> on the embedding isolate, so green_threads.cc
+// never touches a vi:: pointer. Captures carried between passes are plain C++
+// (heap-owned GreenIR pointers keyed by source address), so no handle crosses the
+// isolate boundary.
+static void LiftCapturedValues(Isolate* emb_isolate,
+                               Local<Function> emb_fn,
+                               Local<Context> green_ctx) {
+  // LiftSpec: one captured free variable, ready to install on the green global.
+  struct LiftSpec {
+    std::string name;  // install under this name on the green global.
+    GreenIR* ir;       // structured capture (heap-owned; freed in pass 2).
+  };
+  std::vector<LiftSpec> specs;  // captured values, rebuilt and installed in pass 2.
+  //
+  // Pass 1 -- embedding isolate current. Capture each free var's value, read
+  // directly from the closure-context slot (an internal read), structured into a
+  // GreenIR tree. The value-local bridge to a public handle happens inside
+  // CaptureGreenClosureValues (green_threads_gc.cc); here we only GreenCapture the
+  // value while the embedding isolate is current. Functions are skipped (a
+  // JSFunction can't be rebuilt as a green value -- sharing an embedding SFI is an
+  // F1 cross-heap hazard); native bindings resolve on green via the green `g`
+  // shell. Values (arrays, numbers, ...) are structured-captured so a body that
+  // mutates one (e.g. `++count`) writes its private green copy, not the embedding
+  // value -- preserving CoW isolation.
+  {
+    v8::Isolate::Scope isolate_scope(emb_isolate);
+    HandleScope scope(emb_isolate);
+    Local<Context> emb_ctx = emb_isolate->GetCurrentContext();
+    // True when `value` (or any nested property) is a JSFunction: such a value
+    // is a native/function-bearing binding (e.g. the `green_threads` exports
+    // `g`) that cannot be structured-captured, so it is skipped. Native methods
+    // reached as g.<method> resolve on green via the green `g` shell.
+    auto contains_function = [&](Local<Value> value) -> bool {
+      if (value->IsFunction()) return true;
+      if (!value->IsObject()) return false;
+      std::vector<Local<Value>> work;
+      work.push_back(value);
+      while (!work.empty()) {
+        Local<Value> v = work.back();
+        work.pop_back();
+        if (!v->IsObject() || v->IsArray()) continue;
+        Local<Array> keys =
+            v.As<Object>()->GetPropertyNames(emb_ctx).ToLocalChecked();
+        for (uint32_t i = 0; i < keys->Length(); i++) {
+          // Resolve the property by NAME: the integer `i` is an indexed
+          // lookup (`Object::Get(context, index)`) that misses named properties,
+          // so it cannot see the exports' function methods and would wrongly
+          // return false for `g`, letting GreenCapture choke on the binding.
+          Local<Value> key = keys->Get(emb_ctx, i).ToLocalChecked();
+          if (!key->IsString()) continue;
+          v8::Local<v8::String> key_s = key.As<v8::String>();
+          Local<Value> p = v.As<Object>()->Get(emb_ctx, key_s).ToLocalChecked();
+          if (p->IsFunction()) return true;
+          if (p->IsObject()) work.push_back(p);
+        }
+      }
+      return false;
+    };
+    // CaptureGreenClosureValues yields each captured (name, value) pair while the
+    // value is rooted in the scope above -- GreenCapture consumes it into a
+    // heap-owned GreenIR within the callback, so no Local escapes this scope.
+    CaptureGreenClosureValues(emb_isolate, emb_fn,
+                              [&](const std::string& name, Local<Value> value) {
+                                // Native/function-bearing bindings (e.g. the
+                                // green_threads exports `g`) can't be
+                                // structured-captured; skip them so the green
+                                // `g` shell resolves them.
+                                if (contains_function(value)) return;
+                                std::unordered_map<uint64_t, GreenIR*> by_addr;  // fresh per name.
+                                specs.push_back(LiftSpec{
+                                    name, GreenCapture(emb_isolate, emb_ctx, value, by_addr)});
+                              });
+  }
+  //
+  // Pass 2 -- green isolate current (RelocateFunction installed it inside its
+  // GreenGCPause). Rebuild each structured capture on green and install it under
+  // its original name on the green global, so the reparsed body resolves the free
+  // variable against that green global. Each GreenIR is heap-owned and deleted
+  // after rebuild.
+  {
+    v8::Isolate::Scope isolate_scope(g_green_isolate);
+    HandleScope scope(g_green_isolate);
+    Context::Scope ctx_scope(green_ctx);
+    for (const LiftSpec& spec : specs) {
+      Local<Value> rebuilt = GreenRebuild(g_green_isolate, spec.ir, green_ctx);
+      Local<String> name_key = String::NewFromUtf8(
+          g_green_isolate, spec.name.c_str(), v8::NewStringType::kNormal,
+          spec.name.length()).ToLocalChecked();
+      green_ctx->Global()->Set(green_ctx, name_key, rebuilt).Check();
+      delete spec.ir;
     }
   }
 }
@@ -615,10 +775,6 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   if (it == g_gt_registry.end()) return;
   GreenCallData* data = it->second;
 
-  if (::getenv("GT_COW_DEBUG"))
-    ::fprintf(stderr, "[GTDBG-BODY] GreenJSEntry body start iter=%u os=%ld gt=%p current=%p\n",
-              (unsigned)gt->iteration_count(), (long)pthread_self(), (void*)gt, (void*)vi::CurrentGreenThread());
-
   // Phase machine: iteration 1 runs the body; anything else has already run.
   // In the recursive Model A, ScheduleLoop calls RunGreenThread once per GT and
   // Yield() drives the rest via recursion, so the body always runs at iter 1.
@@ -638,39 +794,12 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   Local<Context> ctx = Local<Context>::New(data->isolate, data->context_p);
   Context::Scope context_scope(ctx);
 
-  Local<Function> fn = Local<Function>::New(data->isolate, data->fn_p);
+  // fn_p lives on fn_isolate, which is the same isolate as data->isolate in
+  // every current mode (green in shared-heap / M2 modes, embedding otherwise),
+  // so recovering it here is equivalent to reading it on data->isolate; the
+  // field documents ownership and future-proofs a split ownership.
+  Local<Function> fn = Local<Function>::New(data->fn_isolate, data->fn_p);
   Local<Value> recv = ctx->Global();
-
-   // [DEBUG] Per-dispatch green-isolate topmost-context introspection, gated on
-   // GT_DEBUG_NATIVECTX (a single getenv() on the disabled path).
-   //
-   // Invoke() reads isolate->native_context() == thread_local_top()->context_
-   // ->native_context() at execution.cc:379-384; the n>=2 spawnAll crash
-   // dereferences the native context's script_execution_callback slot on the
-   // SECOND dispatch while the FIRST reads it fine. This prints the topmost
-   // context (what native_context() resolves through) with its map word, so a
-   // stale topmost context for the 2nd body (garbage map => topmost-context
-   // reset bug, 'H-b') can be told apart from a healthy one whose native context
-   // then resolves corrupt ('H-a', use-after-free/dangling). Dispatch order
-   // distinguishes 1st from 2nd; ActiveCount shows both views live.
-   if (::getenv("GT_DEBUG_NATIVECTX")) {
-      // ctx is the topmost context Invoke() resolves native_context() through
-      // (execution.cc:379). If its map word is not a heap pointer / valid
-      // Context map for the 2nd dispatch, that is H-b (topmost context stale).
-      // A healthy topmost context that then resolves to a corrupt native
-      // context points at H-a
-      // (use-after-free/dangling). Dispatch order distinguishes 1st from 2nd
-      // on the same green isolate; ActiveCount shows both views live
-      Address ctx_addr = UntaggedObjectAddress(Local<Object>::Cast(ctx));
-      Address ctx_map = *(const Address*)ctx_addr;
-      ::fprintf(stderr,
-                "[GTDBG-NCTX] iter=%u iso=%p count=%u ctx=%p ctxmap=%p\n",
-                (unsigned)gt->iteration_count(), (void*)data->isolate,
-                (unsigned)vi::GreenThreadCow::ActiveCount(),
-                (void*)ctx_addr, (void*)ctx_map);
-      ::fflush(stderr);
-    }
-
   std::vector<Local<Value>> argv;
   argv.reserve(data->args_p.size());
   for (auto& arg : data->args_p) {
@@ -678,24 +807,10 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   }
 
   Local<Value> out;
-  if (::getenv("GT_COW_DEBUG")) {
-    ::fprintf(stderr, "[GTDBG-NODE] fn->Call-BEGIN iter=%u current==gt=%d count=%u cow_en=%d ref_table=%p\n",
-              (unsigned)gt->iteration_count(),
-              (vi::CurrentGreenThread() == gt) ? 1 : 0,
-              (unsigned)vi::GreenThreadCow::ActiveCount(),
-              (int)gt->cow_enabled(), (void*)gt->cow_ref_table());
-  }
   if (!fn->Call(ctx, recv, argv.size(), argv.data()).ToLocal(&out)) {
     data->threw = true;
     gt->set_state(vi::GreenThreadState::kComplete);
     return;
-  }
-  if (::getenv("GT_COW_DEBUG")) {
-    ::fprintf(stderr, "[GTDBG-NODE] fn->Call-END iter=%u current==gt=%d count=%u ref_table=%p\n",
-              (unsigned)gt->iteration_count(),
-              (vi::CurrentGreenThread() == gt) ? 1 : 0,
-              (unsigned)vi::GreenThreadCow::ActiveCount(),
-              (void*)gt->cow_ref_table());
   }
   data->result_p.Reset(data->isolate, out);
   gt->set_state(vi::GreenThreadState::kComplete);
@@ -742,16 +857,9 @@ void ThrowTypeError(const Isolate* isolate, const char* message) {
 // `GreenThreadCow::Teardown` (called per thread after scheduling) balances it.
 vi::GreenThread* CreateGreenThread(vi::Isolate* isolate) {
   vi::GreenThread* gt = new vi::GreenThread(isolate);
-  if (::getenv("GT_COW_DEBUG"))
-    ::fprintf(stderr, "[GTDBG-NODE] CreateGreenThread gt=%p os_thread=%ld\n",
-              (void*)gt, (long)pthread_self());
   gt->set_pc_raw(reinterpret_cast<Address>(&GreenJSEntry));
   gt->set_state(vi::GreenThreadState::kRunnable);
   vi::GreenThreadCow::Initialize(gt);
-  if (::getenv("GT_COW_DEBUG"))
-    ::fprintf(stderr, "[CREATE-GT] gt=%p ref_table=%p cow_en=%d iter=%d\n",
-              (void*)gt, (void*)gt->cow_ref_table(), (int)gt->cow_enabled(),
-              (unsigned)gt->iteration_count());
   return gt;
 }
 
@@ -814,9 +922,13 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   datas.reserve(n);
   if (GreenHeapEnabled()) {
     // Shared-heap mode: route each task onto the dedicated green isolate. The
-    // body is re-parsed there so it runs as green Code, and arguments are
-    // copied in so bodies mutate private copies and the shared `parent` in the
-    // harness is never corrupted. COW clones land on the green heap too.
+    // body is the embedding Function itself; it is called on the green
+    // context (see GreenJSEntry) but kept rooted on the embedding isolate so its
+    // captured lexical scope (closures) survives -- reparsing its source into a
+    // fresh green function would strip the closure and every scenario that
+    // references captured state would throw. Arguments are copied in so bodies
+    // mutate private copies and the shared `parent` in the harness is never
+    // corrupted. COW clones land on the green heap too.
     green_isolate_ret = GetGreenIsolate(isolate);
     vi_isolate_for_gt = reinterpret_cast<vi::Isolate*>(green_isolate_ret);
     // Ensure the green context lives in the durable persistent g_green_ctx
@@ -837,9 +949,11 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       // Relocate the body onto the green isolate. RelocateFunction returns a
       // durable Persistent rooted inside itself, so no caller handle scope is
       // needed; Reset copies that handle into data->fn_p (it is not a Persistent
-      // move, which does not exist for this build).
+      // move, which does not exist for this build). fn_isolate is green, so
+      // GreenJSEntry recovers the handle on the green isolate.
       std::unique_ptr<Persistent<Function>> relocated =
           RelocateFunction(isolate, fns[i]);
+      data->fn_isolate = green_isolate_ret;
       data->fn_p.Reset(green_isolate_ret, *relocated);
       const uint32_t argc = task->Length();
       for (uint32_t a = 1; a < argc; a++) {
@@ -857,6 +971,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       Local<Array> task = task_arrays[i];
       GreenCallData* data = new GreenCallData();
       data->isolate = isolate;
+      data->fn_isolate = isolate;
       data->context_p.Reset(isolate, ctx);
       data->fn_p.Reset(isolate, fns[i]);
       const uint32_t argc = task->Length();
@@ -944,43 +1059,6 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
 }
 
 }  // namespace
-
-// ====================================================================
-// DEBUG: opaque native logging hook, kept alive so the JIT cannot elide the
-// body statements it wraps. Prints its JS args as text to stderr under
-// GT_COW_DEBUG. Lets the body prove whether the write happens on every call.
-void Dbg(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  std::string out;
-  for (int i = 0; i < args.Length(); i++) {
-    Local<Value> v = args[i];
-    if (v->IsNumber()) {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%.17g", Local<Number>::Cast(v)->Value());
-      out += buf;
-    } else if (v->IsString()) {
-      String::Utf8Value utf8(isolate, v);
-      out += *utf8;
-    } else if (v->IsObject()) {
-      Address a = UntaggedObjectAddress(Local<Object>::Cast(v));
-      char buf[32];
-      snprintf(buf, sizeof(buf), "0x%lx", static_cast<unsigned long>(a));
-      out += buf;
-    } else if (v->IsUndefined()) {
-      out += "undefined";
-    } else if (v->IsNull()) {
-      out += "null";
-    } else {
-      out += "?";
-    }
-    out += "|";
-  }
-  if (getenv("GT_COW_DEBUG") != nullptr) {
-    ::fprintf(stderr, "[DBG] %s\n", out.c_str());
-    ::fflush(stderr);
-  }
-  args.GetReturnValue().SetUndefined();
-}
 
 // Public API
 // ====================================================================
@@ -1248,6 +1326,10 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
 
     GreenCallData* data = new GreenCallData();
     data->isolate = green;
+    // RelocateFunction returns a green-isolate Persistent, so GreenJSEntry must
+    // recover the handle on the green isolate here (unlike RunTasks, which roots
+    // the embedding Function on the embedding isolate to preserve closures).
+    data->fn_isolate = green;
     data->context_p.Reset(green, g_green_ctx);
     data->fn_p.Reset(green, *relocated);
 
@@ -1386,10 +1468,6 @@ void CowCloneOf(const FunctionCallbackInfo<Value>& args) {
   }
   Address addr = UntaggedObjectAddress(Local<Object>::Cast(args[0]));
   Address copy = vi::kNullAddress;
-  if (getenv("GT_COW_DEBUG") != nullptr) {
-    ::fprintf(stderr, "[CowCloneOf] lookup addr=0x%lx\n", static_cast<unsigned long>(addr));
-    ::fflush(stderr);
-  }
   if (gt->cow_ref_table()->FindCopy(addr, &copy)) {
     args.GetReturnValue().Set(
         BigInt::NewFromUnsigned(isolate, static_cast<uint64_t>(copy)));
@@ -1398,28 +1476,55 @@ void CowCloneOf(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
-// TEMPORARY diagnostic: force-clone via the C++ path (deep-test Path A),
-// bypassing the write-barrier. Returns the copy addr or undefined.
-void CowForce(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  HandleScope scope(isolate);
-  if (args.Length() < 1 || !args[0]->IsObject()) {
-    args.GetReturnValue().SetUndefined();
-    return;
-  }
-  vi::GreenThread* gt = vi::CurrentGreenThread();
-  if (gt == nullptr || !gt->cow_enabled() || !gt->cow_ref_table()) {
-    args.GetReturnValue().SetUndefined();
-    return;
-  }
-  Address addr = UntaggedObjectAddress(Local<Object>::Cast(args[0]));
-  Address copy = vi::GreenThreadCow::CowCheckBeforeStore(gt->isolate(), addr);
-  if (copy == addr) {
-    args.GetReturnValue().SetUndefined();
-  } else {
-    args.GetReturnValue().Set(
-        BigInt::NewFromUnsigned(isolate, static_cast<uint64_t>(copy)));
-  }
+// Build the green `g` shell: a green-isolate-bound object exposing the same
+// native methods as the embedding `green_threads` module, so a green body's free
+// variable `g` resolves to a callable binding instead of throwing ReferenceError.
+//
+// Each method is a fresh JS function bound to the shared C++ callback, so when
+// the body calls g.<method> while executing on the green isolate, args.GetIsolate()
+// returns the green isolate and the callback operates on the current green
+// thread's own state (CoW ref table, scheduler, ...). The object is installed on
+// the green context's global, so it resolves as a free variable in any body
+// reparsed onto this context.
+static void InstallGreenGlobalsShell(Local<Context> green_ctx) {
+  v8::Isolate::Scope isolate_scope(g_green_isolate);
+  HandleScope scope(g_green_isolate);
+  // Suspend green-isolate marking across the allocate + install window so GC
+  // cannot move the freshly-created object and its functions while we root them.
+  GreenGCPause gc(g_green_isolate);
+  Context::Scope ctx_scope(green_ctx);
+  Local<Object> g_shell = Object::New(g_green_isolate);
+  auto set_method = [&](const char* name,
+                        void (*cb)(const FunctionCallbackInfo<Value>&)) {
+    Local<Function> f =
+        FunctionTemplate::New(g_green_isolate, cb)
+            ->GetFunction(green_ctx)
+            .ToLocalChecked();
+    Local<String> key = String::NewFromUtf8(g_green_isolate, name,
+                                            v8::NewStringType::kNormal)
+                            .ToLocalChecked();
+    g_shell->Set(green_ctx, key, f).Check();
+  };
+  set_method("spawn", Spawn);
+  set_method("spawnAll", SpawnAll);
+  set_method("yield", Yield);
+  set_method("addrOf", AddrOf);
+  set_method("cowCloneOf", CowCloneOf);
+  g_shell->Set(
+      green_ctx,
+      String::NewFromUtf8(g_green_isolate, "version",
+                          v8::NewStringType::kNormal)
+          .ToLocalChecked(),
+      String::NewFromUtf8(g_green_isolate, "1",
+                          v8::NewStringType::kNormal)
+          .ToLocalChecked())
+      .Check();
+  green_ctx->Global()->Set(
+      green_ctx,
+      String::NewFromUtf8(g_green_isolate, "g",
+                          v8::NewStringType::kNormal)
+          .ToLocalChecked(),
+      g_shell).Check();
 }
 
 // ====================================================================
@@ -1444,10 +1549,8 @@ void InitGreenThreads(Local<Object> exports,
   node::SetMethod(context, exports, "yield", Yield);
   node::SetMethod(context, exports, "addrOf", AddrOf);
   node::SetMethod(context, exports, "cowCloneOf", CowCloneOf);
-  node::SetMethod(context, exports, "__dbg", Dbg);
   node::SetMethod(context, exports, "__concurrent_entry", ConcurrentEntry);
   node::SetMethod(context, exports, "__m2_probe", M2Probe);
-   node::SetMethod(context, exports, "__cowForce", CowForce);
   node::SetMethod(context, exports, "version",
                   [](const FunctionCallbackInfo<Value>& args) {
                     args.GetReturnValue().Set(String::NewFromUtf8(
