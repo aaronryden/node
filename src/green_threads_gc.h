@@ -78,6 +78,34 @@ void CaptureGreenClosureValues(
     v8::Isolate* emb_isolate, v8::Local<v8::Function> emb_fn,
     const std::function<void(const std::string&, v8::Local<v8::Value>)>& yield);
 
+// Forced GC modes for the M2 forced-GC acceptance test (item 2). The knob is
+// read from the GT_M2_FORCE_GC environment variable so the existing probe path
+// is byte-for-byte unchanged when it is unset.
+enum class M2ForcedGCMode {
+  kNone,     // unset: never force a collection (default, unchanged behavior)
+  kYoung,    // force one young (all-available) collection
+  kFull,     // force one full collection
+  kBoth,     // force young then full (the 4-workers-active acceptance gate)
+};
+
+// Parse the GT_M2_FORCE_GC env var ("young"|"full"|"both"; unset -> kNone).
+M2ForcedGCMode M2ParseForcedGCEnv();
+
+// Force a young and/or full collection on the green isolate, gated by `mode`.
+//
+// The caller (M2Probe) has already invoked GreenThreadCow::RequestAllMutatorsStop
+// (which release-stores gc_requested and snapshots the active COW views) and, in
+// the forced-GC test, the worker threads are parked at their entry safepoint.
+// That quiescence is what makes a synchronous full collection safe here: the
+// collector walks only published, reported roots and no mutator is mid-body.
+//
+// young|both -> Heap::CollectAllAvailableGarbage(kTesting);
+// full|both  -> Heap::CollectAllGarbage(kNoFlags, kTesting, kGCCallbackFlagForced).
+// Collecting on the green isolate's own heap (via vi::Isolate::heap()) keeps this
+// in the single TU that owns V8's heap headers, so heap.h stays out of
+// green_threads.cc (see the GreenGCPause rationale above).
+void M2ForceGC(v8::Isolate* green_isolate, M2ForcedGCMode mode);
+
 }  // namespace node
 
 #endif  // GREEN_THREADS_GC_H_

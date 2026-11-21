@@ -191,6 +191,16 @@ void GreenScheduler::Yield() {
   GreenThread* current = CurrentGreenThread();
   if (current == nullptr) return;
 
+  // Item 1 (invariant I3): before publishing this GT's registers, poll for a
+  // forced stop-the-world GC request. If one is in progress, this publishes the
+  // GT's roots and parks the worker here (returning true) so the collector sees
+  // only quiescent mutators. This is the single existing green-thread safepoint
+  // where a worker regains control between native calls; reusing it (rather than
+  // inventing a new bytecode probe) means every worker that yields stops for GC.
+  if (GreenThreadCow::PollForGCRequest(current, isolate_)) {
+    return;  // Parked: the coordinator resumes this worker later.
+  }
+
   GreenProcessor* p = current->processor();
   if (p != nullptr) {
     // Save the green thread's general-purpose registers into its spill

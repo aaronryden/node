@@ -145,6 +145,11 @@ struct GreenCallData {
   // the body, across the whole ScheduleLoop run.
   std::vector<std::unique_ptr<Persistent<Value>>> args_p;
   Persistent<Value> result_p;   // Body return value.
+  // Disjoint per-worker allocation marker (a small rooted object on the green
+  // heap) used by the forced-GC acceptance test (item 2): it is rooted for the
+  // whole probe so the forced GC -- which runs while this worker is parked --
+  // cannot reclaim it, and post_gc_consistent verifies it survived intact.
+  Persistent<Value> marker_p;
   bool threw = false;
   vi::GreenThread* gt = nullptr;  // Underlying green thread descriptor.
 };
@@ -936,6 +941,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     // argument copies below each root their outputs in a Persistent, so nothing
     // dangles across the isolate switch.
     EnsureGreenContext(isolate, ctx);
+
     GreenValueCopier args_copier;
     args_copier.src = isolate;
     args_copier.dst = green_isolate_ret;
@@ -1322,6 +1328,10 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   Isolate* green = GetGreenIsolate(isolate);
   EnsureGreenContext(isolate, ctx);
 
+   // Item 2 (acceptance gate for item 1): an env-gated forced-GC knob.
+   // Unset = current behavior (byte-for-byte unchanged). "young"|"full"|"both"
+   // forces the corresponding collection(s) while the N workers are active.
+   const M2ForcedGCMode force_gc_mode = M2ParseForcedGCEnv();
   struct Work { vi::GreenThread* gt; GreenCallData* data; };
   std::vector<Work> works;
   works.reserve(static_cast<size_t>(n));
@@ -1347,6 +1357,21 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     data->gt = gt;
     g_gt_registry[gt] = data;
     works.push_back(Work{gt, data});
+     // Item 2: allocate a disjoint per-worker allocation marker on the green
+     // heap, rooted via a Persistent handle so the forced GC (which runs while
+     // this worker is parked) cannot reclaim it. post_gc_consistent verifies
+     // it survived the collection intact. Only built when the knob is set.
+     if (force_gc_mode != M2ForcedGCMode::kNone) {
+       v8::Isolate::Scope marker_scope(green);
+       v8::HandleScope marker_hs(green);
+       Local<Context> marker_ctx = Local<Context>::New(green, data->context_p);
+       Context::Scope marker_ctx_scope(marker_ctx);
+       Local<Object> marker = Object::New(green);
+       marker->Set(marker_ctx,
+                   String::NewFromUtf8(green, "id").ToLocalChecked(),
+                   v8::Integer::New(green, i)).Check();
+       data->marker_p.Reset(green, marker);
+     }
   }
 
   // Warm up each body ONCE on this (single embedding) thread before any worker
@@ -1374,7 +1399,15 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   // pointers from the SAME green heap — the entire point of GT_SHARED_HEAP=1.
   // Reset to the serial fast path once the workers join; the result-copy and
   // teardown below are single-threaded and must not pay CAS overhead.
-  vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, true);
+  // Item 1 (I3) / item 2: announce the stop-the-world GC BEFORE spawning the
+  // workers, so their entry safepoints observe the request and park before
+  // allocating. This quiescence (not the old
+  // GreenThreadCOWSuspendedConcurrentGC suppression) is what makes the
+  // synchronous collection below safe: the collector walks only published,
+  // reported, quiescent roots.
+  if (force_gc_mode != M2ForcedGCMode::kNone) {
+    vi::GreenThreadCow::RequestAllMutatorsStop(nullptr, nullptr);
+  }
   {
     v8::Isolate::Scope green_scope(green);
     std::vector<std::thread> workers;
@@ -1385,6 +1418,15 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
       workers.emplace_back([=]() {
         // (a) Enter the green isolate: green_thread_mode_ keeps this worker's
         // entry chain on its own PerIsolateThreadData (M1).
+        // Item 1 (I3) / item 2: the single per-worker safepoint on this path.
+        // If a forced GC is in progress, PollForGCRequest publishes this
+        // worker's roots and parks it here (before the mutator lock + body)
+        // until the coordinator resumes it; otherwise it returns immediately.
+        // Either way we fall through to the body, which runs only after the
+        // coordinator has collected and resumed.
+        if (force_gc_mode != M2ForcedGCMode::kNone) {
+          vi::GreenThreadCow::PollForGCRequest(w.gt, reinterpret_cast<vi::Isolate*>(green));
+        }
         v8::Isolate::Scope worker_scope(w.data->isolate);
         // Acquire the green-mutator lock so this worker is the sole mutator on
         // the green heap while its body runs. This serializes the young-space
@@ -1402,6 +1444,25 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
         ok_p[idx] = static_cast<char>(!w.data->threw && !w.data->result_p.IsEmpty());
       });
     }
+    // Item 1 (I3) / item 2: quiescence barrier -- spin-join every spawned
+    // worker until it has published + parked at its entry safepoint, so the
+    // collection below runs only when no mutator is mid-body. This is the
+    // step that REPLACES GreenThreadCOWSuspendedConcurrentGC: without it the
+    // collector could start before the workers park and observe torn state.
+    if (force_gc_mode != M2ForcedGCMode::kNone) {
+      vi::GreenThreadCow::WaitForAllMutatorsParked(2000);
+    }
+
+  // Item 1 (I3) / item 2: run the forced young + full collection now that
+  // every worker is parked at its entry safepoint (published + quiescent),
+  // so no mutator is mid-body. This is the acceptance gate for the handshake.
+  if (force_gc_mode != M2ForcedGCMode::kNone) {
+    M2ForceGC(green, force_gc_mode);
+  }
+   // Resume the parked workers so the joined bodies can run and finish.
+   if (force_gc_mode != M2ForcedGCMode::kNone) {
+     vi::GreenThreadCow::ResumeAllMutators();
+   }
     for (std::thread& wt : workers) wt.join();
   }
 
@@ -1425,6 +1486,44 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     }
   }
 
+   // Item 2: every rooted per-worker marker must have survived the forced GC
+   // (still allocated, still carrying its original id). This MUST be checked
+   // before teardown below, which resets marker_p -- the assertion only holds
+   // on the forced-GC path, so it is false when the knob is unset.
+   bool post_gc_consistent = (force_gc_mode == M2ForcedGCMode::kNone);
+   if (force_gc_mode != M2ForcedGCMode::kNone) {
+     post_gc_consistent = true;
+     for (int i = 0; i < n; ++i) {
+       if (works[i].data->marker_p.IsEmpty()) {
+         post_gc_consistent = false;
+         break;
+       }
+       v8::Isolate::Scope marker_scope(green);
+       v8::HandleScope marker_hs(green);
+       Local<Context> marker_ctx =
+           Local<Context>::New(green, works[i].data->context_p);
+       // marker_p roots an Object on the green heap (see the allocation above):
+       // { id: <worker index> }. The per-worker marker must survive the forced
+       // collection intact -- still allocated AND still carrying its original id.
+       // (This is the I3 acceptance assertion: a rooted marker must not be swept.
+       // Only meaningful on the forced-GC path, so it is false when unset.)
+       Local<Value> marker_val = works[i].data->marker_p.Get(green);
+       if (marker_val.IsEmpty() || !marker_val->IsObject()) {
+         post_gc_consistent = false;
+         break;
+       }
+       Local<Value> id_val = marker_val.As<Object>()->Get(
+           marker_ctx, String::NewFromUtf8(green, "id").ToLocalChecked())
+         .ToLocalChecked();
+       if (!id_val->IsNumber() ||
+           id_val->NumberValue(marker_ctx).ToChecked() !=
+               static_cast<double>(i)) {
+         post_gc_consistent = false;
+         break;
+       }
+     }
+   }
+
   // 4. Teardown CoW + free per-worker state (mirrors RunTasks' cleanup).
   for (Work& w : works) {
     vi::GreenThreadCow::Teardown(w.gt);
@@ -1432,14 +1531,18 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     w.data->args_p.clear();
     w.data->result_p.Reset();
     w.data->fn_p.Reset();
+     w.data->marker_p.Reset();
     delete w.data;
     delete w.gt;
   }
+
 
   Local<Object> report = Object::New(isolate);
   report->Set(ctx, String::NewFromUtf8(isolate, "results").ToLocalChecked(), results).Check();
   report->Set(ctx, String::NewFromUtf8(isolate, "all_ok").ToLocalChecked(),
               Boolean::New(isolate, all_ok)).Check();
+   report->Set(ctx, String::NewFromUtf8(isolate, "post_gc_consistent").ToLocalChecked(),
+               Boolean::New(isolate, post_gc_consistent)).Check();
   args.GetReturnValue().Set(report);
 }
 // Cooperative checkpoint: hands control to the next green thread and returns

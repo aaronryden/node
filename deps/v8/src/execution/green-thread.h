@@ -6,7 +6,9 @@
 #define V8_EXECUTION_GREEN_THREAD_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <setjmp.h>
 #include <unordered_set>
 
@@ -171,6 +173,25 @@ class GreenThread {
   void set_resume_cb(ResumeCallback cb) { resume_cb_ = cb; }
   void* resume_data() const { return resume_data_; }
   void set_resume_data(void* d) { resume_data_ = d; }
+
+  // --- GC handshake (invariant I3) ---
+  //
+  // A stop-the-world GC is driven by a coordinator that release-stores
+  // gc_requested and then spin-joins every active green thread until it has
+  // published its roots and parked here. This is the mutator-safepoint the
+  // handshake relies on: a worker may claim to be quiescent only after its
+  // registers, stack, and HeapRefTable have been published. The worker blocks
+  // on gc_cv_ (under gc_mutex_) until the coordinator clears gc_requested and
+  // notifies it on resume. These members are only touched while gc_requested is
+  // set (env-gated forced-GC test path / future true concurrency); the default
+  // serial path never parks.
+  std::mutex gc_mutex_;
+  std::condition_variable gc_cv_;
+  std::atomic<bool> gc_parked_{false};
+  bool gc_parked() const { return gc_parked_.load(std::memory_order_acquire); }
+  void set_gc_parked(bool v) { gc_parked_.store(v, std::memory_order_release); }
+  std::mutex& gc_mutex() { return gc_mutex_; }
+  std::condition_variable& gc_cv() { return gc_cv_; }
 
   // --- Class-level counters ---
 

@@ -93,6 +93,44 @@ class GreenThreadCow {
     return g_cow_active_count.load(std::memory_order_acquire);
   }
 
+  // --- All-mutator stop-the-world GC handshake (invariant I3) ---
+  //
+  // PollForGCRequest is called from a mutator safepoint (GreenScheduler::Yield,
+  // step 1) and -- in the forced-GC test -- from the worker entry boundary
+  // (item 2). If a stop-the-world GC has been requested (gc_requested) and one
+  // is already in progress (gc_in_progress), it publishes this green thread's
+  // current roots (saved registers, stack, HeapRefTable) via the canonical
+  // RedirectWordsLocked machinery, records the "published + parked" flag, and
+  // suspends the calling worker on its per-GT condition variable until the
+  // coordinator resumes it. Returns true iff the worker parked (it must not
+  // continue executing); false if there is nothing to do. A plain
+  // `if (gc_requested && gc_in_progress) { publish(); park(); return true; }`.
+  //
+  // RequestAllMutatorsStop is the coordinator entry: it release-stores
+  // gc_requested, snapshots the active COW green threads under the same mutex
+  // the GC roots provider walks, and writes the snapshot to *out_suspended /
+  // *out_n. The quiescence it establishes REPLACES the old
+  // GreenThreadCOWSuspendedConcurrentGC suppression. Collect the heap while
+  // gc_requested stays set, then call ResumeAllMutators to clear the request,
+  // notify every parked worker, and restore the concurrent-GC gate.
+  //
+  // gc_in_progress is a separate atomic guard so a second coordinator blocks
+  // and the bytecode poll cannot recurse into the publish path mid-collection.
+#if V8_ENABLE_GREEN_THREADS
+  static bool PollForGCRequest(GreenThread* gt, Isolate* isolate);
+  static void RequestAllMutatorsStop(GreenThread*** out_suspended, int* out_n);
+  static void ResumeAllMutators();
+  // True while a coordinator is between RequestAllMutatorsStop and
+  // ResumeAllMutators. Gated so the poll does not act outside a real GC.
+  static bool GCInProgress();
+  // Spin-join every active COW view until it has published + parked (gc_parked),
+  // or until timeout_ms elapses (returns false). This is the quiescence barrier
+  // that REPLACES GreenThreadCOWSuspendedConcurrentGC: the collector must not
+  // start until every mutator is parked with roots published, so no worker is
+  // mid-body mutating the state the GC walks.
+  static bool WaitForAllMutatorsParked(int timeout_ms);
+#endif  // V8_ENABLE_GREEN_THREADS
+
   // Number of times CowCloneForGeneratedCode was reached with COW active
   // (i.e. a real TurboFan kArchStoreWithWriteBarrier store consulted the
   // COW hook). Tests snapshot this counter around JIT stores to prove the

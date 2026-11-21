@@ -14,6 +14,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <thread>
 
 #include "src/common/ptr-compr.h"
 #include "src/common/assert-scope.h"
@@ -44,6 +45,30 @@ std::atomic<uint32_t> GreenThreadCow::g_cow_active_count{0};
 // real TurboFan kArchStoreWithWriteBarrier stores that consulted the COW
 // hook with COW active. Exposed for JIT→COW boundary verification.
 std::atomic<uint64_t> GreenThreadCow::g_cow_generated_code_calls{0};
+
+// ARM64 register save/restore from green-thread-asm.cc (declared extern "C" in
+// green-thread-scheduler.cc). The handshake re-arms this from PollForGCRequest
+// so any heap-object pointer the parked worker still holds lands in its spill
+// buffer, where RedirectWordsLocked can see and rewrite it during GC.
+extern "C" void green_thread_save_registers_arm64(uint8_t* dst);
+
+// All-mutator stop-the-world GC handshake (invariant I3) request flags.
+//
+// These are file-global rather than per-isolate on purpose: the green-threads
+// feature drives a single green isolate per process, and the coordinator
+// (M2Probe's inject_forced_gc) plus every worker all observe the same green
+// heap. A process-global flag therefore gives every worker a single, shared,
+// race-free view of "a GC has been requested". g_gc_in_progress_ additionally
+// serializes coordinators and gates the poll so it cannot recurse mid-collection.
+// Both are guarded by g_cow_green_threads_mutex only where they are read together
+// with the g_cow_green_threads snapshot (RequestAllMutatorsStop).
+static std::atomic<bool> g_gc_requested_{false};
+static std::atomic<bool> g_gc_in_progress_{false};
+
+// Bounded wait for a worker's "published + parked" flag. A worker that never
+// reaches its safepoint (e.g. a body that runs to completion without yielding)
+// must not stall the coordinator forever, so the spin-join gives up after this.
+static constexpr std::chrono::milliseconds kGCStopJoinTimeout{2000};
 
 // Re-entry guard: prevents infinite recursion when cloning triggers another
 // write barrier. CloneObjectInternal allocates a new heap object, which may
@@ -388,6 +413,184 @@ void JoinCOWGCWorkers() {
       });
   GreenThreadDiag("JoinCOWGCWorkers: drained polls=%d inflight=%d", polls,
                   g_cow_gc_inflight_workers);
+}
+
+// ================================================================
+// All-mutator stop-the-world GC handshake (invariant I3)
+//
+// The CoW design runs green threads cooperatively on the embedding thread, so
+// today GC is *suppressed* (GreenThreadCOWSuspendedConcurrentGC forces
+// ShouldUseBackgroundThreads() == false) rather than coordinated: no GC ever
+// runs while a view is active, so there is nothing to coordinate. Item 1 turns
+// that off-guard suppression into a real handshake so GC can start while the
+// mutators are active, stop them, enumerate every root each one holds, collect,
+// then resume. This is invariant I3.
+//
+// Sequence (all under a single coordinator, e.g. M2Probe's inject_forced_gc):
+//   1. RequestAllMutatorsStop() release-stores gc_requested=true, snapshots the
+//      active COW views, and -- when the caller has spawned workers -- the
+//      workers observe the flag at their safepoint and park (published + parked).
+//   2. The collector runs; because every mutator is parked with roots published,
+//      GC sees only quiescent state (no torn pointers, nothing mutating the
+//      HeapRefTable it walks). The GreenThreadGCRootsProvider is already queued
+//      on the heap, so published roots are scanned for free.
+//   3. ResumeAllMutators() clear-store gc_requested=false and notify every parked
+//      worker; ShouldUseBackgroundThreads returns to normal.
+//
+// A worker parks only at an eligible boundary (not mid-publish) and only when a
+// GC is actually in progress, so the default serial path is never affected.
+// ================================================================
+
+// Publish this green thread's live roots for the collector: re-arm the ARM64
+// register save so any heap-object pointer the worker still holds is written to
+// its spill buffer, and set the register mask so the canonical redirect pass
+// scans the masked regs. RedirectWordsLocked (called by the collector through
+// the already-registered GreenThreadGCRootsProvider, which scans
+// `gt->stack_limit()/stack_top()` and `gt->regs()` masked by `register_mask`)
+// then sees the GT's stack + masked regs + HeapRefTable as published roots. This
+// reuses the machinery Yield already uses for COW; it does not build a new scan.
+//
+// The worker must be parked here (it holds no live register the redirect cannot
+// rewrite otherwise), which is guaranteed: PollForGCRequest reaches this only
+// after it has already stashed the regs and is about to suspend.
+static void PublishGCRootsForCollector(GreenThread* gt) {
+  if (gt == nullptr) return;
+  // Save the current registers into the spill buffer so the redirect pass sees
+  // every live heap-object pointer the worker is still holding, and widen the
+  // mask to every root category so the scan covers them all.
+  green_thread_save_registers_arm64(gt->regs());
+  gt->set_register_mask(kGreenRegMaskRoot | kGreenRegMaskCage |
+                        kGreenRegMaskBytecode | kGreenRegMaskDispatch);
+}
+
+// Item 1 safepoint hook (invariant I3). Returns true iff the caller parked and
+// must not continue executing; otherwise returns false and the worker carries
+// on. Plain logic: `if (gc_requested && gc_in_progress && eligible) {
+// publish(); park(); return true; }`. Eligible means not mid-publish and at a
+// bytecode/native boundary -- both true for the yield safepoint and the M2Probe
+// worker entry poll. A null / non-COW thread simply cannot participate.
+bool GreenThreadCow::PollForGCRequest(GreenThread* gt, Isolate* isolate) {
+  (void)isolate;
+  if (gt == nullptr || !gt->cow_enabled()) return false;
+  // Only act while a real stop-the-world GC is in flight; a bare
+  // gc_requested without gc_in_progress never happens and would be a spurious
+  // park. This gate is what keeps the default serial path (GCInProgress false)
+  // from ever parking a worker.
+  if (!g_gc_requested_.load(std::memory_order_acquire)) return false;
+  if (!g_gc_in_progress_.load(std::memory_order_acquire)) return false;
+
+  // Publish this worker's roots so the collector (which runs next, on the
+  // embedding thread) sees only quiescent, reported state.
+  PublishGCRootsForCollector(gt);
+
+  // Commit the quiescence flag under the worker's own mutex so the coordinator's
+  // spin-join observes it, then suspend until the coordinator resumes us.
+  {
+    std::unique_lock<std::mutex> lock(gt->gc_mutex());
+    gt->set_gc_parked(true);
+  }
+  gt->gc_cv().notify_all();
+  std::unique_lock<std::mutex> lock(gt->gc_mutex());
+  gt->gc_cv().wait(lock, [&] { return !g_gc_requested_.load(std::memory_order_acquire); });
+  gt->set_gc_parked(false);
+  return true;
+}
+
+// Coordinator entry (invariant I3). Publishes the set of active COW views to
+// *out_suspended / *out_n and release-stores gc_requested so every worker's
+// safepoint observes the request. The worker then publishes + parks at its next
+// safepoint; the coordinator runs the collector between this call and
+// ResumeAllMutators. ActiveCount (g_cow_active_count) is guaranteed > 0 here
+// because a view only becomes a COW green thread through Initialize, which is
+// exactly when the GC roots provider is registered.
+void GreenThreadCow::RequestAllMutatorsStop(GreenThread*** out_suspended,
+                                            int* out_n) {
+  if (out_suspended) *out_suspended = nullptr;
+  if (out_n) *out_n = 0;
+
+  // Snapshot the active views under the same mutex the GC roots provider walks,
+  // so a view is never added or removed from the snapshot mid-collect.
+  std::vector<GreenThread*> snapshot;
+  {
+    std::lock_guard<std::mutex> guard(g_cow_green_threads_mutex);
+    snapshot = g_cow_green_threads;
+  }
+  if (out_suspended) *out_suspended = snapshot.data();
+  if (out_n) *out_n = static_cast<int>(snapshot.size());
+
+  // Always announce the stop, even if no view is live yet: the forced-GC test
+  // calls this BEFORE spawning the worker threads so their entry safepoints see
+  // the request and park before allocating. The snapshot above is the set of
+  // currently-active views; workers created afterwards park when they observe
+  // gc_requested at their entry poll.
+  g_gc_in_progress_.store(true, std::memory_order_release);
+  g_gc_requested_.store(true, std::memory_order_release);
+}
+
+// Resume every worker the coordinator stopped: clear-store gc_requested, mark
+// each view no longer parked, and notify its condition variable so the worker's
+// poll unblocks and it resumes its body. Restore ShouldUseBackgroundThreads to
+// normal by clearing gc_in_progress. Safe to call even if no worker parked.
+void GreenThreadCow::ResumeAllMutators() {
+  g_gc_requested_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> guard(g_cow_green_threads_mutex);
+    for (GreenThread* gt : g_cow_green_threads) {
+      if (gt == nullptr) continue;
+      {
+        std::lock_guard<std::mutex> wlock(gt->gc_mutex());
+        gt->set_gc_parked(false);
+      }
+      gt->gc_cv().notify_all();
+    }
+  }
+  g_gc_in_progress_.store(false, std::memory_order_release);
+}
+
+bool GreenThreadCow::GCInProgress() {
+  return g_gc_in_progress_.load(std::memory_order_acquire);
+}
+
+// Quiescence barrier (invariant I3). Spin-join every active COW view until it
+// has published + parked (gc_parked == true) under its own mutex, or until
+// timeout_ms elapses. This is the step that REPLACES GreenThreadCOWSuspendedConcurrentGC:
+// the coordinator calls it AFTER RequestAllMutatorsStop (announce) and the
+// workers have been spawned, and immediately BEFORE the collection, so the
+// collector only ever runs once every mutator is parked with its roots
+// published -- no worker is mid-body mutating the HeapRefTable the GC walks.
+//
+// We read gc_parked() (an acquire atomic) directly rather than blocking on the
+// condition variable here, because: (a) the coordinator is the only other
+// writer and we must not hold gc_mutex_ across a potentially long spin that
+// would starve a parked worker of the lock it needs to flip the flag back;
+// (b) the workers set gc_parked under gc_mutex_ and the coordinator only needs
+// the acquire visibility of the atomic, not the mutex. On timeout we still
+// proceed but report false, since a worker that never reaches its safepoint
+// (a body with no yield) must not deadlock the coordinator.
+bool GreenThreadCow::WaitForAllMutatorsParked(int timeout_ms) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) return false;  // Already out of time.
+
+  bool any_active = false;
+  while (true) {
+    std::vector<GreenThread*> to_check;
+    {
+      std::lock_guard<std::mutex> guard(g_cow_green_threads_mutex);
+      to_check = g_cow_green_threads;
+    }
+    for (GreenThread* gt : to_check) {
+      if (gt == nullptr || !gt->cow_enabled()) continue;
+      if (!gt->gc_parked()) return false;  // Not everyone parked yet.
+    }
+    if (!to_check.empty()) return true;  // All parked + published.
+    any_active = true;  // Views exist but none parked yet; keep polling.
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return any_active;  // Spun the whole window: false unless something ran.
+    }
+    std::this_thread::yield();
+  }
 }
 
 void GreenThreadCow::SetIsolateCowCapable(Isolate* isolate) {

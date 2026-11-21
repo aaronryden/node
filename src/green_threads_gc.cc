@@ -27,6 +27,53 @@
 namespace node {
 namespace vi = v8::internal;
 
+// Read the GT_M2_FORCE_GC environment variable. A single getenv() compare over
+// the disabled path is negligible and race-free (M2Probe may run with workers on
+// multiple OS threads), and when unset the caller performs no GC at all, so the
+// existing probe path is unchanged.
+M2ForcedGCMode M2ParseForcedGCEnv() {
+  const char* val = ::getenv("GT_M2_FORCE_GC");
+  if (val == nullptr) return M2ForcedGCMode::kNone;
+  std::string s(val);
+  if (s == "young") return M2ForcedGCMode::kYoung;
+  if (s == "full") return M2ForcedGCMode::kFull;
+  if (s == "both") return M2ForcedGCMode::kBoth;
+  // Unknown value: behave as unset rather than aborting the whole probe.
+  return M2ForcedGCMode::kNone;
+}
+
+// Force a young and/or full collection on the green isolate, gated by `mode`.
+// See green_threads_gc.h for the full rationale. The caller guarantees the active
+// COW green threads are parked + rooted, so a synchronous collection on the green
+// heap walks only reported, quiescent state.
+void M2ForceGC(v8::Isolate* green_isolate, M2ForcedGCMode mode) {
+  if (mode == M2ForcedGCMode::kNone || green_isolate == nullptr) return;
+  vi::Isolate* vi_iso = reinterpret_cast<vi::Isolate*>(green_isolate);
+  vi::Heap* heap = vi_iso->heap();
+  if (heap == nullptr) return;
+
+  const vi::GCFlag kNoFlags = vi::GCFlag::kNoFlags;
+  const vi::GarbageCollectionReason kReason = vi::GarbageCollectionReason::kTesting;
+  const v8::GCCallbackFlags kForced = v8::GCCallbackFlags::kGCCallbackFlagForced;
+
+  // A single full (mark-compact) forced collection. It is run while the green
+  // views are parked + rooted (see M2Probe), so it walks only their published,
+  // quiescent roots -- exactly what the I3 handshake guarantees.
+  //
+  // A forced full collection is *forced* (the kForced callback flag sets
+  // Heap::is_current_gc_forced_), so SelectMarkingType() picks atomic marking:
+  // the cppgc concurrent-marking task is never started, which keeps the marker
+  // cleanly torn down. The green isolate's incremental marking is stopped by
+  // GreenGCPause across the probe (RelocateFunction re-parse + warmup must run
+  // with GC frozen), and a non-forced young collection here would start a
+  // concurrent marker that races the stopped marking during teardown. A full
+  // mark-compact evacuates the nursery too (all roots are marked), so the single
+  // full collection safely subsumes a young + full sequence for any mode.
+  if (mode != M2ForcedGCMode::kNone) {
+    heap->CollectAllGarbage(kNoFlags, kReason, kForced);
+  }
+}
+
 // Constructing GreenGCPause snapshots the current incremental-marking state and
 // stops marking; the destructor resumes it only if it had been running. This
 // freezes the green heap across the green body's re-parse + execution (see
