@@ -514,6 +514,15 @@ ALIAS_REGISTER(Register, wip1, w17);
 // Root register.
 ALIAS_REGISTER(Register, kRootRegister, x26);
 ALIAS_REGISTER(Register, rr, x26);
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+// Per-worker execution-state base register (candidate b, phase i transport
+// proof). Currently x25, which the register allocator may still assign; the
+// allocator reservation (removing x25 from ALLOCATABLE, plus the matching
+// callee-save / regexp / wasm / callee fixes) is deferred to phase ii. Here the
+// alias is only consumed by the gated MacroAssembler helpers below and by the
+// standalone 2-thread transport proof, which manages x25 by hand.
+ALIAS_REGISTER(Register, kExecutionStateRegister, x25);
+#endif
 // Pointer cage base register.
 #ifdef V8_COMPRESS_POINTERS
 ALIAS_REGISTER(Register, kPtrComprCageBaseRegister, x28);

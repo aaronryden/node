@@ -331,7 +331,13 @@
 
     # Enable green threads with copy-on-write heap isolation.
     # Sets -DV8_ENABLE_GREEN_THREADS.
-    'v8_enable_green_threads%': 1
+    'v8_enable_green_threads%': 1,
+
+    # Enable per-worker execution-state (candidate b) transport proof.
+    # Sets -DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE. Off by default; a plain
+    # node build is byte-identical to upstream. Enable with
+    # GYP_DEFINES='v8_enable_green_worker_execution_state=1'.
+    'v8_enable_green_worker_execution_state%': 0
   },
 
   'target_defaults': {
@@ -552,6 +558,9 @@
       }],
       ['v8_enable_green_threads==1', {
         'defines': ['V8_ENABLE_GREEN_THREADS',],
+      }],
+      ['v8_enable_green_worker_execution_state==1', {
+        'defines': ['V8_ENABLE_GREEN_WORKER_EXECUTION_STATE',],
       }],
     ],  # conditions
     'defines': [

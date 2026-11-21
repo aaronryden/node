@@ -1085,6 +1085,17 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void LoadRootRelative(Register destination, int32_t offset) final;
   void StoreRootRelative(int32_t offset, Register value) final;
 
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Access an execution-state field (context / exception / handler / c_entry_fp /
+  // js_entry_sp / ...) of the worker whose kExecutionStateRegister base is
+  // currently loaded, via   kExecutionStateRegister + ExecutionState::FieldOffset(id)
+  // -- the same offset generated code bakes, but rebased on the per-worker
+  // execution-state register instead of kRootRegister.
+  void LoadExecutionField(Register destination, IsolateFieldId id);
+  void StoreExecutionField(IsolateFieldId id, Register value);
+  void LoadExecutionFieldAddress(Register destination, IsolateFieldId id);
+#endif
+
   void PreCheckSkippedWriteBarrier(Register object, Register value,
                                    Register scratch, Label* ok);
 

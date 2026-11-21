@@ -32,6 +32,9 @@
 #include "src/execution/execution.h"
 #include "src/execution/futex-emulation.h"
 #include "src/execution/isolate-data.h"
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+#include "src/execution/execution-state.h"
+#endif
 #include "src/execution/messages.h"
 #include "src/execution/mutex-guard-if-off-thread.h"
 #include "src/execution/stack-guard.h"
@@ -1361,6 +1364,23 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   ThreadLocalTop const* thread_local_top() const {
     return &isolate_data_.thread_local_top_;
   }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Per-worker execution state (candidate b). Interim (phase i) returns the
+  // shared ThreadLocalTop reinterpreted as an ExecutionState: member {top} is at
+  // offset 0, so &es == &thread_local_top_, and es->field_address(id) ==
+  // &thread_local_top_ + FieldOffset(id), i.e. the shared field -- identical to
+  // the thread_local_top() paths above (no serial regression). Real per-worker
+  // blocks are installed in phase ii; until then generated code and runtime both
+  // route through this single shared block.
+  ExecutionState* execution_state() {
+    return reinterpret_cast<ExecutionState*>(&isolate_data_.thread_local_top_);
+  }
+  ExecutionState const* execution_state() const {
+    return reinterpret_cast<ExecutionState const*>(
+        &isolate_data_.thread_local_top_);
+  }
+#endif
 
   constexpr static uint32_t context_offset() {
     return static_cast<uint32_t>(
