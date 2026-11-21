@@ -107,7 +107,7 @@ class ExecutionState {
   // live in the same per-worker block and are reached via top_ptr() in phase ii.
   // HandleScopeData / StackGuard / NewAllocationInfo fields live in other
   // holders and are rejected here.
-  bool is_execution_field(IsolateFieldId id) const {
+  static bool is_execution_field(IsolateFieldId id) {
     switch (id) {
       case IsolateFieldId::kContext:
       case IsolateFieldId::kException:

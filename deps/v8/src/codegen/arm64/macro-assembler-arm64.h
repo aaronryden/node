@@ -230,6 +230,13 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   void LeaveFrame(StackFrame::Type type);
 
   inline void InitializeRootRegister();
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Arm the per-worker execution-state base register (kExecutionStateRegister,
+  // x25) next to the root register. Both are armed together and both are
+  // callee-saved, so x25 is valid on exactly the entry windows where kRootRegister
+  // is, and both survive across C boundaries. See InitializeRootRegister.
+  inline void InitializeExecutionStateRegister();
+#endif
 
   void Mov(const Register& rd, const Operand& operand,
            DiscardMoveMode discard_mode = kDontDiscardForSameWReg);

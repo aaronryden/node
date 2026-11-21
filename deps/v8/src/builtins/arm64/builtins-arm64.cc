@@ -664,6 +664,13 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
     // Initialize the root register.
     // C calling convention. The first argument is passed in x0.
     __ Mov(kRootRegister, x0);
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Arm the per-worker execution-state base register (x25) at JS entry,
+    // alongside kRootRegister. With x25 == &thread_local_top_ (serial transport)
+    // the execution fields accessed through it (AsMemOperand / LoadExecutionField)
+    // match the shared root-relative bytes while isolating per-worker state.
+    __ InitializeExecutionStateRegister();
+#endif
 
 #ifdef V8_COMPRESS_POINTERS
     // Initialize the pointer cage base register.
@@ -952,12 +959,24 @@ static void Generate_JSEntryTrampolineHelper(MacroAssembler* masm,
     __ Mov(x22, x19);
     __ Mov(x23, x19);
     __ Mov(x24, x19);
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // x25 is the reserved per-worker execution-state base register
+    // (kExecutionStateRegister, &thread_local_top_ on the serial path). It is
+    // not a JS callee-save scratch register, so it must not be reseeded to
+    // undefined: doing so would destroy the exec-state base that generated code
+    // reads execution fields through (AsMemOperand / LoadExecutionField). It
+    // addresses a cage-outside base the conservative GC scanner rejects (like
+    // kRootRegister/x26), so leaving it alone is GC-safe.
+#else
     __ Mov(x25, x19);
+#endif
 #ifndef V8_COMPRESS_POINTERS
     __ Mov(x28, x19);
 #endif
     // Don't initialize the reserved registers.
     // x26 : root register (kRootRegister).
+    // x25 : execution-state base register (kExecutionStateRegister) -- reserved
+    //       in the flag-on build above; absent (ordinary allocatable) otherwise.
     // x27 : context pointer (cp).
     // x28 : pointer cage base register (kPtrComprCageBaseRegister).
     // x29 : frame pointer (fp).

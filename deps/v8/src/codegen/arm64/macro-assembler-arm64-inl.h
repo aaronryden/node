@@ -12,6 +12,7 @@
 #include "src/codegen/arm64/assembler-arm64.h"
 #include "src/codegen/macro-assembler.h"
 #include "src/common/globals.h"
+#include "src/execution/execution-state.h"
 #include "src/execution/isolate-data.h"
 
 namespace v8 {
@@ -37,6 +38,23 @@ MemOperand ExitFrameCallerStackSlotOperand(int index) {
 }
 
 MemOperand MacroAssembler::AsMemOperand(IsolateFieldId id) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Execution fields (context / exception / handler / c_entry_fp / pending
+  // handler / ...) live in THIS thread's ExecutionState block, reached through
+  // kExecutionStateRegister (x25) once it is armed at JS/C entry.
+  // ExecutionState::FieldOffset(id) is top-relative and equals
+  // IsolateData::GetOffset(id) - GetOffset(kThreadLocalTop); with x25 ==
+  // &thread_local_top_ this addresses exactly the same bytes as the shared
+  // kRootRegister path below, but per-worker, which is what keeps simultaneous
+  // mutators from clobbering each other's fields. Non-execution isolate fields
+  // (and any scope where the root array is required) keep the kRootRegister
+  // path. This is checked at codegen time (id is a compile-time constant), so
+  // there is no runtime branch in the generated builtin.
+  if (ExecutionState::is_execution_field(id)) {
+    return MemOperand(kExecutionStateRegister,
+                      static_cast<int32_t>(ExecutionState::FieldOffset(id)));
+  }
+#endif
   DCHECK(root_array_available());
   return MemOperand(kRootRegister, IsolateData::GetOffset(id));
 }
@@ -1194,11 +1212,30 @@ void MacroAssembler::InitializeRootRegister() {
   ExternalReference isolate_root = ExternalReference::isolate_root(isolate());
   Mov(kRootRegister, Operand(isolate_root));
   Fmov(fp_zero, 0.0);
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  InitializeExecutionStateRegister();
+#endif
 
 #ifdef V8_COMPRESS_POINTERS
   LoadRootRelative(kPtrComprCageBaseRegister, IsolateData::cage_base_offset());
 #endif
 }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+void MacroAssembler::InitializeExecutionStateRegister() {
+  // Arm kExecutionStateRegister (x25) with the base of this thread's
+  // ExecutionState block. The block embeds its ThreadLocalTop at offset 0
+  // (&ExecutionState == &top), so x25 == isolate_root + GetOffset(kThreadLocalTop)
+  // == &thread_local_top_ on the serial path. Field offsets accessed through x25
+  // (ExecutionState::FieldOffset) are top-relative and therefore address the same
+  // bytes as the shared kRootRegister path — serial behavior is unchanged — while
+  // the base can later point at a genuine per-worker block (installed on
+  // GreenThread) with no change to these generated accesses.
+  LoadRootRegisterOffset(
+      kExecutionStateRegister,
+      static_cast<intptr_t>(IsolateData::GetOffset(IsolateFieldId::kThreadLocalTop)));
+}
+#endif
 
 void MacroAssembler::SmiTag(Register dst, Register src) {
   DCHECK(dst.Is64Bits() && src.Is64Bits());
