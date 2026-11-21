@@ -22,6 +22,10 @@
 #include "src/torque/runtime-macro-shims.h"
 #include "src/torque/runtime-support.h"
 
+#if V8_ENABLE_GREEN_THREADS
+#include "src/execution/green-thread-cow.h"
+#endif  // V8_ENABLE_GREEN_THREADS
+
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
@@ -308,6 +312,11 @@ void FeedbackVector::SynchronizedSet(FeedbackSlot slot,
                                      Tagged<MaybeObject> value,
                                      WriteBarrierMode mode) {
   DCHECK(!IsOfLegacyType(value));
+#if V8_ENABLE_GREEN_THREADS
+  // Under a CoW view several workers run the same SFI and write the same
+  // feedback slot; gate the store + barrier against those other writers.
+  GreenThreadCowSharedWriterScope shared_writer_scope;
+#endif
   const int i = slot.ToInt();
   DCHECK_LT(static_cast<unsigned>(i), static_cast<unsigned>(this->length()));
   const int offset = kRawFeedbackSlotsOffset + i * kTaggedSize;

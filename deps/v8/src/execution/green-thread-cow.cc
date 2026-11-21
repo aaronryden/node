@@ -46,6 +46,13 @@ std::atomic<uint32_t> GreenThreadCow::g_cow_active_count{0};
 // hook with COW active. Exposed for JIT→COW boundary verification.
 std::atomic<uint64_t> GreenThreadCow::g_cow_generated_code_calls{0};
 
+// Backing mutex for GreenThreadCowSharedWriterScope (see that class for why it
+// is process-global and recursive); lazily owns the single process instance.
+base::RecursiveMutex& GreenThreadCow::SharedStateMutex() {
+  static base::RecursiveMutex mutex;
+  return mutex;
+}
+
 // ARM64 register save/restore from green-thread-asm.cc (declared extern "C" in
 // green-thread-scheduler.cc). The handshake re-arms this from PollForGCRequest
 // so any heap-object pointer the parked worker still holds lands in its spill

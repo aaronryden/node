@@ -12,6 +12,10 @@
 #include "src/execution/green-thread.h"
 #include "src/objects/objects.h"
 
+#if V8_ENABLE_GREEN_THREADS
+#include "src/base/platform/mutex.h"
+#endif  // V8_ENABLE_GREEN_THREADS
+
 namespace v8 {
 
 namespace internal {
@@ -93,6 +97,15 @@ class GreenThreadCow {
     return g_cow_active_count.load(std::memory_order_acquire);
   }
 
+#if V8_ENABLE_GREEN_THREADS
+  // Recursive mutex serializing access to V8 shared-writer internal state
+  // (Map slack-tracking, JSDispatchTable code/tiering entries, feedback
+  // vectors) while a CoW view is active. Recursive re-entrancy avoids
+  // self-deadlock. Process-global (not per-isolate) matches the process-global
+  // g_cow_active_count and one green isolate per process.
+  static base::RecursiveMutex& SharedStateMutex();
+#endif  // V8_ENABLE_GREEN_THREADS
+
   // --- All-mutator stop-the-world GC handshake (invariant I3) ---
   //
   // PollForGCRequest is called from a mutator safepoint (GreenScheduler::Yield,
@@ -164,6 +177,39 @@ class GreenThreadCow {
   // Counts CowCloneForGeneratedCode entries past the fast-path guards.
   static std::atomic<uint64_t> g_cow_generated_code_calls;
 };
+
+#if V8_ENABLE_GREEN_THREADS
+// Serializes access to V8 shared-writer internal state (Map slack-tracking,
+// JSDispatchTable code/tiering entries, feedback vectors) so invariant I4 holds
+// under true multi-worker concurrency. No-op when no CoW view is active;
+// recursive-mutex backed so it can be taken re-entrantly.
+class GreenThreadCowSharedWriterScope {
+ public:
+  GreenThreadCowSharedWriterScope() {
+    if (GreenThreadCow::ActiveCount() > 0) {
+      mutex_ = &GreenThreadCow::SharedStateMutex();
+      mutex_->Lock();
+      locked_ = true;
+    } else {
+      locked_ = false;
+      mutex_ = nullptr;
+    }
+  }
+
+  ~GreenThreadCowSharedWriterScope() {
+    if (locked_) mutex_->Unlock();
+  }
+
+  GreenThreadCowSharedWriterScope(const GreenThreadCowSharedWriterScope&) =
+      delete;
+  GreenThreadCowSharedWriterScope& operator=(
+      const GreenThreadCowSharedWriterScope&) = delete;
+
+ private:
+  bool locked_;
+  base::RecursiveMutex* mutex_;
+};
+#endif  // V8_ENABLE_GREEN_THREADS
 
 }  // namespace internal
 }  // namespace v8
