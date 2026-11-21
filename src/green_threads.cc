@@ -1305,9 +1305,14 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
                    "green_threads.__m2_probe(n, ...): n must be in [1, 64]");
     return;
   }
-  if (args.Length() - 1 < static_cast<int>(n)) {
+  // A probe run is allowed either a full set of n distinct bodies or a single
+  // body replicated across all n workers. The shared-heap probe only needs to
+  // prove that n OS workers allocate concurrently from ONE green heap, so a
+  // lone body is filled out to the full worker count (see the setup loop below).
+  if (args.Length() - 1 < 1) {
     ThrowTypeError(isolate,
-                   "green_threads.__m2_probe(n, ...): expected n body functions");
+                   "green_threads.__m2_probe(n, ...): expected at least one "
+                   "body function");
     return;
   }
 
@@ -1321,7 +1326,12 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   std::vector<Work> works;
   works.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
-    Local<Function> emb_fn = Local<Function>::Cast(args[i + 1]);
+    // Use args[i+1] when present; otherwise replicate the first body so a
+    // single-argument probe still spawns n independent workers on the same
+    // green heap.
+    const int body_arg =
+        (static_cast<int>(args.Length()) - 1 > i) ? (i + 1) : 1;
+    Local<Function> emb_fn = Local<Function>::Cast(args[body_arg]);
     std::unique_ptr<Persistent<Function>> relocated = RelocateFunction(isolate, emb_fn);
 
     GreenCallData* data = new GreenCallData();
@@ -1359,6 +1369,12 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   //    [=} capture making a per-worker copy.
   std::vector<char> ok(static_cast<size_t>(n), 0);
   char* ok_p = ok.data();
+  // Flip the green heap's young-gen allocation into the atomic CAS path for the
+  // duration of the concurrent worker run so the N workers reserve disjoint
+  // pointers from the SAME green heap — the entire point of GT_SHARED_HEAP=1.
+  // Reset to the serial fast path once the workers join; the result-copy and
+  // teardown below are single-threaded and must not pay CAS overhead.
+  vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, true);
   {
     v8::Isolate::Scope green_scope(green);
     std::vector<std::thread> workers;
@@ -1388,6 +1404,8 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     }
     for (std::thread& wt : workers) wt.join();
   }
+
+  vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, false);
 
   // 3. Copy results back to the embedding isolate.
   Local<Array> results = Array::New(isolate, n);

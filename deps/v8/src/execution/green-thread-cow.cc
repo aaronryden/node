@@ -22,6 +22,7 @@
 #include "src/execution/isolate.h"
 #include "src/handles/handles.h"
 #include "src/heap/gc-callbacks.h"
+#include "src/heap/linear-allocation-area.h"
 
 // Provide the out-of-line definitions of HandleScope::HandleScope() and the
 // slot store primitives used below. In V8's shared-library build these are
@@ -400,6 +401,27 @@ bool GreenThreadCow::IsolateCowCapable(Isolate* isolate) {
   std::lock_guard<std::mutex> lock(g_cow_capable_isolates_mutex);
   return g_cow_capable_isolates.count(isolate) != 0;
 }
+
+#if V8_ENABLE_GREEN_THREADS
+void GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(
+    v8::Isolate* isolate, bool enabled) {
+  // Bridges Node's green-threads runtime onto V8's young-gen allocation gate,
+  // flipping the LinearAllocationArea's bump-pointer from a plain read-then-bump
+  // to a lock-free atomic CAS so N OS workers reserve disjoint pointers from one
+  // shared green isolate's heap.
+  //
+  // The gate is a single process-global flag (see
+  // ConcurrentLinearAllocationGate in linear-allocation-area.h) rather than a
+  // per-HeapBase member on purpose: a shared green-thread isolate runs its
+  // young generation on a dedicated cppgc heap that is a different object from
+  // the (old-gen) CppHeap, so a per-heap flag reached via CppHeap could miss the
+  // young space. A single relaxed store suffices because the toggle is performed
+  // around the green-mutator-locked concurrent-worker window. A null isolate is a
+  // no-op, so the disabled serial fast path is never disturbed.
+  if (isolate == nullptr) return;
+  ConcurrentLinearAllocationGate().store(enabled, std::memory_order_relaxed);
+}
+#endif  // V8_ENABLE_GREEN_THREADS
 
 void GreenThreadCow::Initialize(GreenThread* gt) {
   // Once any green thread runs on an isolate, mark it COW-capable so compile

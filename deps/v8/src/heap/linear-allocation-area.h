@@ -7,10 +7,26 @@
 
 // This header file is included outside of src/heap/.
 // Avoid including src/heap/ internals.
+#include <atomic>
+
 #include "include/v8-internal.h"
 #include "src/common/checks.h"
 
 namespace v8::internal {
+
+// Process-global gate for concurrent young-gen allocation (green threads on
+// multiple OS threads sharing one isolate). When set, the linear allocation
+// area's `top_` is reserved with a lock-free CAS so that concurrent mutators
+// reserve disjoint regions instead of racing the plain bump-pointer write. A
+// single process-wide flag (rather than per-heap) is used on purpose: the
+// allocation fast path and the green-threads bridge must agree regardless of
+// which specific heap owns this area, and this header deliberately avoids
+// pulling in heap internals. Zero-overhead for the common (flag-off) case: a
+// relaxed load that the compiler lowers to a plain load on every target.
+inline std::atomic<bool>& ConcurrentLinearAllocationGate() {
+  static std::atomic<bool> enabled{false};
+  return enabled;
+}
 
 // A linear allocation area to allocate objects from.
 //
@@ -39,10 +55,34 @@ class LinearAllocationArea final {
   }
 
   V8_INLINE Address IncrementTop(size_t bytes) {
+    if (V8_UNLIKELY(
+            ConcurrentLinearAllocationGate().load(std::memory_order_relaxed))) {
+      return TryIncrementTopAtomic(bytes);
+    }
     Address old_top = top_;
     top_ += bytes;
     Verify();
     return old_top;
+  }
+
+  // Lock-free reservation within [top_, limit_). Returns the reserved old top,
+  // or kNullAddress if the region is exhausted, so the caller falls back to
+  // refreshing the LAB / the slow path. CAS retries while another mutator
+  // advances top_; a plain (relaxed) load of limit_ is safe because only the
+  // main thread/refill changes it. top_ stays a plain member (the class must
+  // remain standard-layout for offsetof / IsolateData serialization); the
+  // atomic CAS operates on it through std::atomic_ref.
+  V8_INLINE Address TryIncrementTopAtomic(size_t bytes) {
+    std::atomic_ref<Address> ref(top_);
+    Address current = ref.load(std::memory_order_relaxed);
+    for (;;) {
+      if (V8_UNLIKELY(current + bytes > limit_)) return kNullAddress;
+      if (ref.compare_exchange_weak(current, current + bytes,
+                                    std::memory_order_relaxed)) {
+        Verify();
+        return current;
+      }
+    }
   }
 
   V8_INLINE bool DecrementTopIfAdjacent(Address new_top, size_t bytes) {

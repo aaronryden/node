@@ -48,6 +48,16 @@ class GreenThreadCow {
   static void SetIsolateCowCapable(Isolate* isolate);
   static bool IsolateCowCapable(Isolate* isolate);
 
+  // Enable/disable concurrent young-gen allocation on an isolate's green heap.
+  // When true, the young-gen LinearAllocationArea's bump-pointer switches to an
+  // atomic CAS so multiple OS workers can reserve disjoint pointers from the
+  // same green V8 isolate's heap (GT_SHARED_HEAP=1). Only the green-threads
+  // bridge calls this; the default (false) leaves the fast path byte-for-byte
+  // unchanged.
+#if V8_ENABLE_GREEN_THREADS
+  static void SetGreenHeapConcurrentAllocationEnabled(v8::Isolate* isolate, bool enabled);
+#endif  // V8_ENABLE_GREEN_THREADS
+
   // Clone an object into the GT's heap view.
   // If gt is null, returns the original pointer unchanged.
   static Address Clone(Isolate* isolate, GreenThread* gt, Address obj_ptr);
