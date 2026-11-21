@@ -86,6 +86,21 @@ These rules apply to **every** build and process run.
    `node` = kill it and find out *why* it hung before the next run — an unbounded,
    never-exiting process is a bug to diagnose, not something to rerun past.
 
+5. **Batch edits around the full build (long feedback loop).** A full `node` rebuild
+   here takes several minutes and is the *only* loop that exercises `deps/v8/` C++
+   changes (like the green-thread isolate-slot redirect). Do not make a small change
+   and wait for a build, then another small change and wait again — that trades
+   minutes of wall-clock per edit. Instead:
+   - **Make all the coding changes you can reason about up front**, across the files,
+     then trigger **one** build. Fix everything you are confident about in that batch;
+     iterate on what the build/test surfaces.
+   - Only break the loop for a change whose compile-time shape you genuinely cannot
+     predict (e.g. a new symbol you must confirm exists before writing more around it).
+     Otherwise keep editing until the feature is coherent, then build once.
+   - When the build finishes, run the **full** relevant test (serial gate first, then
+     the parallel discriminator) rather than a single ad-hoc repro — the full build
+     already paid its cost, so verify the whole surface in one shot.
+
 ## Build Playbooks
 
 Recurring, non-obvious gotchas specific to this V8 14.6 fork, and how to resolve them
@@ -172,11 +187,27 @@ build your debugging around a core dump.
 - `lldb -b -c <file>` is WRONG: `-c` is `--core <file>`, *not* a command file.
   Use `-o "command"` flags for batch input.
 - **Batch needs `-k` past a stop.** In optimized builds `process launch` stops on the
-  `EXC_BAD_ACCESS`/`EXC_BREAKPOINT` and lldb then *exits* batch mode, so any `-o` `bt`,
+  `EXC_BAD_ACCESS`/`EXC_BREAKPOINT` and lldb then *exits* batch mode, so any `bt`,
   `thread list`, or `register read` after it silently never runs — you only get the stop
-  line. Suffix every post-stop command with `-k` (keep-going), e.g.
-  `lldb -b out/Release/node -o 'env GT_SHARED_HEAP=1' -o 'process launch' -k 'thread list' -k 'thread select 1' -k 'bt 45' -k 'register read' -- out/Release/node`.
+  line. The fix is a strict argument shape; get it wrong and the commands get misparsed
+  as *target run-args* (watch for the tell-tale `(lldb) settings set -- target.run-args
+  "thread list"` line, which means a command leaked into that bucket).
+  **Rule:** launch goes in its OWN `-o`, then every post-stop command is written as a
+  `-k '<cmd>'` *pair* — consecutive `-k` + command arguments, none stranded alone and
+  none split across a line break. The canonical working form (verified):
+  ```
+   lldb -b out/Release/node \
+     -o 'env GT_SHARED_HEAP=1' \
+     -o 'process handle SIGSEGV SIGABRT SIGILL --notify true --stop true --pass false' \
+     -o 'process launch /tmp/repro.js' \
+     -k 'thread list' -k 'thread select 1' -k 'bt 60' 2>&1 | head -75
+  ```
   (The `env` command sets the var; `settings set target.env-vars …` fails at `run`.)
+  **What breaks it:** (1) stranding a lone `-k` (e.g. `-o 'process launch …' -k` then
+  `-k 'thread list'` on the next line) — the bare `-k` grabs nothing and the next
+  `-k 'cmd'`'s command falls through to target run-args; (2) using `-o 'run …'` WITHOUT
+  immediately following it with `-k '<cmd>'` pairs; (3) splitting the `-k` flag from its
+  command argument across a line break. Keep each `-k` glued to its command.
 - Detecting a "real" stop by grepping for your own `echo ===== STOP =====`
   marker is a **false positive** — that echo runs on every invocation (normal
   completion too). Detect a real stop via `grep -E "EXC_\|stop reason =\|Process .* stopped"`.
