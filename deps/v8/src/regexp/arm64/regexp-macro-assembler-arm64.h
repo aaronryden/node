@@ -213,7 +213,18 @@ class V8_EXPORT_PRIVATE RegExpMacroAssemblerARM64
   static constexpr Register current_character() { return w22; }
 
   // Register holding address of the end of the input string.
+  //
+  // Default (V8_ENABLE_GREEN_WORKER_EXECUTION_STATE off) is upstream's x25 so
+  // plain builds stay byte-identical. In phase ii, x25 is reserved as
+  // kExecutionStateRegister (and dropped from the allocator), so input_end()
+  // moves to x19: a free callee-save register inside the regexp backup set
+  // (kCalleeSaved). The Poke/Peek offsets below are memory slots and do not
+  // depend on which callee-save register holds the value.
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  static constexpr Register input_end() { return x19; }
+#else
   static constexpr Register input_end() { return x25; }
+#endif
 
   // Register holding address of the start of the input string.
   static constexpr Register input_start() { return x26; }

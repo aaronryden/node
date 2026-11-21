@@ -1304,7 +1304,11 @@ CodeGenerator::CodeGenResult CodeGenerator::AssembleArchInstruction(
         // register also doubles as the value of the record-write barrier, which
         // must record the copy that now sits in the slot.
         const Register kCopyCandidates[] = {x19, x20, x21, x22, x23,
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+                                            x24, x26, x27};
+#else
                                             x24, x25, x26, x27};
+#endif
         Register copy_reg = kCopyCandidates[0];
         for (Register cand : kCopyCandidates) {
           if (cand != object && cand != offset_reg) {

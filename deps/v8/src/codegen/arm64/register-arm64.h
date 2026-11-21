@@ -29,10 +29,23 @@ namespace internal {
 
 // x18 is the platform register and is reserved for the use of platform ABIs.
 // It is known to be reserved by the OS at least on Windows and iOS.
+//
+// In phase ii, x25 is reserved as kExecutionStateRegister (the per-worker
+// execution-state base) and must never be handed out by the register allocator
+// as scratch. ALLOC_X25(R) expands to R(x25) when the transport is OFF (default:
+// x25 stays an ordinary allocatable register, build byte-identical to upstream)
+// and to nothing when it is ON, so the ALWAYS_ALLOCATABLE list stays portable
+// across both build modes without an #ifdef inside the macro body.
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+#define ALLOC_X25(R)
+#else
+#define ALLOC_X25(R) R(x25)
+#endif
+
 #define ALWAYS_ALLOCATABLE_GENERAL_REGISTERS(R)                  \
   R(x0)  R(x1)  R(x2)  R(x3)  R(x4)  R(x5)  R(x6)  R(x7)  \
   R(x8)  R(x9)  R(x10) R(x11) R(x12) R(x13) R(x14) R(x15) \
-         R(x19) R(x20) R(x21) R(x22) R(x23) R(x24) R(x25) \
+         R(x19) R(x20) R(x21) R(x22) R(x23) R(x24) ALLOC_X25(R) \
   R(x27)
 
 #ifdef V8_COMPRESS_POINTERS
@@ -515,12 +528,11 @@ ALIAS_REGISTER(Register, wip1, w17);
 ALIAS_REGISTER(Register, kRootRegister, x26);
 ALIAS_REGISTER(Register, rr, x26);
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
-// Per-worker execution-state base register (candidate b, phase i transport
-// proof). Currently x25, which the register allocator may still assign; the
-// allocator reservation (removing x25 from ALLOCATABLE, plus the matching
-// callee-save / regexp / wasm / callee fixes) is deferred to phase ii. Here the
-// alias is only consumed by the gated MacroAssembler helpers below and by the
-// standalone 2-thread transport proof, which manages x25 by hand.
+// Per-worker execution-state base register (candidate b, phase ii). x25 is
+// reserved here: it is dropped from ALWAYS_ALLOCATABLE via ALLOC_X25() so the
+// register allocator never hands it out, and its regexp / callee-save / GC-root
+// conflicts are resolved in phase ii so generated code and the runtime both
+// treat x25 as the stable per-worker base loaded at JS/C entry.
 ALIAS_REGISTER(Register, kExecutionStateRegister, x25);
 #endif
 // Pointer cage base register.
