@@ -126,9 +126,9 @@ const assert = require('node:assert/strict');
     assert.equal(r['k' + i], vals[i], 'scenario 4: field k' + i + ' intact');
 }
 
-// 5. Canonical copy-on-write isolation: after a write, the thread's private
-//    copy (cowCloneOf) must have a different address than the shared
-//    main-heap view (addrOf).
+// 5. Canonical copy-on-write isolation: after a write through a heap-object
+//    reference store, the thread's private copy (cowCloneOf) must have a
+//    different address than the shared main-heap view (addrOf).
 {
   const r = g.spawn(() => {
     const target = { kind: 'shared' };

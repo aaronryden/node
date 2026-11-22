@@ -1204,6 +1204,18 @@ MaybeHandle<Code> CompileTurbofan(Isolate* isolate, Handle<JSFunction> function,
   }
 
   // Prepare the job and launch concurrent compilation, or compile now.
+  //
+  // While a CoW green-thread view is active the shared heap is rewritten solely
+  // on the embedding thread; concurrent Turbofan would compile on a background
+  // worker against the heap the view is cloning (torn SharedFunctionInfo /
+  // feedback-vector / Map reads). A later deopt from the green body's baseline
+  // frame into that half-written optimized code lands on a dead pointer
+  // (EXC_BAD_ACCESS at 0xbeeddead). Force synchronous compilation, which runs on
+  // the embedding thread and always reads a consistent view. Mirrors the Maglev
+  // gate in CompileMaglev below.
+  if (IsConcurrent(mode) && GreenThreadCOWSuspendedConcurrentGC()) {
+    mode = ConcurrencyMode::kSynchronous;
+  }
   if (IsConcurrent(mode)) {
     if (CompileTurbofan_Concurrent(isolate, std::move(job))) return {};
   } else {

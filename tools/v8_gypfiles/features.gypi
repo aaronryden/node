@@ -334,10 +334,11 @@
     'v8_enable_green_threads%': 1,
 
     # Enable per-worker execution-state (candidate b) transport proof.
-    # Sets -DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE. Off by default; a plain
-    # node build is byte-identical to upstream. Enable with
-    # GYP_DEFINES='v8_enable_green_worker_execution_state=1'.
-    'v8_enable_green_worker_execution_state%': 0
+    # Sets -DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE. The canonical default is in
+    # common.gypi; it is redeclared here so the value is resolvable inside this
+    # file's own target_defaults conditions (common.gypi's variables are not in
+    # scope here). ON for this fork (mirrors v8_enable_green_threads).
+    'v8_enable_green_worker_execution_state%': 1
   },
 
   'target_defaults': {

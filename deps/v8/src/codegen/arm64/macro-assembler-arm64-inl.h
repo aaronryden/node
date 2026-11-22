@@ -1222,29 +1222,46 @@ void MacroAssembler::InitializeRootRegister() {
 }
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+// Bit index of IsolateExecutionModeFlag::kIsGreenThread in
+// IsolateData.execution_mode_ (1 << 2). Read by the JS-entry arming code to
+// branch to the per-worker x25 override under green multi-worker mode.
+static constexpr int kGreenExecutionModeBit = 2;
+
 void MacroAssembler::InitializeExecutionStateRegister() {
-  if (isolate()->is_green_thread_mode()) {
-    // Green mode: several OS workers run concurrently inside one isolate, so each
-    // worker's generated code (which addresses execution fields via x25 +
-    // ExecutionState::FieldOffset) must be armed to THAT worker's own block, not the
-    // shared isolate_root-relative ThreadLocalTop, or they'd clobber each other. The
-    // per-worker base lives in this thread's PerIsolateThreadData, reachable only from
-    // the runtime; the function returns it in x0. Call is a plain bl (no frame) and
-    // allocates nothing, so no GC-safety frame is required. bl clobbers x0 and the
-    // isolate root (x0 is reloaded into kRootRegister=x26 right after for the cage
-    // base), so preserve it in callee-saved x19 across the call.
-    Mov(x19, kRootRegister);
-    Call(ExternalReference::current_execution_state_base());
-    Mov(kExecutionStateRegister, x0);
-    Mov(kRootRegister, x19);
-    return;
-  }
-  // Serial path (and non-green isolates): x25 aliases the shared
-  // isolate_root-relative ThreadLocalTop, so execution-field loads/stores land on
-  // the same bytes they always have — byte-identical to upstream.
-  LoadRootRegisterOffset(
-      kExecutionStateRegister,
-      static_cast<intptr_t>(IsolateData::GetOffset(IsolateFieldId::kThreadLocalTop)));
+  // Arm x25 to the ExecutionState block Isolate::thread_local_top() addresses,
+  // so generated field access and the exception walk read the same bytes.
+
+  // Serial fast path (green_thread_mode_ clear): root-relative ADD to the shared
+  // ThreadLocalTop. Byte-identical to upstream's kRootRegister field routing, no
+  // runtime call and no EXTERNAL_REFERENCE reloc, so the JS-entry builtins stay
+  // isolate-independent. This also matches thread_local_top() off-green.
+  Add(kExecutionStateRegister, kRootRegister,
+      IsolateData::GetOffset(IsolateFieldId::kThreadLocalTop));
+
+  // Multi-worker green override: every OS worker shares one heap, so x25 must be
+  // THIS worker's ExecutionState block, matching thread_local_top()'s per-OS-thread
+  // block under green_thread_mode_ -- else the handler stores the exception where
+  // UnwindAndFindHandler never reads it (throw-mode null-frame SEGV) and a body's
+  // execution-field reads (context()/context_ ...) index the wrong worker's block.
+  // Branch on the green mirror bit baked into IsolateData.execution_mode_ (embeddable,
+  // loaded root-relative next to the root register). When set, reload x25 from the
+  // shared IsolateData execution_state_base_ mirror via a pure root-relative 64-bit
+  // load -- no runtime/cell call, so the entry frame's c_entry_fp/js_entry_sp/stack
+  // state is not disturbed (a CallRuntime through RuntimeCEntry -> CEntry would
+  // spuriously trip the interpreter call-limit here, which is why the arm stays a
+  // load, not a CallCFunction to CurrentExecutionStateBase()). The mirror is written
+  // by SetIsolateThreadLocals; in the M2Probe forced-GC path every such write happens
+  // under the mutator lock, so it reflects the one running worker's own block when
+  // this arm reads it (that lock serialization is what makes the shared-mirror read
+  // race-free for green bodies). Serial clears the bit, so the branch is untaken and
+  // the additive arm (x25 = root + ThreadLocalTop) stands.
+  Label is_green, done;
+  Ldrb(x8.W(), AsMemOperand(IsolateFieldId::kExecutionMode));
+  Tbnz(x8, kGreenExecutionModeBit, &is_green);
+  B(&done);
+  Bind(&is_green);
+  Ldr(kExecutionStateRegister, AsMemOperand(IsolateFieldId::kExecutionStateBase));
+  Bind(&done);
 }
 #endif
 

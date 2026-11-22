@@ -558,6 +558,7 @@ Isolate::PerIsolateThreadData*
 Isolate::FindOrAllocatePerThreadDataForThisThread() {
   ThreadId thread_id = ThreadId::Current();
   PerIsolateThreadData* per_thread = nullptr;
+  bool freshly_allocated = false;
   {
     base::MutexGuard lock_guard(&thread_data_table_mutex_);
     per_thread = thread_data_table_.Lookup(thread_id);
@@ -567,6 +568,7 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
       }
       per_thread = new PerIsolateThreadData(this, thread_id);
       thread_data_table_.Insert(per_thread);
+      freshly_allocated = true;
     }
     DCHECK(thread_data_table_.Lookup(thread_id) == per_thread);
   }
@@ -585,15 +587,40 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
   // CurrentPerIsolateThreadData() is not this data yet (SetIsolateThreadLocals
   // installs it afterwards), and routing through the accessor here would touch
   // the wrong block.
-  if (green_thread_mode_) {
+  // Initialize this worker's ExecutionState only the first time this thread's
+  // PerIsolateThreadData is allocated (freshly_allocated). Re-initializing on every
+  // Enter() would wipe the live context/exception/handler chain of a green body
+  // mid-flight (nested Isolate::Scope / Context::Scope calls re-Enter and route back
+  // through FindOrAllocate) -- the throw-mode regression. A live worker block must
+  // never be re-Cleared. Runs outside the lock, directly on the fresh {per_thread}.
+  if (green_thread_mode_ && per_thread != nullptr) {
     PerIsolateThreadData* data = per_thread;
-    data->execution_state_.top.Initialize(this);
+    // The block must be initialized exactly once -- the first time it goes active
+    // in green mode. freshly_allocated is unreliable as the trigger: a block may
+    // be created during isolate init (before SetGreenThreadMode turns green mode
+    // on) and only reach green mode on the first Enter. Detect not-yet-initialized
+    // via unset isolate_ (Clear() leaves it null); a live block carries a non-null
+    // isolate_ and must never be re-Cleared.
+    if (data->execution_state_.top.isolate_ == nullptr) {
+      data->execution_state_.top.Initialize(this);
+    }
+    // Resting exception_/pending_message_ must be the_hole, not their Clear()
+    // defaults: a resting Smi::zero / null is *not* the_hole, so has_exception() /
+    // has_pending_message() read them as "set". That lets ReportPendingMessages
+    // treat an idle worker as carrying an exception+message and Cast a null message
+    // (the spawn SIGSEGV). Idempotent -- only fill while still at the resting 0
+    // value; a live body's exception/message is a real (non-null) object and is
+    // never clobbered.
     {
       PtrComprCageAccessScope ptr_compr_cage_access_scope(this);
-      data->execution_state_.top.exception_ =
-          ReadOnlyRoots(this).the_hole_value();
-      data->execution_state_.top.pending_message_ =
-          ReadOnlyRoots(this).the_hole_value();
+      if (data->execution_state_.top.exception_.ptr() == 0) {
+        data->execution_state_.top.exception_ =
+            ReadOnlyRoots(this).the_hole_value();
+      }
+      if (data->execution_state_.top.pending_message_.ptr() == 0) {
+        data->execution_state_.top.pending_message_ =
+            ReadOnlyRoots(this).the_hole_value();
+      }
     }
   }
 #endif
@@ -602,12 +629,16 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
 ExecutionState* Isolate::CurrentExecutionStateBase() {
-  // Phase ii per-worker execution-state base. Green-thread isolates run several OS
-  // workers concurrently, so x25 must be armed to THIS worker's block, not the shared
-  // ThreadLocalTop. CurrentPerIsolateThreadData() is a lock-free thread_local read, so
-  // it is safe to call from any worker's generated code at JS entry.
+  // Phase ii per-worker execution-state base. Green-thread isolates run several
+  // OS workers concurrently, so x25 must be armed to THIS worker's block, not
+  // the shared ThreadLocalTop. Use the PerIsolateThreadData registered for the
+  // current thread -- its `isolate_` is *this* green isolate (the code calling
+  // us was generated for it), so `is_green_thread_mode()` is true here even in
+  // the recursive embedding model where TryGetCurrent() would return the
+  // outer isolate and wrongly arm x25 to the shared block, desyncing the JS
+  // entry writes (c_entry_fp / js_entry_sp) from what the unwind walk reads.
   PerIsolateThreadData* data = CurrentPerIsolateThreadData();
-  if (data != nullptr && data->isolate()->is_green_thread_mode()) {
+  if (data && data->isolate()->is_green_thread_mode()) {
     return &data->execution_state_;
   }
   Isolate* iso = data != nullptr ? data->isolate() : TryGetCurrent();
@@ -4914,6 +4945,23 @@ void Isolate::SetIsolateThreadLocals(Isolate* isolate,
                             ? isolate->main_thread_local_heap()
                             : nullptr);
   g_current_per_isolate_thread_data_ = data;
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (isolate && data) {
+    // Mirror THIS worker's ExecutionState base into IsolateData so the
+    // isolate-independent JS-entry builtins (which only carry the root
+    // register) can arm x25 to the per-worker block under green mode, matching
+    // Isolate::thread_local_top(), via a pure root-relative load -- no runtime
+    // call. A CallRuntime (RuntimeCEntry -> CEntry) from the entry corrupts the
+    // entry frame's c_entry_fp/js_entry_sp/stack state and spuriously trips the
+    // interpreter call-limit (Maximum call stack size) in green bodies.
+    // CurrentExecutionStateBase() lazily initializes this worker's block
+    // (the_hole resting exception/pending_message, context) exactly once, so by
+    // the time the arm reads the mirror the block is already initialized.
+    Address es_base = reinterpret_cast<Address>(isolate->CurrentExecutionStateBase());
+    isolate->isolate_data_.execution_state_base_ = es_base;
+  }
+#endif
 
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
   V8HeapCompressionScheme::InitBase(isolate ? isolate->cage_base()

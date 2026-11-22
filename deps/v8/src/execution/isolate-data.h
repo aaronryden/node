@@ -294,6 +294,14 @@ class IsolateData final {
 
   const Address cage_base_ = kNullAddress;
 
+  // Per-worker ExecutionState base mirror for green-thread (multi-mutator)
+  // isolates. Kept current by Isolate::SetIsolateThreadLocals() (it is set
+  // alongside CurrentExecutionStateBase(), which also lazily initializes this
+  // worker's block). The JS-entry arming reads it root-relative to arm x25 to
+  // THIS worker's ExecutionState block under green mode; under serial mode the
+  // arming uses the additive path and ignores this field.
+  Address execution_state_base_ = kNullAddress;
+
   // Fields related to the system and JS stack. In particular, this contains
   // the stack limit used by stack checks in generated code.
   StackGuard stack_guard_;

@@ -35,6 +35,13 @@ const NUM_THREADS = Number(process.env.GT_TIMING_THREADS || '12');
 const CHUNKS = Number(process.env.GT_TIMING_CHUNKS || '6');
 const FIB_PER_CHUNK = Number(process.env.GT_TIMING_FIB_PER_CHUNK || '4000');
 const YIELD_EVERY = Number(process.env.GT_TIMING_YIELD_EVERY || '1');
+// Resolved OS-worker count mirrors RunTasks in src/green_threads.cc: use
+// GT_NUM_WORKERS when set (> 0), else the host core count. GreenThreadPool caps
+// this at the number of bodies, so it is a true upper bound on parallelism.
+const os = require('node:os');
+const numWorkers = (Number(process.env.GT_NUM_WORKERS) || 0) > 0
+  ? Number(process.env.GT_NUM_WORKERS)
+  : os.hardwareConcurrency();
 
 // CPU work for one chunk. fib() keeps BigInt exact and grows the operand size,
 // so the later iterations are genuinely expensive -- a fair analog to the fib
@@ -109,22 +116,18 @@ function main() {
   console.log(`  green_threads.spawnAll wall time              : ${cow.toFixed(1)} ms`);
   const ratio = baseline.ms > 0 ? cow / baseline.ms : 0;
   console.log(`  green / sync                                  : ${ratio.toFixed(2)}`);
-  if (ratio < 1.35) {
+  console.log(`  resolved OS threads (GT_NUM_WORKERS)          : ${numWorkers}`);
+  if (ratio < 0.75) {
     console.log(
-      '\n  => SERIAL: green threads spent ~ the same wall time as doing the work',
-    );
-    console.log(
-      '     on one thread. They interleave cooperatively but share ONE real OS',
-    );
-    console.log(
-      '     thread, so there is no multi-core speedup. This is the CoW-isolation',
-    );
-    console.log(
-      '     model. For real parallelism see examples/green_threads_parallel.js.',
+      '\n  => PARALLEL: green threads ran on multiple OS threads and finished',
+      'faster than the single-thread baseline -- true GT parallel processing.',
     );
   } else {
     console.log(
-      '\n  => FASTER than serial: the green threads exploited multiple cores.',
+      '\n  => SERIAL: green threads spent ~ the same wall time as doing the work',
+      '     on one thread. They interleave cooperatively but share ONE real OS',
+      '     thread, so there is no multi-core speedup (see',
+      '     examples/green_threads_parallel.js for real parallelism).',
     );
   }
 }

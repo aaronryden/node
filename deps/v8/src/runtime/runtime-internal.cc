@@ -204,6 +204,20 @@ RUNTIME_FUNCTION(Runtime_UnwindAndFindExceptionHandler) {
   return isolate->UnwindAndFindHandler();
 }
 
+// Returns the per-worker ExecutionState base for the current OS thread, so that
+// green-thread entry codegen can arm the execution-state register (x25) to this
+// worker's own block instead of the shared isolate-relative ThreadLocalTop.
+// Resolved through the runtime entry table (in-range), so it stays embeddable
+// in the isolate-independent entry builtins, unlike an absolute
+// FUNCTION_REFERENCE. Uses a raw Address return (identity convert) because the
+// base is a C++ block pointer, not a heap object.
+#define IDENTITY_ADDRESS_RESULT(x) (x)
+RUNTIME_FUNCTION_RETURNS_TYPE(Address, Address, IDENTITY_ADDRESS_RESULT,
+                              Runtime_GetExecutionStateBase) {
+  return reinterpret_cast<Address>(isolate->CurrentExecutionStateBase());
+}
+#undef IDENTITY_ADDRESS_RESULT
+
 RUNTIME_FUNCTION(Runtime_PropagateException) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());

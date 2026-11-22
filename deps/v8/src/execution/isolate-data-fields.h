@@ -33,6 +33,15 @@ static constexpr int kFastCCallAlignmentPaddingCount = 1;
 #define ISOLATE_DATA_FIELDS(V)                                                 \
   /* Misc. fields. */                                                          \
   V(CageBase, kSystemPointerSize, cage_base)                                   \
+  /* Per-worker ExecutionState base mirror (green-thread multi-mutator). Set
+     from Isolate::SetIsolateThreadLocals() whenever a worker establishes its
+     PerIsolateThreadData; the JS-entry arming reads it root-relative to load
+     x25 to THIS worker's block under green mode (matching Isolate::
+     thread_local_top()) with a pure root-relative load -- no runtime call, so
+     the shared, isolate-independent entry builtins stay embeddable and their
+     frame state is not disturbed by a CEntry call. Serial (green bit clear)
+     keeps the additive path and never reads this field. */                    \
+  V(ExecutionStateBase, kSystemPointerSize, execution_state_base)              \
   V(StackGuard, StackGuard::kSizeInBytes, stack_guard)                         \
   V(IsMarkingFlag, kUInt8Size, is_marking_flag)                                \
   V(IsMinorMarkingFlag, kUInt8Size, is_minor_marking_flag)                     \

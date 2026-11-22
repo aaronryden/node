@@ -853,7 +853,16 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Green-thread isolates allow multiple OS worker threads to Enter/Exit the
   // same isolate concurrently. The embedder sets this once, right after the
   // isolate is created.
-  void set_green_thread_mode(bool mode) { green_thread_mode_ = mode; }
+  void set_green_thread_mode(bool mode) {
+    green_thread_mode_ = mode;
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Mirror into IsolateData so generated JS-entry code (which only has the
+    // root register, pointing into IsolateData) can read green mode embeddably
+    // and arm the execution-state register (x25) to this worker's block.
+    isolate_data_.execution_mode_.set(IsolateExecutionModeFlag::kIsGreenThread,
+                                      mode);
+#endif
+  }
   bool is_green_thread_mode() const { return green_thread_mode_; }
 
   void InstallConditionalFeatures(DirectHandle<NativeContext> context);
@@ -1380,10 +1389,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   ThreadLocalTop* thread_local_top() {
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
     if (green_thread_mode_) {
-      // Keyed by THIS isolate + the current OS thread, so it resolves to the
-      // correct per-worker block regardless of any concurrent
-      // CurrentPerIsolateThreadData() shift (e.g. Context::New touching the
-      // embedding isolate). Stays on the shared block off-green.
       if (PerIsolateThreadData* data = FindPerThreadDataForThisThread())
         return &data->execution_state_.top;
     }

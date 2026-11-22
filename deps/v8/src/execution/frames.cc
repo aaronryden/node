@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 
 #include "src/api/api-arguments.h"
@@ -290,9 +292,27 @@ StackFrame::Type GetStateForFastCCallCallerFP(Isolate* isolate, Address fp,
 void StackFrameIterator::Reset(ThreadLocalTop* top) {
   StackFrame::State state;
   StackFrame::Type type;
-
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (::getenv("GT_DEBUG")) {
+    ThreadLocalTop* shared = &isolate_->isolate_data()->thread_local_top();
+    fprintf(stderr,
+            "[GT-RESET] green=%d top=%p shared=%p "
+            "top.centry=%p top.jsentry=%p shared.centry=%p shared.jsentry=%p "
+            "fast_cc_fp=%p\n",
+            (int)isolate_->is_green_thread_mode(), (void*)top,
+            (void*)shared, (void*)Isolate::c_entry_fp(top),
+            (void*)top->js_entry_sp_, (void*)Isolate::c_entry_fp(shared),
+            (void*)shared->js_entry_sp_,
+            (void*)isolate_->isolate_data()->fast_c_call_caller_fp());
+  }
+#endif
   const Address fast_c_call_caller_fp =
       isolate_->isolate_data()->fast_c_call_caller_fp();
+  if (::getenv("GTANCHOR")) {
+    fprintf(stderr, "[GTANCHOR] centry=%p jsentry=%p fast_cc_fp=%p\n",
+            (void*)Isolate::c_entry_fp(top), (void*)top->js_entry_sp_,
+            (void*)fast_c_call_caller_fp);
+  }
   if (fast_c_call_caller_fp != kNullAddress) {
     const Address caller_pc = isolate_->isolate_data()->fast_c_call_caller_pc();
     const Address caller_pc_address =

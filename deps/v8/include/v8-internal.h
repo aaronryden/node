@@ -981,8 +981,13 @@ class Internals {
 
   // IsolateData layout guarantees.
   static const int kIsolateCageBaseOffset = 0;
-  static const int kIsolateStackGuardOffset =
+  // Per-worker ExecutionState base mirror (green-thread multi-mutator). Inserted
+  // right after CageBase so the JS-entry arming can arm x25 to THIS worker's
+  // block under green mode via a small, single-instruction root-relative load.
+  static const int kIsolateExecutionStateBaseOffset =
       kIsolateCageBaseOffset + kApiSystemPointerSize;
+  static const int kIsolateStackGuardOffset =
+      kIsolateExecutionStateBaseOffset + kApiSystemPointerSize;
   static const int kVariousBooleanFlagsOffset =
       kIsolateStackGuardOffset + kStackGuardSize;
   static const int kErrorMessageParamOffset =

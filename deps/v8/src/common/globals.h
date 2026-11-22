@@ -2582,6 +2582,13 @@ enum class IsolateExecutionModeFlag : uint8_t {
   // Set if side effect checking is enabled for the Isolate.
   // See Debug::StartSideEffectCheckMode().
   kCheckSideEffects = 1 << 1,
+  // Set if the Isolate runs in green-thread (multi-worker) mode. Mirrored here
+  // (root-reachable from kRootRegister, unlike the Isolate-level green_thread_
+  // mode_) so generated JS-entry code can read it embeddably and arm the
+  // execution-state register (x25) to THIS worker's block under green mode, or
+  // to the shared ThreadLocalTop otherwise -- without a runtime call on the
+  // serial path (which would break isolate-independent embedding).
+  kIsGreenThread = 1 << 2,
 };
 
 // Flags for the runtime function kDefineKeyedOwnPropertyInLiteral.

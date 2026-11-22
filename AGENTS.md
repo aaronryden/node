@@ -101,6 +101,49 @@ These rules apply to **every** build and process run.
      the parallel discriminator) rather than a single ad-hoc repro — the full build
      already paid its cost, so verify the whole surface in one shot.
 
+#### GT feature flags are ON — never debug with them off
+
+This fork targets **real green-thread OS-thread-pool parallelism**, so both V8 GT
+feature flags are permanently enabled in the build:
+
+- `v8_enable_green_threads` → `-DV8_ENABLE_GREEN_THREADS`
+- `v8_enable_green_worker_execution_state` → `-DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE`
+
+The defaults live in `common.gypi` (declared there as `1`, the canonical scope for the
+GYP variables) and are mirrored as `': 1` in `tools/v8_gypfiles/features.gypi` so the
+value is resolvable inside that file's own `target_defaults` conditions (common.gypi
+variables are *not* in features.gypi's scope). `features.gypi` emits the `-D` defines
+from its `['v8_enable_green_...==1', { 'defines': [...] }]` conditions.
+
+**Consequence for every edit and every test — read this before running anything:**
+
+- **A flag change is a full-rebuild change, not an incremental one.** The flag gates
+  `v8_gypfiles` `defines`, so after *any* flip or after changing these `.gypi` files
+  you **must regenerate** the ninja files before building:
+  ```sh
+  # configure.py alone only writes config.gypi. Force a ninja regenerate:
+  rm -f out/Release/build.ninja
+  python3 configure.py --ninja        # NOT ./configure (defaults to -f make -> no build.ninja)
+  ```
+  Verify propagation *before* the multi-minute build — `compile_commands.json` is
+  only refreshed on demand, so re-fetch it rather than trusting a stale copy:
+  ```sh
+  ninja -C out/Release -t compdb cxx > /tmp/ccdb.json
+  grep -c V8_ENABLE_GREEN_WORKER_EXECUTION_STATE /tmp/ccdb.json   # expect many hits
+  ```
+  If it reads `0`, do not build a stale binary.
+- **Never diagnose, test, or iterate with the flag OFF.** All green-thread debugging,
+  benchmarking, and suite runs happen with the flags ON, against the real per-worker
+  execution-state path. Turning them off to "make it compile faster" produces a binary
+  whose behavior is irrelevant to the feature and wastes the build that follows.
+- Enabling `V8_ENABLE_GREEN_WORKER_EXECUTION_STATE` arms x25 to the per-worker
+  `ExecutionState` block and routes `thread_local_top()` / `execution_state()` there.
+  It only activates under `is_green_thread_mode()`, which the green (shared-heap)
+  isolate is set to at construction and which the serial-mode embedding isolate is
+  flipped onto only for the pool run. A flag change therefore also forces the
+  `mksnapshot` re-snapshot (generated code re-arms x25) — expect the full `node`
+  rebuild, not a single `.cc` touch.
+
 ## Build Playbooks
 
 Recurring, non-obvious gotchas specific to this V8 14.6 fork, and how to resolve them
@@ -272,6 +315,45 @@ matching the other copies. One-line, well-commented fix; cow → 20/20, 40×40 a
 **Do NOT re-add the deferral (historical lesson).** The old deferral gated
 `Heap::HandleGCRequest` across 5 files and *regressed* the very case it aimed to
 fix. Don't re-add it.
+
+#### Forced-GC worker SEGV: the shared `execution_state_base_` mirror race
+
+**Symptom.** `test-green-threads-forced-gc.js` (`__m2_probe(4, …)`,
+`GT_SHARED_HEAP=1 GT_M2_FORCE_GC=both`) SIGSEGVs ~30-40% of the time. The
+crasher is a green worker body in `KeyedStoreIC::Store` reading `native_context`
+→ `initial_array_prototype`; the faulting context's map word is
+`0xffffffffffffffff`. Re-running in lldb shows the crasher's **x25**
+(`kExecutionStateRegister` / `thread_local_top()` base under green mode) is
+either `0` or a *sibling* worker's `ExecutionState` block whose `context_` is
+still `0`.
+
+**Root cause (NOT a collection/rooting bug).** The green context and the
+per-worker markers both survive `M2ForceGC` (confirmed by logging them before and
+after the collection — identical addresses). The crash is the per-worker
+execution-state base (`x25`) being armed to the wrong block. x25 is loaded at JS
+entry (arm64 `InitializeExecutionStateRegister`) from the **single shared**
+`IsolateData::execution_state_base_` mirror; that mirror is written by
+`SetIsolateThreadLocals` at every `v8::Isolate::Scope`. The M2Probe worker ran
+`v8::Isolate::Scope worker_scope(w.data->isolate)` **before** acquiring the
+`g_green_mutator_lock`, so on `ResumeAllMutators` (which `notify_all`s every
+parked worker at once) the workers' scopes ran concurrently and clobbered the
+one mirror while a sibling was mid-body. A re-arming body entry then read a
+parked sibling's not-yet-context-entered block → `context()` = 0 → SEGV. Serial
+passes because the body is under the lock; the force-GC `worker_scope` was the
+only write outside it.
+
+**Fix.** Take `worker_scope` **inside** the mutator lock in `M2Probe`
+(`src/green_threads.cc`), so every `SetIsolateThreadLocals` mirror-write during
+body execution belongs to the one running worker and the shared mirror is
+race-free for green bodies. The JS-entry arm then correctly reads that worker's
+own `ExecutionState` block. Verified: forced-GC acceptance test exits 0; stress
+`m2probe_run.js` went from ~35% crash to **0/120**.
+
+**Do NOT "fix" this by making the arm read `CurrentExecutionStateBase()` via a
+`CallCFunction`** (we tried): a C call at the JS entry corrupts the entry frame
+(c_entry_fp/js_entry_sp/stack) — it regressed even plain serial runs to 100%
+SIGSEGV. The mirror-load (root-relative `Ldr`) is the right codegen; the mirror
+must simply be written by the running worker only.
 
 ## Why
 
