@@ -57,6 +57,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <condition_variable>
 
 #include "node_binding.h"
 #include "util.h"
@@ -788,6 +789,23 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
     return;
   }
 
+#ifdef V8_ENABLE_GREEN_THREADS
+  // Multiple OS workers run bodies concurrently inside ONE shared green heap
+  // (GT_M2_PARALLEL). Their C++ HandleScopes and Context::Enter/Exit all go
+  // through the *shared* HandleScopeImplementer (blocks_ + the entered/saved
+  // context stacks), and the shared-writer paths (Map transitions, feedback,
+  // Code dispatch) touch shared V8 metadata -- so without serialization a
+  // sibling worker scrambles another's context stack (isolate->context()
+  // becomes garbage) / handle block stack / descriptor array, corrupting the
+  // heap and EXC_BAD_ACCESS-ing. GreenThreadCowSharedWriterScope serializes the
+  // whole per-worker region under the shared-state recursive mutex when a CoW
+  // view is active; it is a no-op (no lock) off-CoW and single-worker, so the
+  // serial/CONTROL path and warmup are unaffected. The bodies are re-entrant
+  // writers (they take this same mutex for their Map/feedback/Code steps), so
+  // the recursive mutex handles the nested acquisition.
+  vi::GreenThreadCowSharedWriterScope shared_writer_scope;
+#endif
+
   // Enter the green thread's own isolate so its body runs on that heap.
   // ScheduleLoop drives bodies on the embedding thread, so absent this the
   // current isolate would be the embedding one; GreenJSEntry must switch to
@@ -1272,6 +1290,55 @@ void ConcurrentEntry(const FunctionCallbackInfo<Value>& args) {
 // process-global: there is exactly one green isolate per process.
 static std::mutex g_green_mutator_lock;
 
+// One unit of work for the M2Probe worker pool: a green thread and its call
+// data, claimed by an OS worker that runs its body to completion. `idx` is the
+// worker's position in the probe's result vector (also the id baked into its
+// Item-2 forced-GC marker), so a worker records its success under its own slot.
+struct Work {
+  vi::GreenThread* gt;
+  GreenCallData* data;
+  int idx;
+};
+
+// A tiny thread-safe claim queue driving the M2Probe fan-out. Unlike
+// GreenScheduler's global runqueue (accessed only from the embedding thread, so
+// green-thread-scheduler.h declares it needs no sync), this pool is driven by n
+// real OS threads that must claim work concurrently -- hence the mutex +
+// condition variable. Each queued item is handed to exactly one worker via a
+// monotonic claim index, so no item is double-claimed and none is lost. The work
+// items themselves live in the caller's vector for the whole run; the queue only
+// hands them out. The recursive GreenScheduler::Yield entry() is deliberately not
+// used here -- each worker runs its claimed body to completion.
+class M2ProbeWorkQueue {
+ public:
+  explicit M2ProbeWorkQueue(std::vector<Work>* works) : works_(works) {}
+
+  // Block until the next unclaimed work item is available, then claim it by
+  // index. Returns false once every item has been claimed (queue exhausted).
+  bool WaitAndClaim(Work* out) {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [&] { return next_ >= works_->size() || shutdown_; });
+    if (next_ >= works_->size()) return false;
+    *out = (*works_)[next_];
+    ++next_;
+    return true;
+  }
+
+  // Release any worker parked in WaitAndClaim during teardown.
+  void Shutdown() {
+    std::lock_guard<std::mutex> lock(mu_);
+    shutdown_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  std::vector<Work>* works_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  size_t next_ = 0;
+  bool shutdown_ = false;
+};
+
 // green_threads.__m2_probe(n, fn0, ..., fn_{n-1}) -> { results: [..], all_ok: bool }
 //
 // M2 foundational probe: `n` OS worker threads run `n` self-contained allocating
@@ -1332,7 +1399,6 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
    // Unset = current behavior (byte-for-byte unchanged). "young"|"full"|"both"
    // forces the corresponding collection(s) while the N workers are active.
    const M2ForcedGCMode force_gc_mode = M2ParseForcedGCEnv();
-  struct Work { vi::GreenThread* gt; GreenCallData* data; };
   std::vector<Work> works;
   works.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
@@ -1356,7 +1422,7 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     vi::GreenThread* gt = CreateGreenThread(reinterpret_cast<vi::Isolate*>(green));
     data->gt = gt;
     g_gt_registry[gt] = data;
-    works.push_back(Work{gt, data});
+    works.push_back(Work{gt, data, i});
      // Item 2: allocate a disjoint per-worker allocation marker on the green
      // heap, rooted via a Persistent handle so the forced GC (which runs while
      // this worker is parked) cannot reclaim it. post_gc_consistent verifies
@@ -1394,11 +1460,17 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   //    [=} capture making a per-worker copy.
   std::vector<char> ok(static_cast<size_t>(n), 0);
   char* ok_p = ok.data();
-  // Flip the green heap's young-gen allocation into the atomic CAS path for the
-  // duration of the concurrent worker run so the N workers reserve disjoint
-  // pointers from the SAME green heap — the entire point of GT_SHARED_HEAP=1.
-  // Reset to the serial fast path once the workers join; the result-copy and
-  // teardown below are single-threaded and must not pay CAS overhead.
+  // Item 4: enable the atomic CAS bump-pointer for the duration of the
+  // concurrent fan-out so the N workers reserve disjoint young-gen pointers
+  // from the SAME green heap instead of racing the plain bump write (top_ +=
+  // bytes), which would hand two workers the same address. Reset to the serial
+  // fast path once the workers join; the result-copy and teardown below are
+  // single-threaded and must not pay CAS overhead. The serializer below
+  // (g_green_mutator_lock) is released only when GT_M2_PARALLEL is set, so that
+  // flag alone turns "serialized CAS" into "real parallel CAS"; the lock stays
+  // the correctness baseline for GT_NUM_WORKERS==1 / legacy serial compare.
+  const bool parallel = (::getenv("GT_M2_PARALLEL") != nullptr);
+  vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, true);
   // Item 1 (I3) / item 2: announce the stop-the-world GC BEFORE spawning the
   // workers, so their entry safepoints observe the request and park before
   // allocating. This quiescence (not the old
@@ -1410,12 +1482,25 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   }
   {
     v8::Isolate::Scope green_scope(green);
+
+    // Item 4: a thread-safe claim queue drives the fan-out. Unlike the
+    // GreenScheduler global runqueue (accessed only from the embedding thread,
+    // so it needs no sync), this pool is driven by n real OS threads that must
+    // claim work concurrently, so it is mutex + condition-variable protected.
+    // Each worker runs its claimed body to completion -- the recursive
+    // GreenScheduler::Yield entry() is deliberately not used here (prohibited in
+    // parallel mode).
+    M2ProbeWorkQueue pool(&works);
+
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
-      const int idx = i;
-      Work w = works[idx];
-      workers.emplace_back([=]() {
+      workers.emplace_back([&]() {
+        Work w;
+        // Claim exactly one body; a worker exits without running only if the
+        // queue is already drained (never happens here -- n bodies for n
+        // workers -- but keeps the claim contract sound for lopsided pools).
+        if (!pool.WaitAndClaim(&w)) return;
         // (a) Enter the green isolate: green_thread_mode_ keeps this worker's
         // entry chain on its own PerIsolateThreadData (M1).
         // Item 1 (I3) / item 2: the single per-worker safepoint on this path.
@@ -1425,23 +1510,30 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
         // Either way we fall through to the body, which runs only after the
         // coordinator has collected and resumed.
         if (force_gc_mode != M2ForcedGCMode::kNone) {
-          vi::GreenThreadCow::PollForGCRequest(w.gt, reinterpret_cast<vi::Isolate*>(green));
+          vi::GreenThreadCow::PollForGCRequest(
+              w.gt, reinterpret_cast<vi::Isolate*>(green));
         }
         v8::Isolate::Scope worker_scope(w.data->isolate);
-        // Acquire the green-mutator lock so this worker is the sole mutator on
-        // the green heap while its body runs. This serializes the young-space
-        // bump-pointer allocation and mutation of shared cached Maps (e.g.
-        // Map::InobjectSlackTrackingStep during object-literal creation), which
-        // otherwise race across the N workers -> EXC_BAD_ACCESS. Held across the
-        // whole GreenJSEntry call via RAII.
-        std::lock_guard<std::mutex> mutator_guard(g_green_mutator_lock);
+        // Item 4: when GT_M2_PARALLEL is set the CAS above already guarantees
+        // disjoint young-gen pointers, so release the serializer and let the N
+        // workers allocate -- and mutate shared-writer state (serialized by the
+        // Item 3 GreenThreadCowSharedWriterScope) -- concurrently. Otherwise
+        // hold the lock across the whole body so at most one OS worker mutates
+        // the green heap at a time (the serial correctness baseline). The park
+        // above happens before this lock, so a forced-GC worker never holds it
+        // while parked at its safepoint.
+        std::unique_lock<std::mutex> mutator_guard(
+            g_green_mutator_lock, std::defer_lock);
+        if (!parallel) mutator_guard.lock();
         // (b) Worker-local attribution (I1): set BEFORE the body so the CoW
         // barrier attributes every store to THIS worker's GT.
         vi::SetCurrentGreenThread(w.gt);
         // (c) Run the body: GreenJSEntry switches to the green isolate and calls
         // the body, setting data->result_p / data->threw.
         GreenJSEntry(reinterpret_cast<vi::Isolate*>(green), w.gt);
-        ok_p[idx] = static_cast<char>(!w.data->threw && !w.data->result_p.IsEmpty());
+        ok_p[w.idx] =
+            static_cast<char>(!w.data->threw && !w.data->result_p.IsEmpty());
+        if (mutator_guard.owns_lock()) mutator_guard.unlock();
       });
     }
     // Item 1 (I3) / item 2: quiescence barrier -- spin-join every spawned
@@ -1463,7 +1555,9 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
    if (force_gc_mode != M2ForcedGCMode::kNone) {
      vi::GreenThreadCow::ResumeAllMutators();
    }
-    for (std::thread& wt : workers) wt.join();
+   // Release any worker still parked in WaitAndClaim, then join the pool.
+   pool.Shutdown();
+   for (std::thread& wt : workers) wt.join();
   }
 
   vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, false);
