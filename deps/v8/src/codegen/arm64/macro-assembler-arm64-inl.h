@@ -1223,14 +1223,25 @@ void MacroAssembler::InitializeRootRegister() {
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
 void MacroAssembler::InitializeExecutionStateRegister() {
-  // Arm kExecutionStateRegister (x25) with the base of this thread's
-  // ExecutionState block. The block embeds its ThreadLocalTop at offset 0
-  // (&ExecutionState == &top), so x25 == isolate_root + GetOffset(kThreadLocalTop)
-  // == &thread_local_top_ on the serial path. Field offsets accessed through x25
-  // (ExecutionState::FieldOffset) are top-relative and therefore address the same
-  // bytes as the shared kRootRegister path — serial behavior is unchanged — while
-  // the base can later point at a genuine per-worker block (installed on
-  // GreenThread) with no change to these generated accesses.
+  if (isolate()->is_green_thread_mode()) {
+    // Green mode: several OS workers run concurrently inside one isolate, so each
+    // worker's generated code (which addresses execution fields via x25 +
+    // ExecutionState::FieldOffset) must be armed to THAT worker's own block, not the
+    // shared isolate_root-relative ThreadLocalTop, or they'd clobber each other. The
+    // per-worker base lives in this thread's PerIsolateThreadData, reachable only from
+    // the runtime; the function returns it in x0. Call is a plain bl (no frame) and
+    // allocates nothing, so no GC-safety frame is required. bl clobbers x0 and the
+    // isolate root (x0 is reloaded into kRootRegister=x26 right after for the cage
+    // base), so preserve it in callee-saved x19 across the call.
+    Mov(x19, kRootRegister);
+    Call(ExternalReference::current_execution_state_base());
+    Mov(kExecutionStateRegister, x0);
+    Mov(kRootRegister, x19);
+    return;
+  }
+  // Serial path (and non-green isolates): x25 aliases the shared
+  // isolate_root-relative ThreadLocalTop, so execution-field loads/stores land on
+  // the same bytes they always have — byte-identical to upstream.
   LoadRootRegisterOffset(
       kExecutionStateRegister,
       static_cast<intptr_t>(IsolateData::GetOffset(IsolateFieldId::kThreadLocalTop)));

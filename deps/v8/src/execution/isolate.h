@@ -644,6 +644,25 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     // g_current_green_thread_ path unchanged. Last member -> never shifts an
     // existing PerIsolateThreadData field's offset.
     GreenThread* current_green_thread_ = nullptr;
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Per-worker execution-state block (phase ii). Green-thread isolates run
+    // several OS workers concurrently inside one isolate, and PerIsolateThreadData
+    // is keyed per-OS-thread, so each worker gets its own ExecutionState (which
+    // embeds a ThreadLocalTop at offset 0, &es == &top). This holds the fields
+    // that previously collided between simultaneously-running workers on the
+    // shared ThreadLocalTop (context / exception / handler / c_entry_fp /
+    // js_entry_sp / pending-message). x25 is armed to this block in
+    // InitializeExecutionStateRegister and the runtime accessors
+    // (thread_local_top / execution_state) route here under green_thread_mode_,
+    // keyed by (this isolate, current OS thread) so they stay stable across the
+    // cross-isolate CurrentPerIsolateThreadData() shifts. Handle scopes stay on
+    // the shared isolate_data_.handle_scope_data_ (see Isolate::handle_scope_data).
+    // Never serialized; added last so an existing
+    // PerIsolateThreadData field's offset never shifts.
+    ExecutionState execution_state_;
+#endif
+
     friend class Isolate;
     friend class ThreadDataTable;
     friend class EntryStackItem;
@@ -1359,25 +1378,55 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   void InitializeThreadLocal();
   ThreadLocalTop* thread_local_top() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      // Keyed by THIS isolate + the current OS thread, so it resolves to the
+      // correct per-worker block regardless of any concurrent
+      // CurrentPerIsolateThreadData() shift (e.g. Context::New touching the
+      // embedding isolate). Stays on the shared block off-green.
+      if (PerIsolateThreadData* data = FindPerThreadDataForThisThread())
+        return &data->execution_state_.top;
+    }
+#endif
     return &isolate_data_.thread_local_top_;
   }
   ThreadLocalTop const* thread_local_top() const {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (const PerIsolateThreadData* data =
+            const_cast<Isolate*>(this)->FindPerThreadDataForThisThread())
+        return &data->execution_state_.top;
+    }
+#endif
     return &isolate_data_.thread_local_top_;
   }
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
-  // Per-worker execution state (candidate b). Interim (phase i) returns the
-  // shared ThreadLocalTop reinterpreted as an ExecutionState: member {top} is at
-  // offset 0, so &es == &thread_local_top_, and es->field_address(id) ==
-  // &thread_local_top_ + FieldOffset(id), i.e. the shared field -- identical to
-  // the thread_local_top() paths above (no serial regression). Real per-worker
-  // blocks are installed in phase ii; until then generated code and runtime both
-  // route through this single shared block.
+  // Per-worker execution state (phase ii). Resolves THIS isolate's block for the
+  // current OS thread (keyed by `this`, stable across CurrentPerIsolateThreadData
+  // cross-isolate shifts); the &ExecutionState == &top invariant (member {top} at
+  // offset 0) makes es->field_address(id) == &top + FieldOffset(id), the same
+  // bytes generated code reaches through x25. Falls back to the shared
+  // ThreadLocalTop reinterpreted as ExecutionState off-green (serial, byte-identical
+  // to the thread_local_top() paths above).
   ExecutionState* execution_state() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (PerIsolateThreadData* data = FindPerThreadDataForThisThread())
+        return &data->execution_state_;
+    }
+#endif
     return reinterpret_cast<ExecutionState*>(&isolate_data_.thread_local_top_);
   }
   ExecutionState const* execution_state() const {
-    return reinterpret_cast<ExecutionState const*>(
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (const PerIsolateThreadData* data =
+            const_cast<Isolate*>(this)->FindPerThreadDataForThisThread())
+        return reinterpret_cast<const ExecutionState*>(&data->execution_state_);
+    }
+#endif
+    return reinterpret_cast<const ExecutionState*>(
         &isolate_data_.thread_local_top_);
   }
 #endif
@@ -1425,6 +1474,13 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   V8_INLINE HandleScopeData* handle_scope_data() {
     return &isolate_data_.handle_scope_data_;
   }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Base of THIS OS worker's ExecutionState block (phase ii per-worker state).
+  // Read by generated code at JS entry to arm x25 in green mode; exposed as a
+  // runtime ExternalReference so the address is resolvable without the root array.
+  static ExecutionState* CurrentExecutionStateBase();
+#endif
 
   HandleScopeImplementer* handle_scope_implementer() const {
     DCHECK(handle_scope_implementer_);

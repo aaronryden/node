@@ -483,6 +483,8 @@ uint32_t fp16_raw_bits_ieee_to_fp32_raw_bits(uint32_t input) {
 }
 
 #if V8_ENABLE_GREEN_THREADS
+FUNCTION_REFERENCE(current_execution_state_base,
+                   Isolate::CurrentExecutionStateBase)
 FUNCTION_REFERENCE(green_thread_cow_clone_if_needed,
                    GreenThreadCow::CowCloneForGeneratedCode)
 #endif  // V8_ENABLE_GREEN_THREADS

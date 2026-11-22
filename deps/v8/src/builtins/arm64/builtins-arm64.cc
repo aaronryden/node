@@ -666,9 +666,11 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
     __ Mov(kRootRegister, x0);
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
     // Arm the per-worker execution-state base register (x25) at JS entry,
-    // alongside kRootRegister. With x25 == &thread_local_top_ (serial transport)
-    // the execution fields accessed through it (AsMemOperand / LoadExecutionField)
-    // match the shared root-relative bytes while isolating per-worker state.
+    // alongside kRootRegister. In green mode x25 is set to THIS OS worker's own
+    // ExecutionState block (see InitializeExecutionStateRegister), so the execution
+    // fields accessed through it (AsMemOperand / LoadExecutionField) stay isolated
+    // per concurrent worker; on the serial path x25 aliases the shared
+    // isolate_root-relative ThreadLocalTop and the bytes are identical.
     __ InitializeExecutionStateRegister();
 #endif
 

@@ -570,8 +570,51 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
     }
     DCHECK(thread_data_table_.Lookup(thread_id) == per_thread);
   }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Green-thread isolates run several OS workers at once, each with its own
+  // PerIsolateThreadData here. Give each worker its own ExecutionState (which
+  // embeds a ThreadLocalTop at offset 0, &es == &top), mirroring
+  // Isolate::InitializeThreadLocal for the shared block (Clear + the_hole
+  // exception/pending_message init), but only the execution state -- handle
+  // scopes stay on the shared isolate_data_.handle_scope_data_ because C++
+  // HandleScopes are managed on the embedding thread across a single
+  // cross-isolate API sequence (e.g. EnsureGreenContext -> Context::New) where
+  // CurrentPerIsolateThreadData() shifts, making a per-worker handle block
+  // inconsistent. Done outside the lock and directly on {per_thread}:
+  // CurrentPerIsolateThreadData() is not this data yet (SetIsolateThreadLocals
+  // installs it afterwards), and routing through the accessor here would touch
+  // the wrong block.
+  if (green_thread_mode_) {
+    PerIsolateThreadData* data = per_thread;
+    data->execution_state_.top.Initialize(this);
+    {
+      PtrComprCageAccessScope ptr_compr_cage_access_scope(this);
+      data->execution_state_.top.exception_ =
+          ReadOnlyRoots(this).the_hole_value();
+      data->execution_state_.top.pending_message_ =
+          ReadOnlyRoots(this).the_hole_value();
+    }
+  }
+#endif
   return per_thread;
 }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+ExecutionState* Isolate::CurrentExecutionStateBase() {
+  // Phase ii per-worker execution-state base. Green-thread isolates run several OS
+  // workers concurrently, so x25 must be armed to THIS worker's block, not the shared
+  // ThreadLocalTop. CurrentPerIsolateThreadData() is a lock-free thread_local read, so
+  // it is safe to call from any worker's generated code at JS entry.
+  PerIsolateThreadData* data = CurrentPerIsolateThreadData();
+  if (data != nullptr && data->isolate()->is_green_thread_mode()) {
+    return &data->execution_state_;
+  }
+  Isolate* iso = data != nullptr ? data->isolate() : TryGetCurrent();
+  return reinterpret_cast<ExecutionState*>(
+      &iso->isolate_data_.thread_local_top_);
+}
+#endif
 
 void Isolate::DiscardPerThreadDataForThisThread() {
   ThreadId thread_id = ThreadId::TryGetCurrent();
