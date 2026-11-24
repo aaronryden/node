@@ -943,6 +943,30 @@ static void LiftCapturedValues(Isolate* emb_isolate,
   }
 }
 
+// Prime ONE body's maglev -> optimized OSR on the green isolate WITHOUT going
+// through the scheduler entry point (GreenJSEntry) or its iteration_count_ state
+// machine. GreenJSEntry drives the recursive Model-A entry and bumps the pool
+// gt's non-atomic iteration_count_, which corrupted dispatch. Direct fn->Call
+// primes compilation for the shared SFI without touching any pool gt.
+static void PrimeBody(GreenCallData* data) {
+  if (data == nullptr) return;
+  v8::Isolate::Scope isolate_scope(data->isolate);
+  HandleScope scope(data->isolate);
+  Local<Context> ctx = Local<Context>::New(data->isolate, data->context_p);
+  Context::Scope context_scope(ctx);
+  Local<Function> fn = Local<Function>::New(data->fn_isolate, data->fn_p);
+  Local<Value> recv = ctx->Global();
+  std::vector<Local<Value>> argv;
+  argv.reserve(data->args_p.size());
+  for (auto& arg : data->args_p)
+    argv.push_back(Local<Value>::New(data->isolate, *arg));
+  v8::TryCatch tc(data->isolate);
+  const bool was_in_body = g_in_green_body;
+  g_in_green_body = true;
+  fn->Call(ctx, recv, argv.size(), argv.data());
+  g_in_green_body = was_in_body;
+}
+
 // Green scheduler entry point: drives a single green thread's JavaScript body.
 //
 // @param isolate The V8 internal isolate the green thread was created with.
@@ -1213,8 +1237,34 @@ class GreenThreadPool {
 
 void GreenThreadPool::WorkerEntry(GreenThreadPool* self, int worker_id) {
   vi::GreenScheduler* sched = self->schedulers_[worker_id].get();
+  // Hold the green isolate current ONLY when bodies run concurrently -- the
+  // GT_TRUE_PARALLEL path (ParallelBodyDispatchActive), where N OS workers drive
+  // bodies on the SAME green isolate at once. Each worker must then attribute its
+  // running GT to this worker's own PerIsolateThreadData (invariant I1) via
+  // CurrentGreenThread()/SetCurrentGreenThread(), instead of the shared
+  // process-wide g_current_green_thread_ slot. Without it, every worker reads and
+  // writes ONE shared "current GT": a body dispatched to one worker is seen by
+  // another as its own current and RunGreenThread() runs it a second time on a
+  // concurrent thread. iteration_count_ is a plain non-atomic uint32_t, so the
+  // two writers race (lost update -> a GreenJSEntry reads a torn iter before the
+  // body completed) -> the SIGSEGV / empty-result crash we were chasing. Under
+  // green_thread_mode several workers Enter/Exit this isolate concurrently on
+  // purpose -- each worker's EntryStackItem chain routes to its own
+  // PerIsolateThreadData, so the shared scope keeps scheduler bookkeeping
+  // worker-local.
+  //
+  // Serialized guards (CoW writer scope, one body at a time) never set
+  // ParallelBodyDispatchActive, so no scope is held here and the shared-global
+  // slot is exactly what the CoW machinery relies on -- that path stays
+  // byte-for-byte the pre-pool behavior.
+  const bool hold_scope = vi::GreenThreadCow::ParallelBodyDispatchActive();
   g_current_pool_scheduler = sched;
-  sched->ScheduleLoop();
+  if (hold_scope && g_green_isolate != nullptr) {
+    v8::Isolate::Scope iso_scope(g_green_isolate);
+    sched->ScheduleLoop();
+  } else {
+    sched->ScheduleLoop();
+  }
   g_current_pool_scheduler = nullptr;
 }
 
@@ -1490,11 +1540,8 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       // the concurrent-OSR frame-iterator race that SEGV'd here cannot occur.
       // Re-running all N bodies would cost a full serial baseline inside
       // green_ms and destroy the speedup metric, so prime just the first.
-      auto warm = g_gt_registry.begin();
-      if (warm != g_gt_registry.end()) {
-        vi::SetCurrentGreenThread(warm->first);
-        GreenJSEntry(vi_isolate_for_gt, warm->first);
-      }
+      if (!g_gt_registry.empty())
+        PrimeBody(g_gt_registry.begin()->second);
     }
 
     GreenThreadPool pool;
