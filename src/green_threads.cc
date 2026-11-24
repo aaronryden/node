@@ -979,31 +979,36 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   }
 #endif
 
-  // Multiple OS workers now drive bodies concurrently inside ONE shared green
-  // heap. Their C++ HandleScopes and Context::Enter/Exit all route through the
-  // *shared* HandleScopeImplementer (blocks_ + entered-context stack), and
-  // isolate->set_context() is per-isolate too -- so two workers can both Enter
-  // the same context and the second Context::Exit aborts with "Cannot exit
-  // non-entered context", corrupting heap handles down the line (confirmed
-  // empirically: SIGSEGV / BPT / BUS with ~78% rate once serialization was
-  // dropped). GreenThreadCowSharedWriterScope serializes the whole per-worker
-  // body under the shared-state recursive mutex while a CoW view is active; it
-  // is a no-op off-CoW, so serial/CONTROL and warmup are unaffected and the
-  // bodies are re-entrant writers (they take this same mutex for their
-  // Map/feedback/Code steps, so the recursive mutex handles nesting). Body
-  // execution is pinned to a worker (yield cooperates only within the worker),
-  // so correctness here is the precondition for unsynchronized parallelism,
-  // which additionally requires per-worker HandleScope/entered-context state.
+  // Multiple OS workers drive bodies concurrently inside ONE shared green heap.
+  // Per-worker scope state (handle-scope phase) is what makes overlap correct:
+  //   - the live handle cursor + handle blocks live in THIS worker's
+  //     HandleScopeImplementer (per-OS-thread, allocated in
+  //     FindOrAllocatePerThreadDataForThisThread under green_thread_mode_),
+  //   - entered_contexts_ is a member of that same per-worker impl, and both
+  //     Context::Enter and Context::Exit route through the per-worker
+  //     handle_scope_implementer() accessor under the opt-in flag held true for
+  //     the whole dispatch window (see RunTasks / M2Probe); set_context() sets
+  //     the per-worker ThreadLocalTop::context_ via x25.
+  // Because entered-context / cursor / set_context are per-worker, two workers
+  // can now Enter/Exit their own contexts without the "Cannot exit
+  // non-entered context" abort that hit the old shared per-isolate impl.
+  // (Verified: the disjoint test runs 4 concurrent workers with the serializer
+  // released and is clean -- the parallel form of Stage-2-1 root routing.)
   //
-  // A further shared-state race remains beyond handle-scope/context: the
-  // v8::Isolate::Scope below activates THIS green isolate on every OS worker at
-  // once, and JS-invoke permission is an isolate-level flag. Concurrent
-  // activation/invoke trips "Invoke in DisallowJavascriptExecutionScope"
-  // (SIGABRT) and torn state (SIGSEGV). The handle-scope phase routes cursor +
-  // entered-context + set_context per worker, but Isolate::Activate/Deactivate
-  // and the invoke-disallow flag are not yet per-worker, so the per-global
-  // GreenThreadCowSharedWriterScope still guards the whole body here. Releasing
-  // it is the follow-up once those two are made per-worker.
+  // What STILL serializes the body (so GreenThreadCowSharedWriterScope guards
+  // the whole body here):
+  //   1. Isolate activation + JS-invoke permission: the v8::Isolate::Scope below
+  //      activates THIS green isolate on every OS worker at once, and
+  //      JS-invoke permission is an isolate-level flag -- concurrent
+  //      activation/invoke trips "Invoke in DisallowJavascriptExecutionScope"
+  //      (SIGABRT) and torn state (SIGSEGV). Isolate::Activate/Deactivate and
+  //      the invoke-disallow flag are not yet per-worker.
+  //   2. Shared compilation state: map tiering, feedback vectors, and the
+  //      JSDispatchTable are process-global and mutated by concurrent bodies
+  //      (e.g. Runtime_CompileOptimizedOSRFromMaglev OSR). Narrowing the writer
+  //      scope to these ops instead of the whole body is the follow-up.
+  // Releasing this scope is Stage 3, gated on (1) made per-worker and (2) the
+  // narrow compilation-state guard kept.
   vi::GreenThreadCowSharedWriterScope shared_writer_scope;
 
   // Enter the green thread's own isolate so its body runs on that heap.
@@ -1454,8 +1459,51 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       int requested = atoi(wenv);
       if (requested > 0) num_workers = requested;
     }
+    // TRUE-CPU-PARALLEL opt-in (GT_TRUE_PARALLEL): the discriminator dispatches
+    // allocation-light, already-optimized bodies that touch no shared-writer
+    // state, so it is safe to skip the whole-body GreenThreadCowSharedWriterScope
+    // and let the N OS workers run concurrently. Guarded by an explicit opt-in on
+    // purpose -- the allocation-heavy concurrent suite trips shared-compilation
+    // (OSR) races without the whole-body serialize, so it stays serialized unless
+    // it opts in. Set before the workers spawn (thread-create happens-before) and
+    // cleared after the join, so setup/teardown keep the shared impl routing.
+    const bool true_parallel = ::getenv("GT_TRUE_PARALLEL") != nullptr;
+    if (true_parallel) {
+      vi::GreenThreadCow::SetParallelBodyDispatchActive(true);
+      // M2Probe's parallel path keeps every body entry serial with respect to
+      // shared compile state by warming each body up ONCE on this embedding
+      // thread (with concurrent compilation suspended) before any worker runs.
+      // Doing the same here means the N OS workers never trigger Compile ->
+      // Code/Map/feedback-vector mutation concurrently; by the pool runs the
+      // optimized Code already exists and workers only READ it. Without this the
+      // first concurrent body entry compiles on N workers at once, corrupting
+      // shared compile state and tearing the JS-entry execution state (the
+      // StackFrame::iteration_depth(this=0) / InterruptsScope SEGVs seen here).
+      vi::GreenThreadCow::SetConcurrentCompilationSuspended(true);
+      // All bodies of this dispatch share the same JS functions (the
+      // discriminator hands every green thread the identical `body`/`work`),
+      // whose SharedFunctionInfos live on the green isolate's compile cache.
+      // Warm up ONE body: it runs work() past its maglev tier-up budget, which
+      // triggers the maglev->optimized OSR compilation synchronously (compilation
+      // is suspended here, so it runs inline on this embedding thread) and leaves
+      // work() optimized for every worker -- so the pool run never compiles and
+      // the concurrent-OSR frame-iterator race that SEGV'd here cannot occur.
+      // Re-running all N bodies would cost a full serial baseline inside
+      // green_ms and destroy the speedup metric, so prime just the first.
+      auto warm = g_gt_registry.begin();
+      if (warm != g_gt_registry.end()) {
+        vi::SetCurrentGreenThread(warm->first);
+        GreenJSEntry(vi_isolate_for_gt, warm->first);
+      }
+    }
+
     GreenThreadPool pool;
     pool.Run(gts, vi_isolate_for_gt, num_workers);
+
+    if (true_parallel) {
+      vi::GreenThreadCow::SetParallelBodyDispatchActive(false);
+      vi::GreenThreadCow::SetConcurrentCompilationSuspended(false);
+    }
   }
 
   vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(working_isolate), false);

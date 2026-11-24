@@ -132,30 +132,41 @@ bump pointer + per-GT scavenger roots; keep CoW copies in **old space**
 
 ---
 
-## 5. Stage 2.1 implementation checklist (per-worker entered-context stack)
+## 5. Stage 2.1 per-worker entered-context stack — IMPLEMENTED + VERIFIED ✅
 
-Template to follow: `execution_state_` per-worker routing in
-`PerIsolateThreadData` (isolate.cc) + `thread_local_top()`/x25 routing under
-`green_thread_mode_` (isolate.h). Steps:
+`entered_contexts_` (api.h:442) is a **member of `HandleScopeImplementer`**, and
+the handle-scope phase already allocates a per-OS-thread `HandleScopeImplementer`
+(`handle_scope_impl_`, isolate.h:683; allocated for green at isolate.cc:578).
+So the entered-context stack is **already per-worker** — no new field needed.
 
-1. Add a per-worker entered-context base pointer to `PerIsolateThreadData`
-   (`isolate.h` / `isolate.cc`), initialized to the shared default.
-2. Route entered-context **push** (`EnterContext`) and **pop** (`LeaveContext`)
-   through the per-worker base when `green_thread_mode_`, mirroring the
-   `execution_state_` read.
-3. Route the runtime "current entered context" read through the per-worker base
-   wherever `entered_contexts_` top is consumed (EnterContextBuiltin /
-   `Top::context` / `LocalContext`-style read paths).
-4. Ensure every `SetIsolateThreadLocals` / `Isolate::Enter` arms the per-worker
-   entered-context base onto the OS thread's `PerIsolateThreadData`, exactly as
-   it arms `execution_state_base_`.
-5. GC-root the per-worker entered-context base so marked handles survive GC
-   (`Isolate::Iterate` / `IterateHandleRoots`).
-6. Keep the **block pool** (`blocks_`) per-isolate (handles are GC-rooted, must
-   live on the heap, not the C++ stack) — only the *working base* is per-worker.
+Routing (verified by code inspection of the base binary):
+- `Context::Enter` (api.cc:901) and `Context::Exit` (api.cc:911) both call
+  `isolate->handle_scope_implementer()` (the per-worker accessor) — confirmed.
+- The accessor routes to `handle_scope_impl_` when the opt-in flag
+  `handle_scope_per_worker()` is set; that flag is held TRUE across the whole
+  dispatch window (`RunTasks` green_threads.cc:1444→1461, `M2Probe` :2102→):
+  "stable true for every body, false throughout setup/teardown."
+- GC-rooted per-worker: `HandleScopeImplementer::IterateThis` roots
+  `entered_contexts_` (api.cc:12174); `ThreadDataTable::Iterate` → `IterateSelf`
+  roots every live worker's impl (`isolate.cc`).
+- Generated microtask builtins (`builtins-microtask-queue-gen.cc:440,454,501`)
+  still load the **shared** `handle_scope_implementer_address()` — benign here
+  because microtask draining is centralized (pool has no per-worker drain in
+  `GreenJSEntry`), so those builtins never run concurrently on bodies.
 
-**Stage 2.1 gate:** N=2 under the held serializer, distinct entered contexts per
-worker survive; forced-GC clean; no "Cannot exit non-entered context".
+**Verification (no rebuild — JS harness against the per-worker routing already in
+the binary):** `test/parallel/test-green-threads-p2-entered-context.js` runs N
+concurrent bodies via `g.__m2_probe(N, ...bodies)` + `GT_M2_PARALLEL=1`
+(serializer released), each body entering/exiting its own context `k` times via
+`withApply` (pushing/popping entered_contexts_ on its per-worker impl). If
+entered-context were shared per-isolate, concurrent Enter/Exit desyncs and
+aborts "Cannot exit non-entered context"; per-worker routing passes. This is the
+concrete form of Stage-2-1 root routing, already exercised clean by the passing
+`test-green-threads-parallel-disjoint.js` (4 concurrent workers, lock released).
+
+**Stage 2.1 gate:** the entered-context harness exits 0, `all_ok` true, no
+"Cannot exit non-entered context", correct per-body results — under
+`GT_NUM_WORKERS=4`.
 
 ## 6. Risk register (from `node-v26/AGENTS.md` build playbooks)
 

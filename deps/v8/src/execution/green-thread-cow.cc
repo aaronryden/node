@@ -63,6 +63,18 @@ base::RecursiveMutex& GreenThreadCow::SharedStateMutex() {
   return mutex;
 }
 
+// Backing for SetParallelBodyDispatchActive(). Process-global (one green
+// isolate per process), matching g_cow_active_count.
+std::atomic<bool> GreenThreadCow::g_parallel_body_dispatch_{false};
+
+void GreenThreadCow::SetParallelBodyDispatchActive(bool active) {
+  g_parallel_body_dispatch_.store(active, std::memory_order_acq_rel);
+}
+
+bool GreenThreadCow::ParallelBodyDispatchActive() {
+  return g_parallel_body_dispatch_.load(std::memory_order_relaxed);
+}
+
 // ARM64 register save/restore from green-thread-asm.cc (declared extern "C" in
 // green-thread-scheduler.cc). The handshake re-arms this from PollForGCRequest
 // so any heap-object pointer the parked worker still holds lands in its spill

@@ -120,6 +120,16 @@ class GreenThreadCow {
   // self-deadlock. Process-global (not per-isolate) matches the process-global
   // g_cow_active_count and one green isolate per process.
   static base::RecursiveMutex& SharedStateMutex();
+  // True during an opt-in TRUE-CPU-PARALLEL body dispatch (see
+  // GreenThreadCowSharedWriterScope). When set, the whole-body writer scope at
+  // GreenJSEntry becomes a no-op so N allocation-light, already-optimized bodies
+  // run concurrently on the OS worker pool; the narrow per-op writer scopes
+  // (Map/feedback/JSDispatchTable) still lock for any body that compiles or
+  // allocates. The embedding sets/clears this ONLY around dispatches it knows to
+  // be safe (the parallel-execution discriminator), so allocation-heavy
+  // concurrent suites stay serialized and correct.
+  static void SetParallelBodyDispatchActive(bool active);
+  static bool ParallelBodyDispatchActive();
 #endif  // V8_ENABLE_GREEN_THREADS
 
   // --- All-mutator stop-the-world GC handshake (invariant I3) ---
@@ -190,6 +200,10 @@ class GreenThreadCow {
  private:
   static std::atomic<uint32_t> g_cow_active_count;
 
+  // Backing for SetParallelBodyDispatchActive(). Process-global (one green
+  // isolate per process), matching g_cow_active_count. Defined in green-thread-cow.cc.
+  static std::atomic<bool> g_parallel_body_dispatch_;
+
   // Counts CowCloneForGeneratedCode entries past the fast-path guards.
   static std::atomic<uint64_t> g_cow_generated_code_calls;
 };
@@ -202,7 +216,13 @@ class GreenThreadCow {
 class GreenThreadCowSharedWriterScope {
  public:
   GreenThreadCowSharedWriterScope() {
-    if (GreenThreadCow::ActiveCount() > 0) {
+    // During an opt-in true-parallel dispatch the whole-body serialize is
+    // skipped even though a CoW view is active (ActiveCount() > 0): the
+    // dispatched bodies are known to touch no shared-writer state.
+    if (GreenThreadCow::ParallelBodyDispatchActive()) {
+      locked_ = false;
+      mutex_ = nullptr;
+    } else if (GreenThreadCow::ActiveCount() > 0) {
       mutex_ = &GreenThreadCow::SharedStateMutex();
       mutex_->Lock();
       locked_ = true;

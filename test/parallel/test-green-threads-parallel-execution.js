@@ -79,7 +79,7 @@ const CHILD = [
 function runChild(n) {
   const res = spawnSync(process.execPath, ['-e', CHILD], {
     encoding: 'utf8',
-    env: { ...process.env, GT_SHARED_HEAP: '1', GT_NUM_WORKERS: String(n), GT_N: String(n) },
+    env: { ...process.env, GT_SHARED_HEAP: '1', GT_NUM_WORKERS: String(n), GT_N: String(n), GT_TRUE_PARALLEL: '1' },
     timeout: 120000,
   });
   assert.equal(res.status, 0,
