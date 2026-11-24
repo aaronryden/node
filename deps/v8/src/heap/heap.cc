@@ -4748,13 +4748,16 @@ void Heap::IterateRoots(RootVisitor* v, base::EnumSet<SkipRoot> options,
       v->Synchronize(VisitorSynchronization::kStackRoots);
     }
 
-    // Iterate over main thread handles in handle scopes.
-    if (!options.contains(SkipRoot::kMainThreadHandles)) {
-      // Clear main thread handles with stale references to left-trimmed
-      // objects. The GC would crash on such stale references.
-      ClearStaleLeftTrimmedPointerVisitor left_trim_visitor(this, v);
-      isolate_->handle_scope_implementer()->Iterate(&left_trim_visitor);
-    }
+      // Iterate over main thread / live-worker handles in handle scopes. Under
+      // green multi-worker mode every OS worker owns its own handle state, so
+      // route through IterateHandleRoots (which roots all live workers); off-green
+      // this is the single shared HandleScopeImplementer.
+      if (!options.contains(SkipRoot::kMainThreadHandles)) {
+        // Clear main thread handles with stale references to left-trimmed
+        // objects. The GC would crash on such stale references.
+        ClearStaleLeftTrimmedPointerVisitor left_trim_visitor(this, v);
+        isolate_->IterateHandleRoots(&left_trim_visitor);
+      }
     // Iterate local handles for all local heaps.
     safepoint_->Iterate(v);
     // Iterates all persistent handles.
@@ -4898,7 +4901,7 @@ void Heap::IterateConservativeStackRoots(
 
 void Heap::IterateRootsForPrecisePinning(RootVisitor* visitor) {
   IterateStackRoots(visitor);
-  isolate()->handle_scope_implementer()->Iterate(visitor);
+  isolate()->IterateHandleRoots(visitor);
 }
 
 #if V8_OS_ANDROID

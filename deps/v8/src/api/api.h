@@ -381,6 +381,12 @@ class HandleScopeImplementer {
   inline DetachableVector<Address*>* blocks() { return &blocks_; }
   Isolate* isolate() const { return isolate_; }
 
+  // Cursor (next / limit / level) for THIS handle-scope stack. Route to it under
+  // green multi-worker mode from Isolate::handle_scope_data() so each worker's
+  // cursor is separate (the shared isolate_data_ cursor served the single
+  // embedding thread before the handle-scope phase).
+  HandleScopeData* scope_data() { return &handle_scope_data_; }
+
   void ReturnBlock(Address* block) {
     DCHECK_NOT_NULL(block);
     if (spare_ != nullptr) DeleteArray(spare_);
@@ -388,6 +394,13 @@ class HandleScopeImplementer {
   }
 
   static const size_t kEnteredContextsOffset;
+
+  // Roots ONLY this instance's handle blocks / entered-contexts. Used by
+  // ThreadDataTable::Iterate under green multi-worker mode, where every live OS
+  // worker owns its own HandleScopeImplementer: iterating the singleton would
+  // miss every worker except the GC thread's. Reads this instance's own cursor
+  // (which is the live per-worker cursor under green, so no refresh is needed).
+  V8_EXPORT_PRIVATE void IterateSelf(RootVisitor* v) { IterateThis(v); }
 
  private:
   void ResetAfterArchive() {

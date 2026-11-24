@@ -8092,6 +8092,16 @@ uint32_t GetLength(Tagged<JSArray> array) {
   return static_cast<uint32_t>(Object::NumberValue(length));
 }
 
+// Public-API route to Isolate::handle_scope_data() (see the declaration in
+// v8-internal.h). Needed here because it dereferences the complete Isolate type;
+// the inline public path in v8-local-handle.h only has v8::Isolate*. Routed
+// through the member so the public HandleScope / CreateHandle / Local::New see
+// the same per-worker cursor the internal allocation path uses under the green
+// handle-scope phase.
+HandleScopeData* GetRoutedHandleScopeData(v8::Isolate* isolate) {
+  return reinterpret_cast<Isolate*>(isolate)->handle_scope_data();
+}
+
 }  // namespace internal
 
 uint32_t v8::Array::Length() const {

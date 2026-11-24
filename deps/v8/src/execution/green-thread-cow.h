@@ -60,6 +60,22 @@ class GreenThreadCow {
   // unchanged.
 #if V8_ENABLE_GREEN_THREADS
   static void SetGreenHeapConcurrentAllocationEnabled(v8::Isolate* isolate, bool enabled);
+
+  // Set whether concurrent JIT compilation is suspended for the green isolate.
+  //
+  // True-parallel body execution (GT_M2_PARALLEL=1) runs the same body on
+  // multiple OS workers with no CoW view active, so GreenThreadCOWSuspendedConcurrentGC()
+  // (ActiveCount() != 0) is false and V8's concurrent Turbofan/Maglev/batch
+  // compilers would compile against the heap as the workers rewrite it in place
+  // -- torn SharedFunctionInfo / feedback-vector / Map reads that land on a dead
+  // pointer (EXC_BAD_ACCESS at 0xbeeddead) on the next deopt. The green runtime
+  // sets this true around the concurrent body window and false after the workers
+  // join, forcing those compilation paths to run synchronously on the mutator
+  // thread where the heap view is always consistent. Complements the young-gen
+  // allocation CAS gate (SetGreenHeapConcurrentAllocationEnabled), which makes
+  // the heap pointers themselves disjoint; this makes the compiled code and the
+  // IC/map state those pointers feed consistent.
+  static void SetConcurrentCompilationSuspended(bool suspended);
 #endif  // V8_ENABLE_GREEN_THREADS
 
   // Clone an object into the GT's heap view.

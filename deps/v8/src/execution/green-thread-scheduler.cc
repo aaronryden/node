@@ -252,6 +252,10 @@ void GreenScheduler::ScheduleLoop() {
       GreenThread* next = DequeueGlobal();
       if (next == nullptr) {
         // No more threads to run.
+#ifdef V8_ENABLE_GREEN_THREADS
+        if (::getenv("GT_CRASH_DEBUG"))
+          ::fprintf(stderr, "[GTDBG-SCHED-EXIT] worker scheduler empty, exiting\n");
+#endif
         break;
       }
 
@@ -270,6 +274,11 @@ void GreenScheduler::ScheduleLoop() {
       continue;
     }
 
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_CRASH_DEBUG"))
+      ::fprintf(stderr, "[GTDBG-SCHED] worker running gt=%p iter_before=%u\n",
+                (void*)current, (unsigned)current->iteration_count());
+#endif
     // Run the green thread (this calls entry() directly; if it yields,
     // Yield() recursively calls entry(next) and returns when done).
     RunGreenThread(current);

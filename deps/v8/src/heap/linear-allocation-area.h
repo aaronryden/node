@@ -14,18 +14,24 @@
 
 namespace v8::internal {
 
-// Process-global gate for concurrent young-gen allocation (green threads on
-// multiple OS threads sharing one isolate). When set, the linear allocation
-// area's `top_` is reserved with a lock-free CAS so that concurrent mutators
-// reserve disjoint regions instead of racing the plain bump-pointer write. A
-// single process-wide flag (rather than per-heap) is used on purpose: the
-// allocation fast path and the green-threads bridge must agree regardless of
-// which specific heap owns this area, and this header deliberately avoids
-// pulling in heap internals. Zero-overhead for the common (flag-off) case: a
-// relaxed load that the compiler lowers to a plain load on every target.
+// Single process-wide instance for the concurrent young-gen allocation gate.
+// Must be an inline variable (C++17), NOT a function-local static inside an
+// inline function: a function-local static is permitted to have a distinct
+// instance per translation unit that instantiates the inline function, so the
+// green-threads setter (green-thread-cow.cc) armed one copy while IncrementTop
+// and AllocateFastAligned (other objects in libv8_base_without_compiler) kept
+// reading their own always-false copy -- the parallel young-gen bump then raced
+// the LAB reset. An inline variable has external/weak linkage and the linker
+// deduplicates it to exactly one object across the whole program, so every
+// reader and the single writer always touch the same memory. Zero-overhead for
+// the common (flag-off) case: a relaxed load that the compiler lowers to a
+// plain load on every target.
+inline std::atomic<bool> g_concurrent_allocation_gate{false};
+
+// Reference accessor keeps every existing call site (IncrementTop,
+// AllocateFastAligned, the green setter) unchanged while reading g inline.
 inline std::atomic<bool>& ConcurrentLinearAllocationGate() {
-  static std::atomic<bool> enabled{false};
-  return enabled;
+  return g_concurrent_allocation_gate;
 }
 
 // A linear allocation area to allocate objects from.
@@ -59,6 +65,19 @@ class LinearAllocationArea final {
             ConcurrentLinearAllocationGate().load(std::memory_order_relaxed))) {
       return TryIncrementTopAtomic(bytes);
     }
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DUMP")) {
+      ::fprintf(stderr, "[LAB] serial top=%p limit=%p bytes=%zu -> %p\n",
+                (void*)top_, (void*)limit_, bytes, (void*)top_);
+      if (V8_UNLIKELY(top_ < 0x100000)) {
+        ::fprintf(stderr,
+                  "[LAB-SMALL] reserved=%p start=%p limit=%p bytes=%zu "
+                  "top_after=%p\n",
+                  (void*)top_, (void*)start_, (void*)limit_, bytes,
+                  (void*)(top_ + bytes));
+      }
+    }
+#endif
     Address old_top = top_;
     top_ += bytes;
     Verify();
@@ -75,11 +94,26 @@ class LinearAllocationArea final {
   V8_INLINE Address TryIncrementTopAtomic(size_t bytes) {
     std::atomic_ref<Address> ref(top_);
     Address current = ref.load(std::memory_order_relaxed);
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DUMP")) {
+      ::fprintf(stderr, "[CAS] current=%p limit=%p bytes=%zu\n", (void*)current,
+                (void*)limit_, bytes);
+    }
+#endif
     for (;;) {
       if (V8_UNLIKELY(current + bytes > limit_)) return kNullAddress;
       if (ref.compare_exchange_weak(current, current + bytes,
                                     std::memory_order_relaxed)) {
         Verify();
+#ifdef V8_ENABLE_GREEN_THREADS
+        if (::getenv("GT_GT_DUMP") && V8_UNLIKELY(current < 0x100000)) {
+          ::fprintf(stderr,
+                    "[CAS-SMALL] reserved=%p start=%p top=%p limit=%p "
+                    "bytes=%zu\n",
+                    (void*)current, (void*)start_, (void*)top_,
+                    (void*)limit_, bytes);
+        }
+#endif
         return current;
       }
     }

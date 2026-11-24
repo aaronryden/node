@@ -1521,6 +1521,27 @@ TNode<HeapObject> CodeStubAssembler::AllocateRaw(TNode<IntPtrT> size_in_bytes,
 
   bool needs_double_alignment = flags & AllocationFlag::kDoubleAlignment;
 
+#if V8_ENABLE_GREEN_THREADS
+  // Concurrent-allocation gate (true-parallel green-heap execution, armed via
+  // GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled): several OS workers
+  // allocate concurrently from ONE shared young LinearAllocationArea. The inline
+  // bump-pointer below reads top_/limit_ and bumps top_ with plain (non-atomic)
+  // ops and no LAB-validity check, so it races another worker's forced-GC LAB
+  // reset/re-arm (M2ForceGC -> Heap::FreeLinearAllocationAreas) and can bump to a
+  // bogus, reclaimed/near-null pointer -- the SIGSEGV on the store to that dead
+  // object. When the gate is set, defer to the runtime allocation path below,
+  // which reserves through the lock-free CAS bump-pointer the fork arms for
+  // parallel workers. The flag is a process-global mirror of the gate, only ever
+  // set by the green-threads bridge, so this is byte-for-byte unchanged for
+  // standard V8, the snapshot builtins (gate off during mksnapshot), and serial
+  // green execution -- zero overhead in the common case. The check lives in the
+  // generated code, so bodies compiled before the gate is set still defer
+  // correctly at execution time.
+  GotoIf(LoadRuntimeFlag(
+             ExternalReference::green_thread_concurrent_allocation_flag()),
+          &runtime_call);
+#endif  // V8_ENABLE_GREEN_THREADS
+
   {
     Label next(this);
     GotoIf(IsRegularHeapObjectSize(size_in_bytes), &next);

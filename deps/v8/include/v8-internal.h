@@ -912,6 +912,24 @@ struct HandleScopeData final {
 
 static_assert(HandleScopeData::kSizeInBytes == sizeof(HandleScopeData));
 
+// Public-API route to Isolate::handle_scope_data(). The inline v8::HandleScope
+// ctor / v8::HandleScope::CreateHandle / Local::New path resolves the cursor via
+// Internals::GetHandleScopeData, which is pure offset arithmetic to the shared
+// isolate_data_.handle_scope_data_. Under the green "handle-scope phase" (a
+// per-worker HandleScopeImplementer routing bodies across OS workers) that shared
+// cursor is wrong for the public API: the internal allocation path reads the
+// per-worker cursor while the public HandleScope opened on the shared one, leaving
+// the per-worker cursor at level 0 and aborting with "Cannot create a handle
+// without a HandleScope". Routing the public API through the same member
+// (Isolate::handle_scope_data()) the internal path uses unifies them. In the
+// non-routed case it returns &isolate_data_.handle_scope_data_, asserted equal to
+// the offset Internals::GetHandleScopeData used before (isolate.cc), so the common
+// single-threaded path is unchanged. Defined in api.cc (needs the complete Isolate
+// type); declared here because Internals::GetHandleScopeData, in this header, must
+// call it.
+HandleScopeData* GetRoutedHandleScopeData(v8::Isolate* isolate);
+
+
 /**
  * This class exports constants and functionality from within v8 that
  * is necessary to implement inline functions in the v8 api.  Don't
@@ -1301,9 +1319,7 @@ class Internals {
   }
 
   V8_INLINE static HandleScopeData* GetHandleScopeData(v8::Isolate* isolate) {
-    Address addr =
-        reinterpret_cast<Address>(isolate) + kIsolateHandleScopeDataOffset;
-    return reinterpret_cast<HandleScopeData*>(addr);
+    return internal::GetRoutedHandleScopeData(isolate);
   }
 
   V8_INLINE static void IncrementLongTasksStatsCounter(v8::Isolate* isolate) {

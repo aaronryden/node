@@ -74,6 +74,25 @@ void M2ForceGC(v8::Isolate* green_isolate, M2ForcedGCMode mode) {
   }
 }
 
+// Enter the GC-free allocation window on the green isolate. See green_threads_gc.h:
+// with always_allocate non-zero the heap grows instead of collecting, so no
+// concurrent collection can reclaim or relocate an object a live worker still
+// references mid-body (the parallel-allocation SIGSEGV fix). Called around the
+// concurrent body window from M2Probe in green_threads.cc.
+void GreenEnterAlwaysAllocation(v8::Isolate* green_isolate) {
+  if (green_isolate == nullptr) return;
+  vi::Heap* heap = reinterpret_cast<vi::Isolate*>(green_isolate)->heap();
+  if (heap == nullptr) return;
+  heap->EnterAlwaysAllocation();
+}
+
+void GreenLeaveAlwaysAllocation(v8::Isolate* green_isolate) {
+  if (green_isolate == nullptr) return;
+  vi::Heap* heap = reinterpret_cast<vi::Isolate*>(green_isolate)->heap();
+  if (heap == nullptr) return;
+  heap->LeaveAlwaysAllocation();
+}
+
 // Constructing GreenGCPause snapshots the current incremental-marking state and
 // stops marking; the destructor resumes it only if it had been running. This
 // freezes the green heap across the green body's re-parse + execution (see
@@ -231,6 +250,81 @@ void CaptureGreenClosureValues(
       ctx = ctx->previous();
     }
   }
+}
+
+// Debug-only snapshot of the executing OS thread's green-thread execution-state
+// context. See green_threads_gc.h.
+GTDebugCtx GTGreenThreadDebugCtx(v8::Isolate* iso) {
+  vi::Isolate* v = reinterpret_cast<vi::Isolate*>(iso);
+  GTDebugCtx r{false, nullptr, nullptr, nullptr};
+  if (v == nullptr) return r;
+  r.is_green = v->is_green_thread_mode();
+  r.main_iso = static_cast<void*>(v->main_thread_local_isolate());
+  r.main_heap = static_cast<void*>(v->main_thread_local_heap());
+  r.tblock = static_cast<void*>(v->thread_local_top());
+  return r;
+}
+
+void* GTGreenThreadCurrentIsolate() {
+  vi::Isolate* cur = vi::Isolate::TryGetCurrent();
+  return static_cast<void*>(cur);
+}
+
+GTExecSnap GTGreenThreadExecSnapshot() {
+  GTExecSnap r{nullptr, 0, nullptr, nullptr, 0, nullptr, 0};
+  vi::Isolate* cur = vi::Isolate::TryGetCurrent();
+  r.cur_iso = static_cast<void*>(cur);
+  if (cur == nullptr) return r;
+  r.cur_green = cur->is_green_thread_mode() ? 1 : 0;
+  vi::Isolate::PerIsolateThreadData* ptd = cur->CurrentPerIsolateThreadData();
+  r.cur_ptd = static_cast<void*>(ptd);
+  if (ptd != nullptr) {
+    vi::Isolate* piso = ptd->isolate();
+    r.ptd_iso = static_cast<void*>(piso);
+    r.ptd_green = (piso != nullptr && piso->is_green_thread_mode()) ? 1 : 0;
+  }
+  r.tlt = static_cast<void*>(cur->thread_local_top());
+  // "central" here means the executing thread is NOT running on its own green
+  // per-worker block: either the current isolate is not green, or the per-thread
+  // data is bound to a non-green isolate (thread_local_top() routes to central).
+  r.central = (r.cur_green == 1 && r.ptd_green == 1 && r.cur_ptd != nullptr)
+                  ? 0
+                  : 1;
+  return r;
+}
+
+// Env-gated entry-state dump. Runs only when GT_GT_DUMP is set; every other
+// path is a single unconditional call, so it costs nothing in the shipped build
+// beyond the getenv() compare. dumps the ThreadLocalTop entry-state a Maglev
+// body reads on first JS entry, plus isolate_root() (the root-register base the
+// allocation builtins read the young pointer from). The block address itself
+// distinguishes the warmup (central) block from a fresh per-worker block.
+void GTGreenThreadEntryDump(v8::Isolate* iso) {
+  if (::getenv("GT_GT_DUMP") == nullptr) return;
+  vi::Isolate* v_iso = reinterpret_cast<vi::Isolate*>(iso);
+  if (v_iso == nullptr) return;
+  vi::ThreadLocalTop* tlt = v_iso->thread_local_top();
+  ::fprintf(stderr,
+            "[TLDUMP] block=%p c_entry_fp=%p c_fn=%p ctx=%p topmost_ctx=%p "
+            "exc=%p handler=%p js_entry_sp=%p central_sp=%p central_lim=%p "
+            "sec_sp=%p sec_lim=%p is_central_flag=%d isolate_root=%p\n",
+            (void*)tlt, (void*)tlt->c_entry_fp_, (void*)tlt->c_function_,
+            (void*)tlt->context_.ptr(), (void*)tlt->topmost_script_having_context_.ptr(),
+            (void*)tlt->exception_.ptr(), (void*)tlt->handler_,
+            (void*)tlt->js_entry_sp_, (void*)tlt->central_stack_sp_,
+            (void*)tlt->central_stack_limit_, (void*)tlt->secondary_stack_sp_,
+            (void*)tlt->secondary_stack_limit_,
+            (int)tlt->is_on_central_stack_flag_, (void*)v_iso->isolate_root());
+  {
+    const vi::LinearAllocationArea& lab =
+        v_iso->isolate_data()->new_allocation_info();
+    ::fprintf(stderr,
+              "[GTYOUNG] lab.start=%p lab.top=%p lab.limit=%p "
+              "isolate_data=%p\n",
+              (void*)lab.start(), (void*)lab.top(), (void*)lab.limit(),
+              (void*)v_iso->isolate_data());
+  }
+  ::fflush(stderr);
 }
 
 }  // namespace node

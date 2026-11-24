@@ -569,6 +569,14 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
       per_thread = new PerIsolateThreadData(this, thread_id);
       thread_data_table_.Insert(per_thread);
       freshly_allocated = true;
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Handle-scope phase: give this (isolate, OS-thread) its own
+    // HandleScopeImplementer so concurrent green workers each own their handle
+    // blocks / entered-contexts / cursor. Kept off for non-green isolates, which
+    // continue sharing the IsolateData singleton as before.
+    if (green_thread_mode_)
+      per_thread->handle_scope_impl_ = new HandleScopeImplementer(this);
+#endif
     }
     DCHECK(thread_data_table_.Lookup(thread_id) == per_thread);
   }
@@ -4314,6 +4322,60 @@ Isolate::PerIsolateThreadData::~PerIsolateThreadData() {
 #if defined(USE_SIMULATOR)
   delete simulator_;
 #endif
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  delete handle_scope_impl_;
+#endif
+}
+
+HandleScopeData* Isolate::handle_scope_data() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Handle-scope phase: route the cursor to THIS OS worker's per-thread
+  // HandleScopeImplementer so concurrent bodies do not share the
+  // isolate_data_ cursor (which would corrupt each other's handle stacks).
+  // Routed here (not inline in isolate.h) because scope_data() needs the
+  // complete HandleScopeImplementer type, available only where api-inl.h is
+  // included. Uses WorkerHandleScopeImpl() so the cursor and impl are always the
+  // same instance under green bodies, and the shared cursor is kept for the
+  // cross-isolate setup path.
+  if (HandleScopeImplementer* impl = WorkerHandleScopeImpl()) {
+    HandleScopeData* cur = impl->scope_data();
+    return cur;
+  }
+#endif
+  return &isolate_data_.handle_scope_data_;
+}
+
+HandleScopeImplementer* Isolate::WorkerHandleScopeImpl() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  const bool opt_in = handle_scope_per_worker() && green_thread_mode_;
+  // Handle-scope phase: route to THIS OS worker's HandleScopeImplementer ONLY
+  // while the embedder has explicitly opted in (set_handle_scope_per_worker true
+  // around multi-worker body dispatch in RunTasks / M2Probe). green_thread_mode_
+  // ensures the per-worker impl exists (allocated in FindOrAllocate with a
+  // non-null handle_scope_impl_); the per-isolate flag is the unambiguous signal
+  // that a live multi-worker body is executing, cleanly separating that from the
+  // single-threaded cross-isolate setup sequence, where handle_state stays on
+  // the shared IsolateData singleton. current_green_thread_ is NOT used here:
+  // it is written via CurrentPerIsolateThreadData() but read across the
+  // cross-isolate setup where that pointer shifts, so it diverges from the
+  // FindPerThreadDataForThisThread() PTD this routing keys on.
+  if (opt_in) {
+    if (PerIsolateThreadData* pd = FindPerThreadDataForThisThread()) {
+      if (pd->handle_scope_impl_ != nullptr) {
+        return pd->handle_scope_impl_;
+      }
+    }
+  }
+#endif
+  return nullptr;
+}
+
+// Handle-scope phase: embedder-facing entry to toggle per-worker handle-cursor
+// routing on a green-thread isolate. Defined in isolate.cc (which owns the full
+// Isolate type and the flag) and declared in green-thread.h so green_threads.cc
+// can call it without pulling in isolate.h / heap.h.
+void SetIsolateHandleScopePerWorker(Isolate* iso, bool on) {
+  if (iso != nullptr) iso->set_handle_scope_per_worker(on);
 }
 
 Isolate::PerIsolateThreadData* Isolate::ThreadDataTable::Lookup(
@@ -4338,6 +4400,29 @@ void Isolate::ThreadDataTable::RemoveAllThreads() {
     delete x.second;
   }
   table_.clear();
+}
+
+void Isolate::ThreadDataTable::Iterate(RootVisitor* v) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Root every live green worker's own handle state. Each PerIsolateThreadData
+  // owns its HandleScopeImplementer (handle-scope phase); IterateSelf roots only
+  // that instance's blocks/entered-contexts with its own current cursor.
+  for (auto& kv : table_) {
+    HandleScopeImplementer* impl =
+        (kv.second != nullptr) ? kv.second->handle_scope_impl_ : nullptr;
+    if (impl != nullptr) impl->IterateSelf(v);
+  }
+#endif
+}
+
+void Isolate::IterateHandleRoots(RootVisitor* v) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (green_thread_mode_) {
+    thread_data_table_.Iterate(v);
+    return;
+  }
+#endif
+  handle_scope_implementer()->Iterate(v);
 }
 
 #ifdef DEBUG

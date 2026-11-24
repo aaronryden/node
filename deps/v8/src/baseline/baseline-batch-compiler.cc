@@ -30,6 +30,7 @@ namespace internal {
 // so the unqualified call below in BaselineBatchCompiler resolves to that
 // definition rather than a mis-mangled baseline-local symbol.
 bool GreenThreadCOWSuspendedConcurrentGC();
+bool GreenThreadConcurrentCompilationSuspended();
 
 // The CoW barrier diagnostic printer, defined in execution/green-thread-cow.cc.
 // Same opt-in gate (V8_GREEN_THREADS_DEBUG) as its caller-side diagnostics.
@@ -206,7 +207,8 @@ class ConcurrentBaselineCompiler {
       // the remaining jobs in the incoming queue to be compiled once the view
       // ends, rather than reading torn heap state mid-compilation.
       while (!incoming_queue_->IsEmpty() && !delegate->ShouldYield() &&
-             !GreenThreadCOWSuspendedConcurrentGC()) {
+             !GreenThreadCOWSuspendedConcurrentGC() &&
+             !GreenThreadConcurrentCompilationSuspended()) {
         std::unique_ptr<BaselineBatchCompilerJob> job;
         if (!incoming_queue_->Dequeue(&job)) break;
         DCHECK_NOT_NULL(job);
@@ -311,7 +313,8 @@ bool BaselineBatchCompiler::concurrent() const {
   // RelocateFromDescWriteBarriers. While a view is active, compile serially on
   // the embedding thread, matching the single-execution-thread CoW assumption.
 #if V8_ENABLE_GREEN_THREADS
-  if (GreenThreadCOWSuspendedConcurrentGC()) {
+  if (GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) {
     return false;
   }
 #endif
@@ -346,7 +349,9 @@ void BaselineBatchCompiler::EnqueueSFI(Tagged<SharedFunctionInfo> shared) {
   // workers would otherwise read torn heap state. (The EnqueueFunction entry
   // already serializes here via concurrent(); this path bypasses it.)
 #if V8_ENABLE_GREEN_THREADS
-  if (GreenThreadCOWSuspendedConcurrentGC() && ShouldCompileBatch(shared)) {
+  if ((GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) &&
+      ShouldCompileBatch(shared)) {
     Enqueue(DirectHandle<SharedFunctionInfo>(shared, isolate_));
     return;
   }
@@ -371,7 +376,8 @@ void BaselineBatchCompiler::InstallBatch() {
   // now dereferences torn handle state inside a job's task vector
   // (EXC_BAD_ACCESS). The batches stay queued and install serially once the
   // view ends (the next interrupt re-enters InstallBatch).
-  if (GreenThreadCOWSuspendedConcurrentGC()) {
+  if (GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) {
     return;
   }
   concurrent_compiler_->InstallBatch();

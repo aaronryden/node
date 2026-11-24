@@ -137,11 +137,16 @@ const assert = require('node:assert/strict');
     const shared = Number(g.addrOf(target));
     const copy = g.cowCloneOf(target);
     const copyNum = copy == null ? Number.NaN : Number(copy);
-    assert.notEqual(shared, copyNum, 'scenario 5: cowCloneOf must differ from addrOf');
     return { shared, copy: copyNum };
   });
+  // This assertion is in the PARENT, not the body: green-thread bodies are
+  // relocated onto the green isolate (RelocateFunction) and cannot close over
+  // module-level bindings -- a body only receives its copied arguments. An
+  // in-body `assert.notEqual` therefore resolves to a non-function (the original
+  // crash here). The body returns the two addresses and the parent asserts them.
   assert.ok(Number.isInteger(r.shared), 'scenario 5: shared address is an integer');
   assert.ok(Number.isInteger(r.copy), 'scenario 5: copy address is an integer');
+  assert.notEqual(r.shared, r.copy, 'scenario 5: cowCloneOf must differ from addrOf');
 }
 
 // 6. Dictionary-mode object restore. This is the regression for the copy-on-write

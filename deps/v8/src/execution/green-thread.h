@@ -25,6 +25,14 @@ class GreenProcessor;
 class HeapRefTable;
 class Isolate;
 
+// Handle-scope phase routing gate. The embedder calls this to opt a green-thread
+// isolate into per-worker handle-cursor routing while its N OS workers run bodies
+// concurrently (RunTasks pool.Run / M2Probe worker pool). Declared here against
+// the forward-declared Isolate so green_threads.cc can toggle the flag WITHOUT
+// including src/execution/isolate.h (which pulls heap.h -> trace-event.h and
+// collides with node's tracing/trace_event.h).
+void SetIsolateHandleScopePerWorker(Isolate* iso, bool on);
+
 // --- Constants ---
 
 // Runqueue capacity for GreenProcessor.

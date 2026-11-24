@@ -46,6 +46,16 @@ std::atomic<uint32_t> GreenThreadCow::g_cow_active_count{0};
 // hook with COW active. Exposed for JIT→COW boundary verification.
 std::atomic<uint64_t> GreenThreadCow::g_cow_generated_code_calls{0};
 
+// Readable mirror of ConcurrentLinearAllocationGate() (linear-allocation-area.h),
+// exposed as an ExternalReference so the inline young-gen allocation fast path
+// (CodeStubAssembler::AllocateRaw) can tell, at code-execution time, that parallel
+// green-heap workers have armed the lock-free CAS bump-pointer. When true, generated
+// allocation code defers to the CAS runtime path instead of doing a plain read-then-
+// bump on the shared young LAB (which races another worker's forced-GC LAB reset).
+// Written only by SetGreenHeapConcurrentAllocationEnabled, so it never desyncs from
+// the atomic gate. Zero in the common (green threads disabled or serial) case.
+bool green_thread_concurrent_allocation_active = false;
+
 // Backing mutex for GreenThreadCowSharedWriterScope (see that class for why it
 // is process-global and recursive); lazily owns the single process instance.
 base::RecursiveMutex& GreenThreadCow::SharedStateMutex() {
@@ -315,8 +325,32 @@ bool GreenThreadCOWSuspendedConcurrentGC() {
   return suspended;
 }
 
-// ================================================================
-// Concurrent-GC worker suspension & drain barrier (Option A)
+// --- Concurrent-compilation suspension for true-parallel body execution ------
+//
+// See GreenThreadCow::SetConcurrentCompilationSuspended (green-thread-cow.h).
+// In the true-parallel (GT_M2_PARALLEL) model no CoW view is active, so
+// GreenThreadCOWSuspendedConcurrentGC() is false and the JIT compilers run
+// concurrently with the mutators -- racing the in-place heap rewrites and
+// producing torn SharedFunctionInfo / feedback-vector / Map reads that land on
+// a dead pointer (EXC_BAD_ACCESS at 0xbeeddead) on the next deopt. The green
+// runtime sets this flag around the concurrent body window to force those paths
+// synchronous on the mutator thread, where the heap view is always consistent.
+// Unlike the CoW GC gate it is consulted by the COMPILATION sites only, never
+// by Heap::ShouldUseBackgroundThreads, so parallel allocation never OOMs.
+static std::atomic<bool> g_concurrent_compilation_suspended{false};
+
+void GreenThreadCow::SetConcurrentCompilationSuspended(bool suspended) {
+  g_concurrent_compilation_suspended.store(suspended, std::memory_order_relaxed);
+}
+
+// True while a true-parallel green-thread body window is active (see
+// SetConcurrentCompilationSuspended). OR'd into the concurrent-compilation
+// gates alongside GreenThreadCOWSuspendedConcurrentGC(); intentionally NOT
+// wired into Heap::ShouldUseBackgroundThreads so GC stays concurrent and the
+// parallel allocation window does not run out of heap.
+bool GreenThreadConcurrentCompilationSuspended() {
+  return g_concurrent_compilation_suspended.load(std::memory_order_relaxed);
+}
 //
 // The guard in Heap::ShouldUseBackgroundThreads() (see below) gates only the
 // one-time decision to schedule a concurrent-GC worker when a GC job is
@@ -630,6 +664,9 @@ void GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(
   // no-op, so the disabled serial fast path is never disturbed.
   if (isolate == nullptr) return;
   ConcurrentLinearAllocationGate().store(enabled, std::memory_order_relaxed);
+  // Keep the JIT-visible mirror in lockstep with the atomic gate the CAS
+  // allocation path reads.
+  green_thread_concurrent_allocation_active = enabled;
 }
 #endif  // V8_ENABLE_GREEN_THREADS
 

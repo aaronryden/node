@@ -35,6 +35,7 @@ namespace internal {
 // RegisterCOWGCWorker()/UnregisterCOWGCWorker() count in-flight workers so the
 // embedding thread can drain them on the 0 -> 1 view boundary.
 bool GreenThreadCOWSuspendedConcurrentGC();
+bool GreenThreadConcurrentCompilationSuspended();
 bool RegisterCOWGCWorker();
 void UnregisterCOWGCWorker();
 
@@ -302,7 +303,8 @@ class MaglevConcurrentDispatcher::JobTask final : public v8::JobTask {
     // the previous job finished. Bailing leaves the queued job for the view's
     // end instead of racing the rewrite mid-compilation.
     while (!delegate->ShouldYield() &&
-           !GreenThreadCOWSuspendedConcurrentGC()) {
+           !GreenThreadCOWSuspendedConcurrentGC() &&
+           !GreenThreadConcurrentCompilationSuspended()) {
       std::unique_ptr<MaglevCompilationJob> job;
       if (incoming_queue()->Dequeue(&job)) {
         DCHECK_NOT_NULL(job);
@@ -402,7 +404,8 @@ void MaglevConcurrentDispatcher::FinalizeFinishedJobs() {
   // exactly as the baseline compiler defers InstallBatch(). The jobs stay in
   // the outgoing queue and finalize once the view ends and a new batch
   // completes and re-raises the maglev-install interrupt.
-  if (GreenThreadCOWSuspendedConcurrentGC()) {
+  if (GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) {
     return;
   }
   HandleScope handle_scope(isolate_);

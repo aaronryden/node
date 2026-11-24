@@ -28,6 +28,11 @@ namespace internal {
 // @sideEffects Modifies the green thread's iteration_count and state.
 void RunGreenThread(GreenThread* gt) {
   if (!gt || gt->pc_raw() == kNullAddress) {
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_CRASH_DEBUG"))
+      ::fprintf(stderr, "[GTDBG-NULLPC] gt=%p pc_raw=%p\n", (void*)gt,
+                (void*)gt->pc_raw());
+#endif
     gt->set_state(GreenThreadState::kComplete);
     return;
   }

@@ -93,6 +93,7 @@ namespace internal {
 // while a view is active, so there is nothing to defer or drain. See
 // Heap::ShouldUseBackgroundThreads for the full rationale.
 bool GreenThreadCOWSuspendedConcurrentGC();
+bool GreenThreadConcurrentCompilationSuspended();
 #endif
 
 namespace {
@@ -1211,9 +1212,14 @@ MaybeHandle<Code> CompileTurbofan(Isolate* isolate, Handle<JSFunction> function,
   // feedback-vector / Map reads). A later deopt from the green body's baseline
   // frame into that half-written optimized code lands on a dead pointer
   // (EXC_BAD_ACCESS at 0xbeeddead). Force synchronous compilation, which runs on
-  // the embedding thread and always reads a consistent view. Mirrors the Maglev
-  // gate in CompileMaglev below.
-  if (IsConcurrent(mode) && GreenThreadCOWSuspendedConcurrentGC()) {
+  // the embedding thread and always reads a consistent view. The same holds for
+  // true-parallel body execution (GT_M2_PARALLEL=1), where no CoW view is active
+  // (so GreenThreadCOWSuspendedConcurrentGC() is false) but the workers still
+  // rewrite the heap in place -- hence the GreenThreadConcurrentCompilationSuspended()
+  // check is OR'd in. Mirrors the Maglev gate in CompileMaglev below.
+  if (IsConcurrent(mode) &&
+      (GreenThreadCOWSuspendedConcurrentGC() ||
+       GreenThreadConcurrentCompilationSuspended())) {
     mode = ConcurrencyMode::kSynchronous;
   }
   if (IsConcurrent(mode)) {
@@ -1275,10 +1281,13 @@ MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
        // While a CoW green-thread view is active the shared heap is being
        // rewritten solely on the embedding thread; concurrent Maglev would
        // compile on a background worker against the heap the view is cloning
-       // (torn SharedFunctionInfo / feedback-vector reads -> crash). Fall back
-       // to synchronous compilation, which runs on the embedding thread and
+       // (torn SharedFunctionInfo / feedback-vector reads -> crash). The same
+       // race exists for true-parallel body execution (no CoW view active), so
+       // GreenThreadConcurrentCompilationSuspended() is OR'd in. Fall back to
+       // synchronous compilation, which runs on the embedding thread and
        // therefore always reads a consistent view.
-       GreenThreadCOWSuspendedConcurrentGC())) {
+       GreenThreadCOWSuspendedConcurrentGC() ||
+       GreenThreadConcurrentCompilationSuspended())) {
     mode = ConcurrencyMode::kSynchronous;
   }
 

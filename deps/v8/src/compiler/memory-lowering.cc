@@ -224,6 +224,36 @@ Reduction MemoryLowering::ReduceAllocateRaw(Node* node,
                           ? IsolateFieldId::kNewAllocationInfoLimit
                           : IsolateFieldId::kOldAllocationInfoLimit);
 
+  // Green-thread concurrent-allocation gate (isolate-dependent only). When the
+  // gate is armed, true-parallel green-heap workers share ONE young
+  // LinearAllocationArea, so any inline bump-pointer below races another
+  // worker's forced-GC LAB reset (Heap::FreeLinearAllocationAreas ->
+  // ResetLab), which can leave top_ at a reclaimed/near-null address and
+  // produce a bogus allocation object that SEGVs. When armed, the inline
+  // allocation below defers (GotoIfNot -> call_runtime) to the runtime
+  // allocator (Allocate*Stub), which reserves through the lock-free CAS
+  // bump-pointer (MainAllocator::AllocateFastAligned) under the green mutator
+  // lock. Wasm code is isolate-independent (no green heap), so the node stays
+  // null and no gate codegen is generated. inline_ok is the *idle* condition:
+  // truthy when the gate is NOT armed, i.e. the inline bump-pointer below is
+  // safe; when false (armed) the inline path defers.
+  Node* inline_ok = nullptr;
+  if (isolate_ != nullptr) {
+    Node* flag = __ Load(
+        MachineType::Uint8(),
+        __ ExternalConstant(
+            ExternalReference::green_thread_concurrent_allocation_flag()),
+        __ IntPtrConstant(0));
+    // Mirror CodeStubAssembler::LoadRuntimeFlag: the loaded flag is a single
+    // byte (kWord8), which the graph assembler's Word32 ops cannot take
+    // directly. Bitcast it up to Word32, mask the low byte, then compare to 0.
+    // Truthy => the gate is idle (inline bump-pointer below is safe); false =>
+    // armed (defer to the runtime allocator).
+    Node* masked = __ Word32And(
+        TNode<Uint32T>::UncheckedCast(flag), __ Uint32Constant(0xFF));
+    inline_ok = __ Word32Equal(masked, __ Uint32Constant(0));
+  }
+
   // Check if we can fold this allocation into a previous allocation represented
   // by the incoming {state}.
   IntPtrMatcher m(size);
@@ -237,6 +267,18 @@ Reduction MemoryLowering::ReduceAllocateRaw(Node* node,
       // We can fold this Allocate {node} into the allocation {group}
       // represented by the given {state}. Compute the upper bound for
       // the new {state}.
+
+      // Concurrent gate: an inline fold bumps state->top() (the running folded
+      // top), which under true-parallel execution is stale (raced by another
+      // worker's forced-GC LAB reset). When armed, skip the inline fold and
+      // defer to the runtime allocator (CAS bump under the lock). Idle
+      // (serial) keeps the original folding behavior unchanged.
+      auto call_runtime = __ MakeDeferredLabel();
+      auto done = __ MakeLabel(MachineRepresentation::kTaggedPointer);
+      if (isolate_ != nullptr) {
+        __ GotoIfNot(inline_ok, &call_runtime);
+      }
+
       intptr_t const state_size = state->size() + object_size;
 
       // Update the reservation check to the actual maximum upper bound.
@@ -264,13 +306,32 @@ Reduction MemoryLowering::ReduceAllocateRaw(Node* node,
                top_address, __ IntPtrConstant(0), top);
 
       // Compute the effective inner allocated address.
-      value = __ BitcastWordToTagged(
-          __ IntAdd(state->top(), __ IntPtrConstant(kHeapObjectTag)));
+      Node* fold_value =
+          __ BitcastWordToTagged(
+              __ IntAdd(state->top(), __ IntPtrConstant(kHeapObjectTag)));
+
+      // Route the folded (idle) result into {done}.
+      __ Goto(&done, fold_value);
+
+      // Armed: allocate through the runtime allocator and converge with the
+      // folded result at {done}; the inline fold above is skipped at runtime.
+      __ Bind(&call_runtime);
+      EnsureAllocateOperator();
+      Node* allocated =
+          __ Call(allocate_operator_.get(), allocate_builtin,
+                  __ IntPtrConstant(object_size));
+      __ Goto(&done, allocated);
+
+      __ Bind(&done);
+      value = done.PhiAt(0);
       effect = gasm()->effect();
       control = gasm()->control();
 
-      // Extend the allocation {group}.
-      group->Add(value);
+      // Extend the allocation {group} and thread the (folded) allocation state.
+      // Under the concurrent gate the folded top is theoretical and never used
+      // for an actual bump (the allocation defers); serial execution keeps real
+      // folding.
+      group->Add(fold_value);
       *state_ptr =
           AllocationState::Open(group, state_size, top, effect, zone());
     } else {
@@ -286,6 +347,13 @@ Reduction MemoryLowering::ReduceAllocateRaw(Node* node,
           __ Load(MachineType::Pointer(), top_address, __ IntPtrConstant(0));
       Node* limit =
           __ Load(MachineType::Pointer(), limit_address, __ IntPtrConstant(0));
+
+      // When the concurrent-allocation gate is armed, an inline bump races
+      // another worker's LAB reset; defer to the runtime allocator (CAS bump
+      // under the lock). Predicted not taken when idle (serial).
+      if (isolate_ != nullptr) {
+        __ GotoIfNot(inline_ok, &call_runtime);
+      }
 
       // Check if we need to collect garbage before we can start bump pointer
       // allocation (always done for folded allocations).
@@ -332,6 +400,13 @@ Reduction MemoryLowering::ReduceAllocateRaw(Node* node,
         __ Load(MachineType::Pointer(), top_address, __ IntPtrConstant(0));
     Node* limit =
         __ Load(MachineType::Pointer(), limit_address, __ IntPtrConstant(0));
+
+    // When the concurrent-allocation gate is armed, an inline bump races
+    // another worker's LAB reset; defer to the runtime allocator (CAS bump
+    // under the lock). Predicted not taken when idle (serial).
+    if (isolate_ != nullptr) {
+      __ GotoIfNot(inline_ok, &call_runtime);
+    }
 
     // Compute the new top.
     Node* new_top = __ IntAdd(top, AlignToAllocationAlignment(size));

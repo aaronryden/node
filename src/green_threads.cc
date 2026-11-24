@@ -47,6 +47,10 @@
 #include <string>
 #include <cstdlib>
 #include <pthread.h>
+#include <execinfo.h>
+#include <csignal>
+#include <signal.h>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -94,6 +98,51 @@
 #include "node_internals.h"
 #include "node_snapshot_builder.h"
 #include "node_v8_platform-inl.h"
+
+// Diagnostic-only: install during an M2Probe run to capture the location and
+// green-thread phase of a fatal SIGSEGV/SIGABRT (macOS writes no core). Prints
+// phase + pthread + a backtrace, then re-raises for the default termination so
+// the exit code stays 139. Guarded so it never leaks into a release build.
+#ifdef V8_ENABLE_GREEN_THREADS
+namespace {
+bool gt_faulting = false;
+void gt_fault_handler(int sig, siginfo_t* si, void* ucp) {
+  (void)ucp;
+  if (gt_faulting) return;  // avoid recursion / re-entrancy
+  gt_faulting = true;
+  const char* phase = ::getenv("GT_PHASE");
+  ::fprintf(stderr,
+            "\n[SIGFAULT] sig=%d phase=%s pthread=0x%lx fault_addr=%p\n",
+            sig, phase ? phase : "idle", (unsigned long)pthread_self(),
+            si ? (void*)si->si_addr : (void*)0);
+  void* bt[48];
+  int n = ::backtrace(bt, 48);
+  ::backtrace_symbols_fd(bt, n, 2);
+  ::fflush(stderr);
+  struct sigaction sa;
+  ::memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = SIG_DFL;
+  ::sigaction(sig, &sa, nullptr);
+  ::raise(sig);
+}
+
+// RAII: installs gt_fault_handler for the wrapping scope and restores the
+// previous disposition on exit.
+class GTFaultGuard {
+ public:
+  GTFaultGuard() {
+    ::memset(&sa_impl_, 0, sizeof(sa_impl_));
+    sa_impl_.sa_sigaction = gt_fault_handler;
+    sa_impl_.sa_flags = SA_SIGINFO;
+    ::sigaction(SIGSEGV, &sa_impl_, &prev_);
+  }
+  ~GTFaultGuard() { ::sigaction(SIGSEGV, &prev_, nullptr); }
+ private:
+  struct sigaction sa_impl_{};
+  struct sigaction prev_{};
+};
+}  // namespace
+#endif
 
 namespace node {
 // Forward declaration of the green `g` shell installer, defined below in node
@@ -161,6 +210,10 @@ struct GreenCallData {
   // cannot reclaim it, and post_gc_consistent verifies it survived intact.
   Persistent<Value> marker_p;
   bool threw = false;
+  // SpawnAll round id (per RunTasks call), stamped here and echoed into every
+  // GT_CRASH_DEBUG print so worker-thread RESULT lines and the main-thread
+  // RUNTASKS lines can be correlated to the same spawnAll.
+  uint64_t round = 0;
   // Thrown-exception metadata. When a body throws a non-array Error-like value,
   // GreenJSEntry reads its resolved `name`/`message` here -- the real prototype
   // is intact at throw time, whereas the structured copy carries no prototype
@@ -176,6 +229,10 @@ struct GreenCallData {
 // Registry from green thread to its call data. The scheduler entry point is
 // keyed by the GreenThread pointer the scheduler hands back on every call.
 std::unordered_map<vi::GreenThread*, GreenCallData*> g_gt_registry;
+// Monotonic spawnAll round id, stamped into GreenCallData::round so that
+// GT_CRASH_DEBUG output can correlate a worker's RESULT write with the main
+// thread's RUNTASKS read for the exact same spawnAll().
+static std::atomic<uint64_t> g_green_spawn_round{0};
 
 // Returns the green address (untagged heap pointer) of a heap object handle,
 // matching the key form the COW write barrier stores in each HeapRefTable
@@ -219,6 +276,12 @@ static Isolate* g_green_isolate = nullptr;
 // re-parsing their source, skipping anything that is not real JS (native
 // bindings synthesize a non-compilable source, which we detect and skip).
 static Persistent<Context> g_green_ctx;
+
+// Set (per-OS-thread) while a green body executes inside GreenJSEntry, so the
+// crash diagnostic can tell a body run (green isolate) apart from embedding-
+// isolate bookkeeping that might read a shared object. Declared here rather
+// than inline to avoid capturing state across the C call.
+static thread_local bool g_in_green_body = false;
 
 static Isolate* GetGreenIsolate(Isolate* embedding) {
   if (g_green_isolate != nullptr) return g_green_isolate;
@@ -529,6 +592,18 @@ static GreenIR* GreenCapture(Isolate* src, Local<Context> ctx, Local<Value> valu
 
   Address addr = UntaggedObjectAddress(Local<Object>::Cast(value));
   uint64_t key = static_cast<uint64_t>(addr);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG") && (value->IsTypedArray() || value->IsArrayBuffer())) {
+    static int g_cap;
+    if (g_cap++ < 20) {
+      GTDebugCtx d = GTGreenThreadDebugCtx(src);
+      ::fprintf(stderr, "[GTGT-CAP] #%d %s addr=%p src=%p is_green=%d\n",
+                g_cap, value->IsTypedArray() ? "TypedArray" : "ArrayBuffer",
+                (void*)addr, (void*)src, (int)d.is_green);
+      ::fflush(stderr);
+    }
+  }
+#endif
   auto it = by_addr.find(key);
   if (it != by_addr.end()) return it->second;
 
@@ -565,6 +640,20 @@ static GreenIR* GreenCapture(Isolate* src, Local<Context> ctx, Local<Value> valu
 
 // Recreate a value on `dst` from a GreenIR tree on `ctx`.
 static Local<Value> GreenRebuild(Isolate* dst, const GreenIR* ir, Local<Context> ctx) {
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    static int g_rb;
+    if (g_rb++ < 40) {
+      GTDebugCtx d = GTGreenThreadDebugCtx(dst);
+      bool gempty = ctx->Global().IsEmpty();
+      ::fprintf(stderr, "[GTGT-REBUILD] #%d rebuilder_iso=%p is_green=%d tblock=%p "
+                        "global_empty=%d\n",
+                g_rb, (void*)dst, (int)d.is_green, (void*)d.tblock,
+                (int)gempty);
+      ::fflush(stderr);
+    }
+  }
+#endif
   switch (ir->kind) {
     case GreenIR::kArray: {
       Local<Array> arr = Array::New(dst, static_cast<uint32_t>(ir->children.size()));
@@ -644,6 +733,16 @@ static std::unique_ptr<Persistent<Value>> CopyValueAcross(const GreenValueCopier
     v8::Isolate::Scope isolate_src(copier.src);
     HandleScope scope_src(copier.src);
     Local<Context> ctx = ContextFor(copier.src);
+    // Enter the source context as current on the source isolate before
+    // GreenCapture walks the value. GreenCapture reads string-valued and
+    // property-key members via `String::Utf8Value`, which resolves the
+    // isolate's *current* context (it takes no context argument); with no
+    // context entered on the green isolate that read resolves a null context
+    // whose map word is 0xffffffffffffffff and the value->ToString() below
+    // SEGVs. This mirrors Phase 2 (rebuild), which already enters `dst_ctx`
+    // for the same reason. For a non-green source `ctx` is already current, so
+    // the nested Context::Scope is a harmless no-op there.
+    v8::Context::Scope ctx_scope(ctx);
     std::unordered_map<uint64_t, GreenIR*> by_addr;
     GreenIR* ir = GreenCapture(copier.src, ctx, value, by_addr);
     // Phase 2: rebuild on the destination isolate and root it in a Persistent.
@@ -870,6 +969,15 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   if (gt->iteration_count() >= 2) {
     return;
   }
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_CRASH_DEBUG")) {
+    ::fprintf(stderr,
+              "[GTDBG-GREENJSENTRY] round=%u gt=%p pc=%p iter=%d tid=%ld\n",
+              (unsigned)data->round, (void*)gt, (void*)gt->pc_raw(),
+              (unsigned)gt->iteration_count(), (long)pthread_self());
+    ::fflush(stderr);
+  }
+#endif
 
   // Multiple OS workers now drive bodies concurrently inside ONE shared green
   // heap. Their C++ HandleScopes and Context::Enter/Exit all route through the
@@ -886,6 +994,16 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   // execution is pinned to a worker (yield cooperates only within the worker),
   // so correctness here is the precondition for unsynchronized parallelism,
   // which additionally requires per-worker HandleScope/entered-context state.
+  //
+  // A further shared-state race remains beyond handle-scope/context: the
+  // v8::Isolate::Scope below activates THIS green isolate on every OS worker at
+  // once, and JS-invoke permission is an isolate-level flag. Concurrent
+  // activation/invoke trips "Invoke in DisallowJavascriptExecutionScope"
+  // (SIGABRT) and torn state (SIGSEGV). The handle-scope phase routes cursor +
+  // entered-context + set_context per worker, but Isolate::Activate/Deactivate
+  // and the invoke-disallow flag are not yet per-worker, so the per-global
+  // GreenThreadCowSharedWriterScope still guards the whole body here. Releasing
+  // it is the follow-up once those two are made per-worker.
   vi::GreenThreadCowSharedWriterScope shared_writer_scope;
 
   // Enter the green thread's own isolate so its body runs on that heap.
@@ -898,6 +1016,17 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   HandleScope scope(data->isolate);
   Local<Context> ctx = Local<Context>::New(data->isolate, data->context_p);
   Context::Scope context_scope(ctx);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    ::fprintf(stderr,
+              "[GTGT-AFTERSCOPE] pthread=0x%lx data_isolate=%p cur_iso=%p "
+              "is_green=%d\n",
+              (unsigned long)pthread_self(), (void*)data->isolate,
+              (void*)GTGreenThreadCurrentIsolate(),
+              (int)data->isolate->isGreenThreadMode());
+    ::fflush(stderr);
+  }
+#endif
 
   // fn_p lives on fn_isolate, which is the same isolate as data->isolate in
   // every current mode (green in shared-heap / M2 modes, embedding otherwise),
@@ -912,8 +1041,50 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
   }
 
   Local<Value> out;
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    static std::atomic<int> g_concurrent_bodies{0};
+    const int prev = g_concurrent_bodies.fetch_add(1, std::memory_order_acq_rel);
+    const int conc = prev + 1;
+    GTDebugCtx d = GTGreenThreadDebugCtx(data->isolate);
+    void* cur_iso = node::GTGreenThreadCurrentIsolate();
+    ::fprintf(stderr,
+              "[GTGT-ENTER] tid=0x%lx gt=%p iso=%p cur_iso=%p conc=%d "
+              "is_green=%d same=%d\n"
+              "   main_iso=%p main_heap=%p tblock=%p\n",
+              (unsigned long)pthread_self(), (void*)gt, (void*)data->isolate,
+              cur_iso, conc, (int)d.is_green,
+              (int)(cur_iso == (void*)data->isolate), d.main_iso, d.main_heap,
+              d.tblock);
+    ::fflush(stderr);
+    g_concurrent_bodies.fetch_sub(1, std::memory_order_acq_rel);
+  }
+#endif
   v8::TryCatch body_tc(data->isolate);
-  if (!fn->Call(ctx, recv, argv.size(), argv.data()).ToLocal(&out)) {
+  const bool was_in_body = g_in_green_body;
+  g_in_green_body = true;
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTExecSnap s = GTGreenThreadExecSnapshot();
+    GTDebugCtx d = GTGreenThreadDebugCtx(data->isolate);
+    ::fprintf(stderr,
+              "[GTGT-PRECALL] tid=0x%lx iso=%p cur_iso=%p cur_green=%d "
+              "cur_ptd=%p ptd_iso=%p ptd_green=%d tlt=%p central=%d "
+              "data_green=%d\\n",
+              (unsigned long)pthread_self(), (void*)data->isolate, s.cur_iso,
+              s.cur_green, s.cur_ptd, s.ptd_iso, s.ptd_green, s.tlt, s.central,
+              (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DUMP")) {
+    node::GTGreenThreadEntryDump(data->isolate);
+  }
+#endif
+  const bool called = fn->Call(ctx, recv, argv.size(), argv.data()).ToLocal(&out);
+  g_in_green_body = was_in_body;
+  if (!called) {
     // The body threw: TryCatch has already captured the exception and its
     // message. Root it in exc_p (on the executing isolate) while the TryCatch
     // is still in scope, then let it return. Its Exit() restores the isolate's
@@ -961,10 +1132,27 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
       }
     }
     data->threw = true;
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_CRASH_DEBUG")) {
+      ::fprintf(stderr,
+                "[GTDBG-THREW] gt=%p tid=%ld\n", (void*)gt,
+                (long)pthread_self());
+      ::fflush(stderr);
+    }
+#endif
     gt->set_state(vi::GreenThreadState::kComplete);
     return;
   }
   data->result_p.Reset(data->isolate, out);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_CRASH_DEBUG")) {
+    ::fprintf(stderr,
+              "[GTDBG-RESULT] round=%u gt=%p data=%p result_p=%p isempty=%d tid=%ld\n",
+              (unsigned)data->round, (void*)gt, (void*)data, (void*)&data->result_p,
+              (int)data->result_p.IsEmpty(), (long)pthread_self());
+    ::fflush(stderr);
+  }
+#endif
   gt->set_state(vi::GreenThreadState::kComplete);
 }
 
@@ -1042,9 +1230,32 @@ void GreenThreadPool::Run(std::vector<vi::GreenThread*> gts,
   for (uint32_t i = 0; i < gts.size(); i++) {
     schedulers_[i % num_workers]->EnqueueGlobal(gts[i]);
   }
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_CRASH_DEBUG")) {
+    for (uint32_t i = 0; i < gts.size(); i++)
+      ::fprintf(stderr, "[GTDBG-ASSIGN] task=%u -> scheduler[%d%%] gt=%p\n", i,
+                i % num_workers, (void*)gts[i]);
+    ::fflush(stderr);
+  }
+#endif
 
   for (int i = 0; i < num_workers; i++)
     workers_.emplace_back(&GreenThreadPool::WorkerEntry, this, i);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_CRASH_DEBUG")) {
+    int64_t completed = 0;
+    for (int s = 0; s < num_workers; s++)
+      completed += schedulers_[s]->total_threads_completed();
+    ::fprintf(stderr,
+              "[GTDBG-POOL] num_workers=%d gts=%zu completed=%lld\n", num_workers,
+              gts.size(), (long long)completed);
+    for (int s = 0; s < num_workers; s++) {
+      const char* firstgt = gts.empty() ? "?" : "x";
+      ::fprintf(stderr, "  scheduler[%d] assigned gt=%p\n", s, firstgt);
+    }
+    ::fflush(stderr);
+  }
+#endif
   for (std::thread& w : workers_) w.join();
 
   for (auto& s : schedulers_) s->Shutdown();
@@ -1172,6 +1383,10 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   }
 
   const uint32_t m = datas.size();
+  // Stamp every call data with this spawnAll's round so GT_CRASH_DEBUG prints
+  // (worker RESULT and main RUNTASKS) can be correlated to the same call.
+  const uint64_t round = g_green_spawn_round.fetch_add(1, std::memory_order_relaxed);
+  for (GreenCallData* data : datas) data->round = round;
 
   // Create each green thread (which enables COW, allocates its ref table and
   // registers it as COW-active), register its call data, and collect its
@@ -1206,7 +1421,27 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   // serial fast path once the workers join; the single-threaded result
   // copy-back + teardown below must not pay CAS overhead.
   const bool enable_cas = GreenHeapEnabled();
+  // GC-free allocation window armed BEFORE the workers spawn so thread creation
+  // and every body's first allocation happen-before any collection. While the
+  // count is non-zero the heap grows instead of collecting (young scavenger,
+  // mark-compact, and incremental marking all skip), so no concurrent collection
+  // can relocate or reclaim the green-isolate context or objects a worker still
+  // holds mid-body. Without it, g.spawnAll() driving two or more green threads on
+  // the shared green isolate tore the second body's green-isolate native context
+  // out from under it (SIGSEGV, ~5% of runs under GT_NUM_WORKERS>1) -- the same
+  // torn-context class the __m2_probe dispatcher fixes by holding this window
+  // around its own concurrent fan-out. Held only in shared-heap mode, where
+  // bodies run on the green isolate concurrently; serial Model-A execution never
+  // needs it.
+  const bool gt_shared = GreenHeapEnabled();
+  if (gt_shared) node::GreenEnterAlwaysAllocation(working_isolate);
   if (enable_cas) vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(working_isolate, true);
+  // Handle-scope phase: this is the ONLY window where N OS workers run bodies
+  // concurrently on the green heap, so opt into per-worker handle-state routing
+  // here (and only here). Set before the workers spawn (thread create is a
+  // happens-before) and cleared after the join (happens-after), so it is stable
+  // true for every body and false throughout setup/teardown.
+  vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(working_isolate), true);
 
   {
     int num_workers = static_cast<int>(std::thread::hardware_concurrency());
@@ -1223,6 +1458,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     pool.Run(gts, vi_isolate_for_gt, num_workers);
   }
 
+  vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(working_isolate), false);
   if (enable_cas) vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(working_isolate, false);
 
   // Gather results. A body that threw had its exception captured and cleared
@@ -1231,6 +1467,18 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   // replacement. Because we must not Set a return value once an exception is
   // pending, we surface the fact through *threw_out and, at the end, re-throw
   // the captured exception on this isolate.
+  //
+  // The GC-free (AlwaysAllocate) window is still held here (armed above and
+  // released only just before return, below). The green-heap copy path runs
+  // CopyValueAcross, which allocates rebuilt objects onto the shared green heap;
+  // with collection re-enabled those allocations tripped the heap's
+  // young_gc_during_full_gc_sweeping_ invariant (a FATAL) and, more subtly,
+  // let a collection relocate/reclaim the young green objects the task results
+  // and the Persistent handles reference -- so a result Persistent read back in
+  // the loop came up empty (null Local<Value> -> SIGSEGV in GreenCapture).
+  // __m2_probe proves this holds: it arms the window before the fan-out and
+  // disarms only after gathering all results. Not armed off-CT mode, where
+  // bodies never share the green heap and nothing here allocates on it.
   Local<Array> results = Array::New(isolate, m);
   bool threw = false;
   // The first thrown body's exception, copied onto the embedding isolate so it
@@ -1282,6 +1530,16 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
           Local<Value>::New(green_isolate_ret, datas[i]->result_p);
       // CopyValueAcross returns a durable Persistent rooted on the embedding
       // isolate; root the result row directly from it.
+#ifdef V8_ENABLE_GREEN_THREADS
+      if (::getenv("GT_CRASH_DEBUG")) {
+        ::fprintf(stderr,
+                  "[GTDBG-RUNTASKS] round=%u i=%u gt=%p data=%p result_p=%p threw=%d result_p.isempty=%d tid=%ld\n",
+                  (unsigned)datas[i]->round, i, (void*)datas[i]->gt,
+                  (void*)datas[i], (void*)&datas[i]->result_p, (int)datas[i]->threw,
+                  (int)datas[i]->result_p.IsEmpty(), (long)pthread_self());
+        ::fflush(stderr);
+      }
+#endif
       std::unique_ptr<Persistent<Value>> emb_result_p =
           CopyValueAcross(out_copier, green_result);
       results->Set(ctx, i, Local<Value>::New(isolate, *emb_result_p)).Check();
@@ -1336,6 +1594,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   } else if (thrown_exc) {
     isolate->ThrowException(Local<Value>::New(isolate, *thrown_exc));
   }
+  if (gt_shared) node::GreenLeaveAlwaysAllocation(working_isolate);
   return scope.Escape(results);
 }
 
@@ -1619,9 +1878,20 @@ class M2ProbeWorkQueue {
 // this pass leaves allocation-driven (serial) GC alone so the I1/I4 signals are
 // isolated.
 void M2Probe(const FunctionCallbackInfo<Value>& args) {
+#ifdef V8_ENABLE_GREEN_THREADS
+  GTFaultGuard gt_fault_guard;
+#endif
   Isolate* isolate = args.GetIsolate();
   HandleScope scope(isolate);
   Local<Context> ctx = isolate->GetCurrentContext();
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+    ::fprintf(stderr, "[GTGT-M2START] pthread=0x%lx iso=%p is_green=%d\n",
+              (unsigned long)pthread_self(), (void*)isolate, (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
 
   if (args.Length() < 2 || !args[0]->IsNumber()) {
     ThrowTypeError(isolate,
@@ -1651,6 +1921,17 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   //    writes); only after all setup do workers run.
   Isolate* green = GetGreenIsolate(isolate);
   EnsureGreenContext(isolate, ctx);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    ::fprintf(stderr,
+              "[GTGT-M2GREEN] pthread=0x%lx emb=%p green=%p "
+              "is_green=%d\n",
+              (unsigned long)pthread_self(), (void*)isolate, (void*)green,
+              (int)green->isGreenThreadMode());
+    ::fflush(stderr);
+  }
+  if (::getenv("GT_GT_DEBUG")) ::setenv("GT_PHASE", "setup", 1);
+#endif
 
    // Item 2 (acceptance gate for item 1): an env-gated forced-GC knob.
    // Unset = current behavior (byte-for-byte unchanged). "young"|"full"|"both"
@@ -1707,9 +1988,36 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   // READS Code flags (safe concurrently) and never calls UpdateCode again.
   // Bodies here are pure (allocate-local, return), so the discarded warmup
   // run does not affect the concurrent results.
-  for (Work& w : works) {
-    vi::SetCurrentGreenThread(w.gt);
-    GreenJSEntry(reinterpret_cast<vi::Isolate*>(green), w.gt);
+  const bool skip_warmup = (::getenv("GT_M2_WARMUP") != nullptr);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) ::setenv("GT_PHASE", "warmup", 1);
+  // Warmup compiles each body (first call triggers Compile -> Maglev/Turboshaft).
+  // Suspend concurrent (background) compilation HERE, before warmup, so that
+  // compilation runs synchronously on THIS embedding thread inside GreenJSEntry's
+  // green Isolate::Scope -- producing Code linked to the green isolate/context.
+  // If warmup compiled on a background compiler thread (embedding isolate), the
+  // resulting Code embeds emb-derived pointers, and a worker running it on the
+  // green heap faults (EXC_BAD_ACCESS at 0x3ff / 0xbeeddead). Disarmed after the
+  // workers join, below.
+  vi::GreenThreadCow::SetConcurrentCompilationSuspended(true);
+#endif
+  // Suppress EMBEDDING's own collection for the whole probe window, not just
+  // green's. The green isolate has its own heap (objects on it fail the
+  // embedding heap's Contains check), yet a green object is reachable from an
+  // embedding GC root, so embedding's background mark-compact can walk it. In
+  // true-parallel mode (GT_M2_PARALLEL) no CoW view is active, so
+  // ShouldUseBackgroundThreads()==true and that concurrent GC runs while
+  // workers mutate the heap in place -> torn-state SEGV. Always-allocate makes
+  // the heap grow instead of collecting; arming it here (before warmup) means
+  // no embedding collection is ever in flight while a body runs. Restored after
+  // the workers join, below. This is the "safe access in ALL cases" guarantee:
+  // while the shared heap is live no other isolate collects it.
+  node::GreenEnterAlwaysAllocation(isolate);
+  if (!skip_warmup) {
+    for (Work& w : works) {
+      vi::SetCurrentGreenThread(w.gt);
+      GreenJSEntry(reinterpret_cast<vi::Isolate*>(green), w.gt);
+    }
   }
 
   // 2. Run n workers concurrently. `ok` is written by every worker, so each
@@ -1728,6 +2036,23 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   // the correctness baseline for GT_NUM_WORKERS==1 / legacy serial compare.
   const bool parallel = (::getenv("GT_M2_PARALLEL") != nullptr);
   vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, true);
+  // TRUE-PARALLEL bodies mutate the shared heap in place, so no CoW view is
+  // active (ActiveCount()==0); workers reserve disjoint young-gen pointers (CAS
+  // alloc via SetGreenHeapConcurrentAllocationEnabled) and write their own
+  // objects.
+  // Concurrent-JIT-compiler suspension for TRUE-PARALLEL body execution
+  // (GT_M2_PARALLEL=1). In this mode no CoW view is active (ActiveCount()==0),
+  // so GreenThreadCOWSuspendedConcurrentGC() is false and V8's concurrent
+  // Turbofan / Maglev / baseline-batch compilers would compile on background OS
+  // workers against the heap the mutating workers rewrite in place -- torn
+  // SharedFunctionInfo / feedback-vector / Map reads that land on a dead pointer
+  // (EXC_BAD_ACCESS at 0xbeeddead) on the next deopt. Force those compilation
+  // paths synchronous (no background compiler thread touches the heap) for the
+  // whole concurrent body window; GC stays concurrent (Heap::ShouldUseBackground
+  // Threads is untouched) so the parallel allocation window never runs out of
+  // heap. Complements SetGreenHeapConcurrentAllocationEnabled, which makes the
+  // young-gen pointers disjoint. Disarmed after the workers join, below.
+  vi::GreenThreadCow::SetConcurrentCompilationSuspended(true);
   // Item 1 (I3) / item 2: announce the stop-the-world GC BEFORE spawning the
   // workers, so their entry safepoints observe the request and park before
   // allocating. This quiescence (not the old
@@ -1737,8 +2062,26 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   if (force_gc_mode != M2ForcedGCMode::kNone) {
     vi::GreenThreadCow::RequestAllMutatorsStop(nullptr, nullptr);
   }
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) ::setenv("GT_PHASE", "workers", 1);
+#endif
   {
     v8::Isolate::Scope green_scope(green);
+
+    // GC-free allocation window for the concurrent body execution below.
+    // While this count is non-zero the heap grows instead of collecting (young
+    // scavenger, mark-compact, and incremental marking all skip), so no
+    // worker-triggered GC can reclaim or relocate an object that another
+    // worker still references mid-body -- making every fast-path map /
+    // dictionary-fallback / heap-object-field read in a JIT body observe a
+    // consistent heap. Without this, a concurrent collection leaves a freed
+    // pointer (faulting x5==0x400 on a reclaimed object) in a live body -- the
+    // SIGSEGV the 8-worker parallel allocation hit. Armed BEFORE the workers
+    // spawn so thread creation happens-before each body's first allocation;
+    // the forced collection below is taken OUTSIDE this window and re-arms it,
+    // and GC resumes after the workers join (all bodies finished, no live
+    // mid-body reference).
+    node::GreenEnterAlwaysAllocation(green);
 
     // Item 4: a thread-safe claim queue drives the fan-out. Unlike the
     // GreenScheduler global runqueue (accessed only from the embedding thread,
@@ -1751,6 +2094,12 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
 
     std::vector<std::thread> workers;
     workers.reserve(static_cast<size_t>(n));
+    // Handle-scope phase: N OS workers run bodies concurrently here, so opt into
+    // per-worker handle-state routing on the green isolate (and only here). Set
+    // before the workers spawn (thread create is a happens-before) and cleared
+    // after the join, so the single-threaded M2Probe setup sequence that ran
+    // above keeps the shared IsolateData handle cursor unchanged.
+    vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(green), true);
     for (int i = 0; i < n; ++i) {
       workers.emplace_back([&]() {
         Work w;
@@ -1816,7 +2165,14 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
   // every worker is parked at its entry safepoint (published + quiescent),
   // so no mutator is mid-body. This is the acceptance gate for the handshake.
   if (force_gc_mode != M2ForcedGCMode::kNone) {
+    // The GC-free window above would make this collection a no-op -- with
+    // always_allocate active the heap only grows, so M2ForceGC could never
+    // reclaim the parked markers. Turn it OFF for the collection, then re-arm
+    // it BEFORE the workers resume and run their bodies: the bodies, not the
+    // collection, are the concurrent window that must observe a consistent heap.
+    node::GreenLeaveAlwaysAllocation(green);
     M2ForceGC(green, force_gc_mode);
+    node::GreenEnterAlwaysAllocation(green);
   }
    // Resume the parked workers so the joined bodies can run and finish.
    if (force_gc_mode != M2ForcedGCMode::kNone) {
@@ -1825,13 +2181,61 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
    // Release any worker still parked in WaitAndClaim, then join the pool.
    pool.Shutdown();
    for (std::thread& wt : workers) wt.join();
+   // Bodies are done and no OS worker is executing a green body on the green
+   // isolate anymore, so restore the shared handle-scope routing for any
+   // post-join teardown on the embedding thread.
+   vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(green), false);
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DEBUG")) {
+      GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+      ::fprintf(stderr, "[GTGT-PHASE] after-join iso=%p is_green=%d\n",
+                (void*)isolate, (int)d.is_green);
+      ::fflush(stderr);
+    }
+#endif
+    vi::GreenThreadCow::SetConcurrentCompilationSuspended(false);
+    // Bodies are done and every mid-body worker reference is now dead, so end
+    // the GC-free window here: ordinary GC may reclaim/relocate freely again.
+    node::GreenLeaveAlwaysAllocation(green);
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DEBUG")) {
+      GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+      ::fprintf(stderr, "[GTGT-PHASE] after-GreenLeaveAlways iso=%p is_green=%d\n",
+                (void*)isolate, (int)d.is_green);
+      ::fflush(stderr);
+    }
+#endif
   }
+
+  // Release the embedding-heap suppression now that all workers have joined and
+  // no body is still mutating the heap, so embedding may reclaim normally again.
+  node::GreenLeaveAlwaysAllocation(isolate);
 
   vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(green, false);
 
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+    ::fprintf(stderr, "[GTGT-PHASE] pre-ArrayNew iso=%p is_green=%d\n",
+              (void*)isolate, (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
+
   // 3. Copy results back to the embedding isolate.
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) ::setenv("GT_PHASE", "copyback", 1);
+#endif
   Local<Array> results = Array::New(isolate, n);
   bool all_ok = true;
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+    ::fprintf(stderr, "[GTGT-PHASE] collection START iso=%p is_green=%d\n",
+              (void*)isolate, (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
   {
     v8::Isolate::Scope green_scope(green);
     HandleScope green_handle_scope(green);
@@ -1846,6 +2250,14 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
       results->Set(ctx, i, Local<Value>::New(isolate, *emb)).Check();
     }
   }
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+    ::fprintf(stderr, "[GTGT-PHASE] copyback DONE iso=%p is_green=%d\n",
+              (void*)isolate, (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
 
    // Item 2: every rooted per-worker marker must have survived the forced GC
    // (still allocated, still carrying its original id). This MUST be checked
@@ -1905,6 +2317,14 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
    report->Set(ctx, String::NewFromUtf8(isolate, "post_gc_consistent").ToLocalChecked(),
                Boolean::New(isolate, post_gc_consistent)).Check();
   args.GetReturnValue().Set(report);
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_GT_DEBUG")) {
+    GTDebugCtx d = GTGreenThreadDebugCtx(isolate);
+    ::fprintf(stderr, "[GTGT-PHASE] M2 report SET iso=%p is_green=%d\n",
+              (void*)isolate, (int)d.is_green);
+    ::fflush(stderr);
+  }
+#endif
 }
 // Cooperative checkpoint: hands control to the next green thread and returns
 // when scheduling returns here. No-op when called outside a running green
