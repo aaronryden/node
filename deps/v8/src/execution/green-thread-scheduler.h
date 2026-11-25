@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 
 #include "src/execution/green-processor.h"
 #include "src/execution/green-thread.h"
@@ -90,6 +91,36 @@ class GreenScheduler {
   // Run the scheduler loop — processes green threads until none are left.
   void ScheduleLoop();
 
+  // --- Cooperative I/O block / reactivate ---
+  //
+  // A body that parks on an external event (I/O) calls BlockGreenThread: it
+  // stamps its registers for root visibility and links itself into this
+  // scheduler's blocked list, then returns up to ScheduleLoop so the OS worker
+  // runs the next body. ReactivateGreenThread (called when the event completes,
+  // possibly from a libuv pool thread) records a one-shot reactivation on the
+  // thread-safe react_queue_ and wakes the worker; the worker's DrainReactivations
+  // moves the body back to the runnable queue (blocked-list mutation stays
+  // worker-only, so no two threads touch it). WaitForReactivationWithPred parks
+  // the worker until a predicate that checks THIS worker's OWN finished reads
+  // becomes true -- a predicate that is steal-proof under the shared scheduler
+  // (the shared react_queue_ alone can be drained by another worker).
+
+  void BlockGreenThread(GreenThread* gt);
+  void ReactivateGreenThread(GreenThread* gt);
+  bool DrainReactivations();
+  // Park the worker until `pred` becomes true or the scheduler stops. Under a
+  // shared drive scheduler, ReactivateGreenThread's notify_all wakes EVERY parked
+  // worker, and DrainReactivations (run at the top of each worker's loop) drains
+  // the shared react_queue_ -- so another worker can pop-and-clear THIS worker's
+  // reactivation before its owner wakes. Waiting on a predicate that checks THIS
+  // worker's own bodies (a finished read still in its pending_reads) is steal-proof:
+  // the completion's effect is always visible to the owner regardless of who drained
+  // the shared queue. The predicate is evaluated under react_mutex_, so it must not
+  // touch any other lock.
+  void WaitForReactivationWithPred(const std::function<bool()>& pred);
+  bool has_blocked() const { return blocked_list_head_ != nullptr; }
+  int64_t blocked_count() const;
+
   // --- COW support ---
 
   // Get the active COW heap view for the current green thread.
@@ -122,6 +153,21 @@ class GreenScheduler {
   // Global runqueue for load balancing.
   GreenThread* global_queue_head_;
   GreenThread* global_queue_tail_;
+
+  // Parked bodies: green threads suspended on an external event (I/O). The
+  // worker thread only ever links/unlinks here (BlockGreenThread /
+  // DrainReactivations). ReactivateGreenThread never mutates this list -- it
+  // signals through react_queue_ under react_mutex_ instead.
+  GreenThread* blocked_list_head_;
+
+  // Reactivation coordination. ReactivateGreenThread (libuv pool thread) and
+  // DrainReactivations/WaitForReactivationWithPred (owning worker) both take
+  // react_mutex_; the condition variable parks the worker while its bodies are
+  // still blocked so the OS core is not burned polling.
+  std::deque<GreenThread*> react_queue_;
+  std::mutex react_mutex_;
+  std::condition_variable react_cv_;
+  bool stopping_ = false;
 
   // Thread-local processor mapping (OS thread -> GreenProcessor*).
   static thread_local GreenProcessor* g_processor_;

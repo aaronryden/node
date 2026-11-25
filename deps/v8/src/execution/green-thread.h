@@ -61,6 +61,7 @@ enum : uint32_t {
 enum class GreenThreadState : uint8_t {
   kRunnable,  // In a P's runqueue, waiting to run
   kRunning,   // Currently executing on an OS thread
+  kBlocked,   // Suspended on an external event (I/O); OS thread freed for other
   kComplete   // Finished execution
 };
 
@@ -182,6 +183,15 @@ class GreenThread {
   void* resume_data() const { return resume_data_; }
   void set_resume_data(void* d) { resume_data_ = d; }
 
+  // --- I/O-reactivation flag (blocked-list bookkeeping) ---
+  // Set under GreenScheduler::react_mutex_ by ReactivateGreenThread (which may
+  // run on a libuv pool thread) and cleared under the same lock by the owning
+  // worker's DrainReactivations: a reactivation is a one-shot signal, so the
+  // flag dedups repeated I/O completions for a body still parked and prevents
+  // the same gt being enqueued twice into the runnable queue.
+  bool react_pending() const { return react_pending_; }
+  void set_react_pending(bool r) { react_pending_ = r; }
+
   // --- GC handshake (invariant I3) ---
   //
   // A stop-the-world GC is driven by a coordinator that release-stores
@@ -266,6 +276,10 @@ class GreenThread {
   // Resume callback for blocked thread wakeup.
   ResumeCallback resume_cb_;
   void* resume_data_;
+
+  // I/O-reactivation flag (guarded by GreenScheduler::react_mutex_). See the
+  // accessor comment above.
+  bool react_pending_ = false;
 
   // Handle scope (Phase 4 - for V8 API interactions).
   void* handle_scope_;

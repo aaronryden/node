@@ -7,7 +7,9 @@
 #include <sys/mman.h>
 
 #include <cstdlib>
+#include <deque>
 #include <pthread.h>
+#include <vector>
 
 #include "src/execution/green-processor.h"
 #include "src/execution/isolate.h"
@@ -32,6 +34,8 @@ GreenScheduler::GreenScheduler(Isolate* isolate)
       num_processors_(0),
       global_queue_head_(nullptr),
       global_queue_tail_(nullptr),
+      blocked_list_head_(nullptr),
+      stopping_(false),
       total_threads_created_(0),
       total_threads_completed_(0) {
   for (int i = 0; i < kMaxGreenProcessors; i++) {
@@ -69,6 +73,17 @@ void GreenScheduler::Shutdown() {
   // Clear global queue.
   global_queue_head_ = nullptr;
   global_queue_tail_ = nullptr;
+
+  // Clear the reactivation queue and wake a worker that may be parked waiting
+  // for a reactivation, so teardown / destruction never hangs.
+  {
+    std::lock_guard<std::mutex> lk(react_mutex_);
+    stopping_ = true;
+    react_queue_.clear();
+  }
+  react_cv_.notify_all();
+
+  blocked_list_head_ = nullptr;
 
   // Clear thread-local processor.
   g_processor_ = nullptr;
@@ -362,6 +377,116 @@ GreenThread* GreenScheduler::DequeueGlobal() {
   gt->set_state(GreenThreadState::kRunnable);
 
   return gt;
+}
+
+// --- Cooperative I/O block / reactivate ---
+//
+// Let a green body park on an external event (I/O) and free its OS worker for
+// other bodies. BlockGreenThread runs on the body's owning worker thread;
+// ReactivateGreenThread may run on a libuv pool thread, so the only cross-thread
+// hand-off is the mutex-protected react_queue_ + react_cv_. The blocked list and
+// the global runnable queue stay worker-only, so no two threads mutate them.
+
+void GreenScheduler::BlockGreenThread(GreenThread* gt) {
+  std::lock_guard<std::mutex> lk(react_mutex_);
+  // Stamp the body's architectural registers so a GC root visit during the
+  // parked window sees its live state (mirrors the register save in Yield).
+  // No-op for a green-async descriptor (processor()==0): it holds no arch stack,
+  // and the drive holds AlwaysAllocate so no collection parks against it.
+  GreenProcessor* p = gt->processor();
+  if (p != nullptr) {
+    green_thread_save_registers_arm64(gt->regs());
+  }
+  gt->set_register_mask(kGreenRegMaskRoot | kGreenRegMaskCage |
+                        kGreenRegMaskBytecode | kGreenRegMaskDispatch);
+  // Reset the reactivation gate so the next I/O completion can wake this body
+  // again. Guarded here too (not just by the owning worker) because a single
+  // shared scheduler serves every drive worker, so Block can run on any of them.
+  gt->set_react_pending(false);
+  gt->set_state(GreenThreadState::kBlocked);
+  // Head-insert into the (now mutex-guarded) blocked list.
+  gt->set_blocked_next(blocked_list_head_);
+  gt->set_blocked_prev(nullptr);
+  if (blocked_list_head_ != nullptr) {
+    blocked_list_head_->set_blocked_prev(gt);
+  }
+  blocked_list_head_ = gt;
+}
+
+void GreenScheduler::ReactivateGreenThread(GreenThread* gt) {
+  std::lock_guard<std::mutex> lk(react_mutex_);
+  // Skip if the body was already scheduled for reactivation, or if the scheduler
+  // is tearing down -- a completion racing Shutdown must not resurrect a worker.
+  if (gt->react_pending() || stopping_) return;
+  gt->set_react_pending(true);
+  react_queue_.push_back(gt);
+  react_cv_.notify_all();
+}
+
+// Move every reactivated body from the blocked list into the global runnable
+// queue. Worker thread only. Returns true if at least one body was reactivated.
+bool GreenScheduler::DrainReactivations() {
+  std::vector<GreenThread*> reactivated;
+  {
+    std::lock_guard<std::mutex> lk(react_mutex_);
+    while (!react_queue_.empty()) {
+      GreenThread* r = react_queue_.front();
+      react_queue_.pop_front();
+      r->set_react_pending(false);  // gate so Reactivate cannot re-add it
+      reactivated.push_back(r);
+    }
+  }
+  for (GreenThread* r : reactivated) {
+    // Unlink from the (mutex-guarded) blocked list. Track the previous node
+    // explicitly (blocked_next() returns by value, so we cannot take the
+    // address of the link slot); set_blocked_next is the muting accessor.
+    GreenThread* prev = nullptr;
+    GreenThread* node = blocked_list_head_;
+    while (node != nullptr && node != r) {
+      prev = node;
+      node = node->blocked_next();
+    }
+    if (node == r) {
+      GreenThread* nx = r->blocked_next();
+      if (prev == nullptr) blocked_list_head_ = nx;
+      else prev->set_blocked_next(nx);
+      if (nx != nullptr) nx->set_blocked_prev(prev);
+    }
+    r->set_blocked_next(nullptr);
+    r->set_blocked_prev(nullptr);
+    r->set_state(GreenThreadState::kRunnable);
+    EnqueueGlobal(r);
+  }
+  return !reactivated.empty();
+}
+
+// Park the worker until `pred` becomes true (an I/O this worker OWNS has
+// completed) or the scheduler is stopping. The worker does not spin here -- that
+// is what frees the core while its bodies are blocked on I/O.
+//
+// We wait on a per-worker predicate rather than the shared react_queue_: under a
+// single drive scheduler, ReactivateGreenThread's notify_all wakes EVERY parked
+// worker, and DrainReactivations (run at the top of each worker's loop) drains the
+// shared queue, so another worker can pop-and-clear THIS worker's reactivation
+// before its owner wakes. The owner then re-parks on an empty queue, while its own
+// body still has a completed read it can no longer be signalled to drain -- a
+// deadlock. A predicate that checks THIS worker's own finished reads is steal-proof:
+// the completion's effect is always visible to the owner regardless of who drained
+// the shared queue. Evaluated under react_mutex_ (as all cv.wait predicates are),
+// it must touch only the worker's own state -- no other lock, no cross-thread
+// queue. Reactivate still supplies the notify_all that wakes the parked worker to
+// re-check; the predicate decides whether it actually returns.
+void GreenScheduler::WaitForReactivationWithPred(const std::function<bool()>& pred) {
+  std::unique_lock<std::mutex> lk(react_mutex_);
+  react_cv_.wait(lk, [&] { return stopping_ || pred(); });
+}
+
+int64_t GreenScheduler::blocked_count() const {
+  int64_t count = 0;
+  for (GreenThread* t = blocked_list_head_; t != nullptr; t = t->blocked_next()) {
+    count++;
+  }
+  return count;
 }
 
 }  // namespace internal

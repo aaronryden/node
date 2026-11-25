@@ -283,14 +283,15 @@ struct GreenCallData {
   // driving the green isolate's microtask queue (RunMicrotasks), with external
   // triggers (timers / I/O) progressed by running the embedding libuv loop.
   // The scheduler/pool only ever drives SYNC bodies, so green-async bodies
-  // (async_green) are given no green thread and are driven directly here.
-  // A green-async body (Option C): an async function whose body runs on the
-  // GREEN isolate, so its control flow and compute stay green and `await`
-  // cooperatively parks it (its continuation lives in the async closure while
-  // fn->Call has returned a pending promise). The scheduler/pool only ever
-  // drives SYNC bodies; green-async bodies are parked and resumed directly by
-  // the RunTasks drive loop below. `awaiting` stays true so the pool never
-  // creates a green thread / COW view for one.
+  // (async_green) are driven directly here. A green-async body (Option C): an
+  // async function whose body runs on the GREEN isolate, so its control flow and
+  // compute stay green and `await` cooperatively parks it (its continuation lives
+  // in the async closure while fn->Call has returned a pending promise). It holds
+  // a bare GreenThread* descriptor (created in SetupAndRunGreenAsyncBody) used
+  // ONLY by the cooperative block/resume primitives to free the OS core while
+  // parked on I/O -- NOT a runnable green thread and no COW view. `awaiting`
+  // stays true so the pool never creates a runnable green thread / COW view for
+  // one and the sync teardown loop skips it.
   bool async_green = false;
   // Rooted on data->isolate (the green isolate): the body's pending promise,
   // held from fn->Call until the drive phase settles it.
@@ -374,6 +375,17 @@ static thread_local bool g_in_green_body = false;
 // around that body's continuations; thread-local so distinct workers never
 // clobber each other's target.
 static thread_local GreenCallData* g_green_driving_body = nullptr;
+
+// Process-global pointer to the ONE shared GreenScheduler that drives the
+// green-async body pool (created by RunTasks and live for the whole spawnAll).
+// A green-async body's gtRead submits its read against this scheduler and its
+// completion (a libuv pool thread) reactivates the body through it, so the
+// drive worker can park until the I/O finishes. It is a plain (not thread-local)
+// global on purpose: the embedding setup thread, every spawned drive worker, and
+// GT_TRUE_PARALLEL's warm-up all read the same stable value for the run --
+// GreenIoExecute needs no global at all, since it reactivates via the per-read
+// owner pointer captured at submission.
+static vi::GreenScheduler* g_async_drive_scheduler = nullptr;
 
 static Isolate* GetGreenIsolate(Isolate* embedding) {
   if (g_green_isolate != nullptr) return g_green_isolate;
@@ -1155,13 +1167,27 @@ struct GreenIoWork {
   std::string path;
   std::string encoding;
   Persistent<Promise::Resolver> green_resolver_p;  // resolved by the owning worker
+  // Owner the moment this read finishes: the body's GreenThread* + the shared
+  // async-drive scheduler it reactivates. GreenIoExecute (a libuv pool thread)
+  // calls owner_sched->ReactivateGreenThread(owner_gt) here -- not in the
+  // owning worker -- so the worker wakes the instant I/O completes instead of
+  // polling. Null for the non-owned fallback path (never used for a real body).
+  vi::GreenThread* owner_gt = nullptr;
+  vi::GreenScheduler* owner_sched = nullptr;
   // Ownership + completion flags. `owned` is set when GreenGtRead hands the read
   // to the body's owning worker (data->pending_reads); a non-owned read is
   // resolved + freed here on GreenIoComplete (a fallback, unreachable for a real
   // async body). `finished` is set (release) by GreenIoExecute once buf/err are
   // valid, so the owning worker that reads it (acquire) observes a stable result.
+  // `consumed` is set (release) by the owning driver AFTER it has resolved the
+  // promise and copied buf into its own storage -- it gates GreenIoComplete, the
+  // race-free free point (the libuv after-callback, which runs strictly after
+  // the pool worker's post-execute bookkeeping). Until consumed, a completion
+  // pumped before the driver drained it must not free w (the driver still needs
+  // w to resolve).
   bool owned = false;
   std::atomic<bool> finished{false};
+  std::atomic<bool> consumed{false};
   char* buf = nullptr;
   size_t len = 0;
   int err = 0;
@@ -1169,13 +1195,21 @@ struct GreenIoWork {
 
 static void GreenIoExecute(uv_work_t* req) {
   GreenIoWork* w = reinterpret_cast<GreenIoWork*>(req);
+  // Wake the owning body's drive worker now that this read has a terminal result
+  // (success OR failure). Must run after finished.store(true) above (or just
+  // before, below) so the worker's acquire observes a stable buf/err. Guarded:
+  // the non-owned fallback path never binds an owner.
+  auto reactivate = [](GreenIoWork* w) {
+    if (w->owner_gt != nullptr && w->owner_sched != nullptr)
+      w->owner_sched->ReactivateGreenThread(w->owner_gt);
+  };
   int fd = ::open(w->path.c_str(), O_RDONLY);
-  if (fd < 0) { w->err = errno; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
+  if (fd < 0) { w->err = errno; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); reactivate(w); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
   long sz = 0;
   struct stat st;
   if (::fstat(fd, &st) == 0) sz = st.st_size;
   char* buf = static_cast<char*>(::malloc(sz > 0 ? sz : 1));
-  if (buf == nullptr) { ::close(fd); w->err = ENOMEM; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
+  if (buf == nullptr) { ::close(fd); w->err = ENOMEM; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); reactivate(w); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
   size_t off = 0;
   ssize_t r;
   while (off < static_cast<size_t>(sz) &&
@@ -1186,17 +1220,29 @@ static void GreenIoExecute(uv_work_t* req) {
   w->len = off;
   w->err = 0;
   w->finished.store(true, std::memory_order_release);
+  reactivate(w);
   g_green_io_active.fetch_sub(1, std::memory_order_relaxed);
 }
 
 static void GreenIoComplete(uv_work_t* req, int status) {
   GreenIoWork* w = reinterpret_cast<GreenIoWork*>(req);
   if (w->owned) {
-    // The owning worker owns resolution + freeing (it resolves into the body's
-    // OWN queue, same thread that later checkpoints it -- the lock-free
-    // MicrotaskQueue must never see a concurrent enqueue from here and drain
-    // from a worker). The driver never pumps this loop for owned reads, so the
-    // worker frees w; GreenIoComplete only touches w when it is non-owned.
+    // The owning driver resolves the promise (into its own microtask queue --
+    // same thread that checkpoints it) and owns buf; it copies buf before it
+    // sets consumed. Free here, in the libuv after-callback, which runs only
+    // AFTER the pool worker finished all post-execute bookkeeping on this req
+    // (moving w->wq into the loop, uv_async_send). Freeing w from the driver
+    // raced with that pool reference (SIGSEGV worker(arg=0x0) on the pool).
+    // Defer the free until consumed so a completion pumped before its driver
+    // drained it does not free a read the driver still has to resolve.
+    if (!w->consumed.load(std::memory_order_acquire)) return;
+    {
+      v8::Isolate::Scope iso_scope(g_green_isolate);
+      v8::HandleScope hs(g_green_isolate);
+      w->green_resolver_p.Reset();
+    }
+    ::free(w->buf);
+    delete w;
     return;
   }
   // Non-owned fallback (unreachable for a real green-async body -- the setup and
@@ -1250,6 +1296,17 @@ static void GreenGtRead(const FunctionCallbackInfo<Value>& args) {
   }
   g_green_io_active.fetch_add(1, std::memory_order_relaxed);
   w->green_resolver_p.Reset(green, res);
+  // Bind this read to its owning body + the shared async-drive scheduler so
+  // GreenIoExecute (a libuv pool thread) can reactivate the body the instant
+  // the read finishes -- the body does not run on this pool thread, it runs on
+  // a drive worker that parks until the Reactivate wakes it. g_green_driving_body
+  // is set by the setup thread (first read) and by each drive worker (later
+  // continuations); g_async_drive_scheduler is set by RunTasks for the whole run.
+  if (g_green_driving_body != nullptr) {
+    w->owned = true;
+    w->owner_gt = g_green_driving_body->gt;
+    w->owner_sched = g_async_drive_scheduler;
+  }
   uv_queue_work(GreenIOLoop(), &w->req, GreenIoExecute, GreenIoComplete);
   if (g_green_driving_body != nullptr) {
     // Hand the read to the body's OWN drive worker: it owns both the resolution
@@ -1257,7 +1314,6 @@ static void GreenGtRead(const FunctionCallbackInfo<Value>& args) {
     // the lock-free MicrotaskQueue never sees a concurrent enqueue here and a
     // drain elsewhere) and the freeing. w->owned stays false for the fallback
     // path, where GreenIoComplete resolves + frees it.
-    w->owned = true;
     g_green_driving_body->pending_reads.push_back(
         std::unique_ptr<GreenIoWork>(w));
   }
@@ -1306,6 +1362,13 @@ static GreenCallData* SetupAndRunGreenAsyncBody(Isolate* emb, Local<Context> emb
   data->caller_isolate = emb;
   data->isolate = green;
   data->fn_isolate = green;
+
+  // A GreenThread* descriptor for cooperative I/O block/resume. It is NOT run by
+  // the scheduler (async bodies are driven directly here) and holds no arch stack
+  // or COW view -- it only carries the kBlocked state + reactivation flag that
+  // the async-drive parks against. Created here, before the first gtRead below,
+  // so the read (and thus this body's completion Reactivate) can target it.
+  data->gt = new vi::GreenThread(reinterpret_cast<vi::Isolate*>(green));
 
   // Create THIS body's own green context + microtask queue. Each green-async
   // body gets a private context (not the shared g_green_ctx) so a per-worker
@@ -1480,9 +1543,14 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
   // guard for the all-async case where no window was armed in the mixed path.
   GreenGCPause gc(green);
 
-  // Async bodies (async_green) hold no green thread; they are driven directly
-  // here. Sync bodies (awaiting) are driven by the pool and have no reads/queue
-  // to drive.
+  // Async bodies (async_green) are driven directly here (never through the
+  // scheduler's RunGreenThread). Each holds a bare GreenThread* descriptor
+  // (created in SetupAndRunGreenAsyncBody) that the cooperative block/resume
+  // uses to free the OS core while the body is parked on I/O -- the descriptor
+  // is NOT a runnable green thread; its continuations run in this drive loop,
+  // blocked via GreenScheduler::BlockGreenThread and woken via
+  // ReactivateGreenThread. Sync bodies (awaiting) are driven by the pool and
+  // have no reads/queue to drive.
   std::vector<GreenCallData*> async_bodies;
   async_bodies.reserve(datas.size());
   for (GreenCallData* d : datas)
@@ -1513,8 +1581,25 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
     // which is what makes the CoW barrier a no-op for async-allocated objects.
     v8::Isolate::Scope iso_scope(green);
     v8::HandleScope handle_scope(green);
+    // Shared async-drive scheduler (created in RunTasks, alive for this run).
+    // Every drive worker blocks against and is reactivated through this ONE
+    // coordinator, so a read submitted during setup -- before any worker existed
+    // -- still has a valid scheduler to Reactivate against on completion.
+    vi::GreenScheduler* sched = g_async_drive_scheduler;
     int idle = 0;
     for (;;) {
+      // Consume Reactivate signals that arrived while we were parked or working,
+      // BEFORE re-testing the predicate and re-parking -- otherwise a leftover
+      // entry would keep this worker awake. ReactivateGreenThread sets the body's
+      // react_pending flag before pushing to the shared react_queue_, so draining
+      // here resets that flag (Reactivate skips an already-pending body) and keeps
+      // the queue from growing unbounded: without it a body's SECOND read could
+      // never be reactivated. This is the standard condition-variable contract --
+      // drain the wakeners, then re-check the predicate. Drain is a no-op when the
+      // queue is empty (the common per-iteration case) and is race-safe: it only
+      // clears react_pending / unlinks blocked bodies; THIS worker's own readiness
+      // is decided by the finished-read predicate below, not this queue.
+      if (sched != nullptr) sched->DrainReactivations();
       bool all_settled = true;
       bool progressed = false;
       for (GreenCallData* d : bodies) {
@@ -1536,43 +1621,64 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
         // microtask path made worker-safe (a separate co-design).
         std::lock_guard<std::mutex> mutator_lock(g_green_mutator_lock);
 
-        // Resolve every finished gtRead for this body into ITS OWN queue. The
-        // resolve runs with the body's context current so the awaited
-        // continuation enqueues into body_mq_p (the lock-free queue we check
-        // point below on this same thread) rather than a shared queue.
+        // Take ownership of this thread's driving slot for the whole iteration.
+        // A finished read's resolve may RESUME the body's continuation inline
+        // (its awaited reaction runs during res->Resolve); that continuation's
+        // next gtRead must then route into THIS body's pending_reads and Reactivate
+        // THIS body's gt. g_green_driving_body is per-OS-thread thread_local, and
+        // the value the setup thread stashed is invisible on this worker, so pin it
+        // to d here and restore it after PerformCheckpoint below.
+        GreenCallData* const prior_driving = g_green_driving_body;
+        g_green_driving_body = d;
+
+        // Drain FINISHED gtReads OUT of pending_reads BEFORE resolving them.
+        // Resolving a finished read may inline-resume the body, which then pushes
+        // its next read into pending_reads -- mutating the vector we would be
+        // iterating, so empty the finished ones first. pending_reads then holds
+        // only unfinished reads (possibly empty). `finished` holds raw pointers:
+        // GreenIoComplete (the libuv after-callback) owns freeing them, so the
+        // vector must not delete -- a double free would otherwise follow.
         std::vector<std::unique_ptr<GreenIoWork>> still;
+        std::vector<GreenIoWork*> finished;
         still.reserve(d->pending_reads.size());
         for (auto& rd : d->pending_reads) {
-          if (rd->finished.load(std::memory_order_acquire)) {
-            v8::Local<v8::Context> bctx =
-                v8::Local<v8::Context>::New(green, d->context_p);
-            {
-              v8::Context::Scope ctx_scope(bctx);
-              v8::Local<v8::Promise::Resolver> res =
-                  v8::Local<v8::Promise::Resolver>::New(green, rd->green_resolver_p);
-              if (rd->err != 0) {
-                std::string msg =
-                    std::string("green_threads gtRead: ") +
-                    std::string(strerror(rd->err));
-                res->Reject(bctx, v8::Exception::Error(
-                    v8::String::NewFromUtf8(green, msg.c_str(),
-                                            v8::NewStringType::kNormal)
-                                                .ToLocalChecked()));
-              } else {
-                std::string contents(rd->buf, rd->len);
-                res->Resolve(bctx, v8::String::NewFromUtf8(
-                    green, contents.c_str(), v8::NewStringType::kNormal)
-                                        .ToLocalChecked());
-              }
-            }
-            ::free(rd->buf);
-            delete rd.release();  // owned read: the driver owns its lifetime now
-            progressed = true;
-          } else {
+          if (rd->finished.load(std::memory_order_acquire))
+            finished.push_back(rd.release());
+          else
             still.push_back(std::move(rd));
-          }
         }
         d->pending_reads.swap(still);
+
+        // Resolve the finished reads. Resolve runs with the body's own context
+        // current so the awaited reaction enqueues into THIS body's queue. A
+        // synchronous resume here pushes the next read into the just-drained
+        // pending_reads; we iterate the local `finished` vector, not pending_reads,
+        // so that re-entry is safe.
+        for (auto& rd : finished) {
+          v8::Local<v8::Context> bctx =
+              v8::Local<v8::Context>::New(green, d->context_p);
+          {
+            v8::Context::Scope ctx_scope(bctx);
+            v8::Local<v8::Promise::Resolver> res =
+                v8::Local<v8::Promise::Resolver>::New(green, rd->green_resolver_p);
+            if (rd->err != 0) {
+              std::string msg =
+                  std::string("green_threads gtRead: ") +
+                  std::string(strerror(rd->err));
+              res->Reject(bctx, v8::Exception::Error(
+                  v8::String::NewFromUtf8(green, msg.c_str(),
+                                          v8::NewStringType::kNormal)
+                                              .ToLocalChecked()));
+            } else {
+              std::string contents(rd->buf, rd->len);
+              res->Resolve(bctx, v8::String::NewFromUtf8(
+                  green, contents.c_str(), v8::NewStringType::kNormal)
+                                      .ToLocalChecked());
+            }
+          }
+          rd->consumed.store(true, std::memory_order_release);
+          progressed = true;
+        }
 
         // Resume continuations now enqueued in THIS body's own queue and run
         // them under the SAME lock. The microtask execution (PerformCheckpoint)
@@ -1585,9 +1691,15 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
         // serialization.
         v8::Local<v8::Context> bctx2 =
             v8::Local<v8::Context>::New(green, d->context_p);
-        GreenCallData* const prior_driving = g_green_driving_body;
-        g_green_driving_body = d;  // static thread_local: per-OS-thread
         bctx2->GetMicrotaskQueue()->PerformCheckpoint(green);
+        // Drain libuv completion callbacks so each finished read's GreenIoWork is
+        // freed at its race-free after-callback point (see GreenIoComplete). The
+        // pool worker still references w until it queues the completion; GreenIoComplete
+        // runs only then -- on this drive-worker thread -- so freeing is race-free.
+        // Pumped non-blocking (UV_RUN_NOWAIT) and under g_green_mutator_lock:
+        // GreenIOLoop is a single shared loop that libuv only tolerates one uv_run()
+        // caller at a time.
+        uv_run(GreenIOLoop(), UV_RUN_NOWAIT);
         g_green_driving_body = prior_driving;
 
         // Mark settled once the body promise leaves kPending; its reaction then
@@ -1602,10 +1714,45 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
       }
       if (all_settled) break;
       if (++idle > max_idle) return false;
-      // No read was resolvable this pass: the libuv pool threads progress the
-      // outstanding reads independently, so wait briefly instead of busy-spinning.
-      if (!progressed)
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      // No read was resolvable and nothing advanced this pass: every remaining
+      // body is parked on an in-flight I/O. Cooperatively block each body
+      // (stamping kBlocked so the OS core is freed) and park THIS worker until a
+      // libuv pool thread reactivates one of them -- replacing the old
+      // sleep_for(50us)/max_idle busy-poll that burned a core per parked body.
+      // Reactivate fires from GreenIoExecute (after finished.store(true)), so the
+      // worker wakes the instant an I/O finishes rather than every 50us.
+      if (!progressed) {
+        bool any_starved = false;
+        for (GreenCallData* d : bodies) {
+          if (d->async_settled) continue;
+          // A body with no outstanding read cannot be reactivated (nothing will
+          // call Reactivate for it); block only bodies parked on real I/O, so a
+          // genuinely starved body keeps the idle counter spinning to the safety
+          // bound instead of parking on a CV that never fires.
+          if (d->pending_reads.empty()) { any_starved = true; continue; }
+          if (d->gt != nullptr && sched != nullptr)
+            sched->BlockGreenThread(d->gt);
+        }
+        // Park only when every parked body has an outstanding read whose
+        // completion will Reactivate it -- otherwise never block and let the
+        // idle counter bound the run. Park on a predicate that checks THIS
+        // worker's OWN finished reads, not the shared react_queue_: under the
+        // single drive scheduler another worker may DrainReactivations and clear
+        // this worker's reactivation, stranding it in the predicate wait forever
+        // while its own completed read never drains. A read's finished flag is set
+        // (before Reactivate) and stays visible to its owner, so this predicate is
+        // steal-proof and still frees the core.
+        auto park_pred = [&] {
+          for (GreenCallData* d : bodies) {
+            if (d->async_settled) continue;
+            for (auto& rd : d->pending_reads)
+              if (rd->finished.load(std::memory_order_acquire)) return true;
+          }
+          return false;
+        };
+        if (!any_starved && sched != nullptr)
+          sched->WaitForReactivationWithPred(park_pred);
+      }
     }
   };
 
@@ -2125,6 +2272,12 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       EnsureGreenContext(isolate, ctx);
     }
 
+    // The shared green-async drive reactivates bodies through this scheduler.
+    // It must exist before any SetupAndRunGreenAsyncBody runs -- a body's first
+    // gtRead is submitted during setup and binds this scheduler as its Reactivate
+    // target. Live for the whole RunTasks; destroyed once the drive completes.
+    g_async_drive_scheduler = new vi::GreenScheduler(vi_isolate_for_gt);
+
     GreenValueCopier args_copier;
     args_copier.src = isolate;
     args_copier.dst = green_isolate_ret;
@@ -2212,11 +2365,13 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   for (GreenCallData* data : datas) data->round = round;
 
   // Create a green thread for each SYNC body only. Async bodies (data->awaiting)
-  // hold no green thread -- in serial mode they run on the embedding isolate via
-  // SetupAndRunAsyncBody; in shared-heap mode they run GREEN via
-  // SetupAndRunGreenAsyncBody and are driven by the async drive loop below.
-  // Gating CreateGreenThread on !awaiting keeps g_gt_registry, the worker pool,
-  // and the teardown loop below green-only.
+  // hold no RUNNABLE green thread -- in serial mode they run on the embedding
+  // isolate via SetupAndRunAsyncBody; in shared-heap mode they run GREEN via
+  // SetupAndRunGreenAsyncBody and are driven by the async drive loop below. They
+  // DO hold a bare GreenThread* descriptor (created in SetupAndRunGreenAsyncBody)
+  // used only for cooperative block/resume, never scheduled by this pool. Gating
+  // CreateGreenThread on !awaiting keeps g_gt_registry, the worker pool, and the
+  // teardown loop below green-only.
   std::vector<vi::GreenThread*> gts;
   gts.reserve(datas.size());
   for (GreenCallData* data : datas) {
@@ -2347,6 +2502,16 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     vi::GreenThreadCow::SetConcurrentCompilationSuspended(true);
     DriveGreenAsyncBodiesParallel(green_isolate_ret, datas);
     vi::GreenThreadCow::SetConcurrentCompilationSuspended(false);
+  }
+
+  // The drive owns all Reactivate targets; once it returns every body has
+  // settled (no outstanding reads, no libuv pool thread will Reactivate again).
+  // Tear the shared scheduler down so a late Reactivate (if any) hits stopping_
+  // rather than a freed object, matching Shutdown's guard elsewhere.
+  if (has_async && g_async_drive_scheduler != nullptr) {
+    g_async_drive_scheduler->Shutdown();
+    delete g_async_drive_scheduler;
+    g_async_drive_scheduler = nullptr;
   }
 
   vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(working_isolate), false);
@@ -2530,13 +2695,15 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     delete data;
   }
 
-  // Teardown green-async bodies. They hold no green thread (the pool never
-  // created one for them): the green settle reaction (GreenGreenCaptureSettle)
-  // only captured the body's settle value on the green heap; RunTasks copied it
-  // into the embedding caller resolver in the results loop above. So dispose the
-  // green body promise, the captured settle value, the embedding caller
-  // resolvers, and the copied green args/fn here. This runs after results
-  // gathered the (now settled) caller Promises above.
+  // Teardown green-async bodies. The pool never created a RUNNABLE green thread
+  // for them -- only a bare GreenThread* descriptor (created in
+  // SetupAndRunGreenAsyncBody, freed below) used for cooperative block/resume.
+  // The green settle reaction (GreenGreenCaptureSettle) only captured the body's
+  // settle value on the green heap; RunTasks copied it into the embedding caller
+  // resolver in the results loop above. So dispose the green body promise, the
+  // captured settle value, the embedding caller resolvers, the bare descriptor,
+  // and the copied green args/fn here. This runs after results gathered the
+  // (now settled) caller Promises above.
   for (GreenCallData* data : datas) {
     if (!data->async_green) continue;
     data->async_promise_p.Reset();
@@ -2545,6 +2712,13 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     data->caller_ctx_p.Reset();
     data->args_p.clear();
     data->fn_p.Reset();
+    // The pool never ran this descriptor through RunGreenThread/COW, so it needs
+    // no GreenThreadCow::Teardown -- just free the bare GreenThread* created in
+    // SetupAndRunGreenAsyncBody (its destructor is a no-op: no stack, no COW view).
+    if (data->gt != nullptr) {
+      delete data->gt;
+      data->gt = nullptr;
+    }
     delete data;
   }
 
