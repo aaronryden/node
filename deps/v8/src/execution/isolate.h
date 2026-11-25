@@ -32,6 +32,9 @@
 #include "src/execution/execution.h"
 #include "src/execution/futex-emulation.h"
 #include "src/execution/isolate-data.h"
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+#include "src/execution/execution-state.h"
+#endif
 #include "src/execution/messages.h"
 #include "src/execution/mutex-guard-if-off-thread.h"
 #include "src/execution/stack-guard.h"
@@ -103,6 +106,16 @@ class AsyncEventDelegate;
 
 namespace internal {
 
+// THIS OS thread's routed HandleScopeImplementer: the per-worker impl under
+// green multi-worker drives (SetIsolateHandleScopePerWorker on), the shared
+// impl otherwise. Native microtask EnterContext / RewindEnteredContext
+// builtins call this (not the cached shared-impl address) so they balance on
+// the same entered_contexts_ stack that C++ HandleScope / Context::Enter use.
+#ifdef V8_ENABLE_GREEN_THREADS
+HandleScopeImplementer* CurrentHandleScopeImplementer();
+#endif
+
+
 void DefaultWasmAsyncResolvePromiseCallback(
     v8::Isolate* isolate, v8::Local<v8::Context> context,
     v8::Local<v8::Promise::Resolver> resolver,
@@ -152,6 +165,7 @@ class PersistentHandlesList;
 class ReadOnlyArtifacts;
 class RegExpStack;
 class RootVisitor;
+class GreenThread;
 class SetupIsolateDelegate;
 class SharedStructTypeRegistry;
 class Simulator;
@@ -603,6 +617,22 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       return isolate_ == isolate && thread_id_ == thread_id;
     }
 
+    // Worker-local current-GT accessor (M2 multi-mutator entry). Green-thread
+    // isolates run several OS workers at once; stored per worker in
+    // PerIsolateThreadData so concurrent mutators keep separate CoW
+    // attribution. Non-green isolates use the g_current_green_thread_ fallback
+    // in green-thread.cc and never touch this slot.
+    GreenThread* current_green_thread() const { return current_green_thread_; }
+    void set_current_green_thread(GreenThread* gt) { current_green_thread_ = gt; }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Per-worker HandleScopeImplementer (handle-scope phase). Null off-green;
+    // the single shared IsolateData HandleScopeImplementer serves non-green
+    // isolates. Routing in Isolate::handle_scope_(data|implementer) selects it.
+    HandleScopeImplementer* handle_scope_impl() const {
+      return handle_scope_impl_;
+    }
+#endif
    private:
     Isolate* isolate_;
     ThreadId thread_id_;
@@ -611,6 +641,56 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
 #if USE_SIMULATOR
     Simulator* simulator_;
+#endif
+
+    // Head of this thread's EntryStackItem chain for a green-thread isolate.
+    // Green-thread isolates run with several OS worker threads active at once,
+    // and PerIsolateThreadData is keyed per-OS-thread, so each worker owns its
+    // own chain here: a worker's Exit() can never pop or free a sibling worker's
+    // item. Non-green isolates keep the shared Isolate::entry_stack_ path and
+    // never touch this slot. It is the last member so adding it never shifts an
+    // existing PerIsolateThreadData field's offset.
+    EntryStackItem* entry_stack_ = nullptr;
+
+    // Current green thread attributed to THIS OS worker for THIS isolate.
+    //
+    // Multi-mutator entry (M2): green-thread isolates run with several OS
+    // worker threads active at once, and PerIsolateThreadData is keyed per-OS-
+    // thread, so storing the current GT here (per worker) keeps each worker's
+    // CoW attribution separate instead of a single process-global slot that a
+    // concurrent worker would clobber. Gated on green_thread_mode_ in the
+    // accessors (green-thread.cc), so non-green isolates keep using the shared
+    // g_current_green_thread_ path unchanged. Last member -> never shifts an
+    // existing PerIsolateThreadData field's offset.
+    GreenThread* current_green_thread_ = nullptr;
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Per-worker execution-state block (phase ii). Green-thread isolates run
+    // several OS workers concurrently inside one isolate, and PerIsolateThreadData
+    // is keyed per-OS-thread, so each worker gets its own ExecutionState (which
+    // embeds a ThreadLocalTop at offset 0, &es == &top). This holds the fields
+    // that previously collided between simultaneously-running workers on the
+    // shared ThreadLocalTop (context / exception / handler / c_entry_fp /
+    // js_entry_sp / pending-message). x25 is armed to this block in
+    // InitializeExecutionStateRegister and the runtime accessors
+    // (thread_local_top / execution_state) route here under green_thread_mode_,
+    // keyed by (this isolate, current OS thread) so they stay stable across the
+    // cross-isolate CurrentPerIsolateThreadData() shifts. Handle scopes are made
+    // per-worker below (the "handle-scope phase", see Isolate::handle_scope_data)
+    // so N bodies on N OS workers each own their own handle stack instead of
+    // colliding on the shared IsolateData singleton.
+    // Never serialized; added last so an existing
+    // PerIsolateThreadData field's offset never shifts.
+    ExecutionState execution_state_;
+
+    // Per-worker HandleScopeImplementer (handle-scope phase). One instance per
+    // (isolate, OS-thread); it owns THIS worker's handle blocks_ / entered-
+    // contexts / cursor, replacing the shared IsolateData singleton under
+    // green_thread_mode_. Constructed only for green-thread isolates (guarded in
+    // FindOrAllocatePerThreadDataForThisThread); non-green PTDs keep it null and
+    // never route through it. Last member so an existing PerIsolateThreadData
+    // field's offset never shifts.
+    HandleScopeImplementer* handle_scope_impl_ = nullptr;
 #endif
 
     friend class Isolate;
@@ -799,6 +879,35 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   inline ThreadId thread_id() const {
     return thread_local_top()->thread_id_.load(std::memory_order_relaxed);
   }
+
+  // Green-thread isolates allow multiple OS worker threads to Enter/Exit the
+  // same isolate concurrently. The embedder sets this once, right after the
+  // isolate is created.
+  void set_green_thread_mode(bool mode) {
+    green_thread_mode_ = mode;
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Mirror into IsolateData so generated JS-entry code (which only has the
+    // root register, pointing into IsolateData) can read green mode embeddably
+    // and arm the execution-state register (x25) to this worker's block.
+    isolate_data_.execution_mode_.set(IsolateExecutionModeFlag::kIsGreenThread,
+                                      mode);
+#endif
+  }
+  bool is_green_thread_mode() const { return green_thread_mode_; }
+
+  // Handle-scope phase routing gate. When true, isolate->handle_scope_data()
+  // and handle_scope_implementer() route to THIS OS worker's per-thread
+  // HandleScopeImplementer, so concurrent bodies on separate OS workers each own
+  // their own handle cursor / blocks / entered-context stack. The embedder sets
+  // it true ONLY around multi-worker body dispatch (RunTasks and M2Probe worker
+  // pools) and clears it after the workers join, so the single-threaded
+  // cross-isolate setup sequence (EnsureGreenContext -> Context::New,
+  // RelocateFunction, warmup) keeps the shared IsolateData singleton exactly as
+  // before the handle-scope phase. Without this gate the setup sequence would
+  // route its cursors to per-worker impls allocated mid-sequence, leaving an
+  // empty cursor and aborting with "Cannot create a handle without a HandleScope".
+  void set_handle_scope_per_worker(bool on) { handle_scope_per_worker_ = on; }
+  bool handle_scope_per_worker() const { return handle_scope_per_worker_; }
 
   void InstallConditionalFeatures(DirectHandle<NativeContext> context);
 
@@ -1110,6 +1219,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   char* Iterate(RootVisitor* v, char* t);
   void IterateThread(ThreadVisitor* v, char* t);
 
+  // Roots the handle blocks / entered-contexts. Non-green iterates the single
+  // shared HandleScopeImplementer; green (per-worker handle state) iterates
+  // every live thread's impl so all concurrently-running bodies' handles are
+  // rooted (see ThreadDataTable::Iterate).
+  void IterateHandleRoots(RootVisitor* v);
+
   // Returns the current native context.
   inline Handle<NativeContext> native_context();
   inline Tagged<NativeContext> raw_native_context();
@@ -1322,11 +1437,54 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
   void InitializeThreadLocal();
   ThreadLocalTop* thread_local_top() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (PerIsolateThreadData* data = FindPerThreadDataForThisThread())
+        return &data->execution_state_.top;
+    }
+#endif
     return &isolate_data_.thread_local_top_;
   }
   ThreadLocalTop const* thread_local_top() const {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (const PerIsolateThreadData* data =
+            const_cast<Isolate*>(this)->FindPerThreadDataForThisThread())
+        return &data->execution_state_.top;
+    }
+#endif
     return &isolate_data_.thread_local_top_;
   }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Per-worker execution state (phase ii). Resolves THIS isolate's block for the
+  // current OS thread (keyed by `this`, stable across CurrentPerIsolateThreadData
+  // cross-isolate shifts); the &ExecutionState == &top invariant (member {top} at
+  // offset 0) makes es->field_address(id) == &top + FieldOffset(id), the same
+  // bytes generated code reaches through x25. Falls back to the shared
+  // ThreadLocalTop reinterpreted as ExecutionState off-green (serial, byte-identical
+  // to the thread_local_top() paths above).
+  ExecutionState* execution_state() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (PerIsolateThreadData* data = FindPerThreadDataForThisThread())
+        return &data->execution_state_;
+    }
+#endif
+    return reinterpret_cast<ExecutionState*>(&isolate_data_.thread_local_top_);
+  }
+  ExecutionState const* execution_state() const {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    if (green_thread_mode_) {
+      if (const PerIsolateThreadData* data =
+            const_cast<Isolate*>(this)->FindPerThreadDataForThisThread())
+        return reinterpret_cast<const ExecutionState*>(&data->execution_state_);
+    }
+#endif
+    return reinterpret_cast<const ExecutionState*>(
+        &isolate_data_.thread_local_top_);
+  }
+#endif
 
   constexpr static uint32_t context_offset() {
     return static_cast<uint32_t>(
@@ -1368,14 +1526,41 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return descriptor_lookup_cache_;
   }
 
-  V8_INLINE HandleScopeData* handle_scope_data() {
-    return &isolate_data_.handle_scope_data_;
-  }
+  HandleScopeData* handle_scope_data();
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Base of THIS OS worker's ExecutionState block (phase ii per-worker state).
+  // Read by generated code at JS entry to arm x25 in green mode; exposed as a
+  // runtime ExternalReference so the address is resolvable without the root array.
+  static ExecutionState* CurrentExecutionStateBase();
+#endif
 
   HandleScopeImplementer* handle_scope_implementer() const {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Handle-scope phase: under green multi-worker mode return THIS OS worker's
+    // HandleScopeImplementer (per-OS-thread in PerIsolateThreadData) so concurrent
+    // bodies own separate handle blocks / entered-context stacks. Keyed by
+    // (this isolate, current OS thread) like execution_state(); stable across the
+    // cross-isolate CurrentPerIsolateThreadData() shifts during green setup.
+    if (HandleScopeImplementer* impl =
+          const_cast<Isolate*>(this)->WorkerHandleScopeImpl())
+      return impl;
+#endif
     DCHECK(handle_scope_implementer_);
     return handle_scope_implementer_;
   }
+
+  // Handle-scope routing gate (handle-scope phase). Returns THIS OS worker's
+  // HandleScopeImplementer ONLY when a green body is actually executing on it --
+  // i.e. the worker PTD was allocated with green_thread_mode_ (non-null impl)
+  // AND its current_green_thread_ is set (a body is live here). This signal
+  // distinguishes live multi-worker body execution from the single-threaded
+  // cross-isolate green-context setup sequence (EnsureGreenContext -> Context::New
+  // on the embedding thread, no body running, current_green_thread_ null), where
+  // handle state must stay on the shared singleton/cursor exactly as before the
+  // handle-scope phase. When it returns null, callers fall back to the shared
+  // implementation; body and setup paths therefore never mix cursors and impls.
+  HandleScopeImplementer* WorkerHandleScopeImpl();
 
   UnicodeCache* unicode_cache() const { return unicode_cache_; }
 
@@ -1866,6 +2051,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   Address handle_scope_implementer_address() {
     return reinterpret_cast<Address>(&handle_scope_implementer_);
   }
+
 
   void SetReleaseCppHeapCallback(v8::Isolate::ReleaseCppHeapCallback callback);
 
@@ -2486,6 +2672,12 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     void Insert(PerIsolateThreadData* data);
     void Remove(PerIsolateThreadData* data);
     void RemoveAllThreads();
+    // Root every live thread's handle blocks / entered-contexts for GC. Under
+    // green multi-worker mode each OS worker owns its own HandleScopeImplementer
+    // (in this table), so the singleton Iterate() alone would miss them; this
+    // visits every live worker's handle state so GC roots handles held by all
+    // concurrently-running bodies, not just the GC thread's.
+    void Iterate(RootVisitor* v);
 
    private:
     struct Hasher {
@@ -2957,6 +3149,20 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif
 
   bool is_frozen_ = false;
+
+  // Set by the embedder on a green-thread isolate to allow several OS worker
+  // threads to Enter/Exit the same isolate at once. When true, Enter/Exit keep
+  // each worker's EntryStackItem chain on its per-OS-thread PerIsolateThreadData
+  // instead of the shared entry_stack_. Every other isolate leaves this false and
+  // keeps the original single-threaded entry path byte-for-byte unchanged.
+  //
+  // Placed last (after every other data member) so adding it never shifts an
+  // existing isolate member's offset.
+  bool green_thread_mode_ = false;
+
+  // Handle-scope phase gate (see set_handle_scope_per_worker). Also last so no
+  // existing member's offset shifts.
+  bool handle_scope_per_worker_ = false;
 
   friend class GlobalSafepoint;
   friend class heap::HeapTester;

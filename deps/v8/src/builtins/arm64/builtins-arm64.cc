@@ -685,6 +685,18 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
   __ Mov(x12, StackFrame::TypeToMarker(type));
   __ Push(x12, xzr);
 
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Arm the per-worker execution-state base register (x25) at JS entry, AFTER
+  // the entry frame (fp + type markers) is built so the green-mode runtime
+  // override call below runs over a valid unwind frame (a call before the frame
+  // is laid out leaves a spurious pending exception that aborts later API
+  // boundaries). The additive serial path stays embeddable (no call); the green
+  // path overrides x25 to THIS worker's ExecutionState block, matching
+  // Isolate::thread_local_top() under green_thread_mode_, else the shared
+  // ThreadLocalTop. x25 stays valid for every execution-field access below.
+  __ InitializeExecutionStateRegister();
+#endif
+
   // x10 = C entry FP.
   __ Ldr(x10, __ AsMemOperand(IsolateFieldId::kCEntryFP));
 
@@ -952,12 +964,24 @@ static void Generate_JSEntryTrampolineHelper(MacroAssembler* masm,
     __ Mov(x22, x19);
     __ Mov(x23, x19);
     __ Mov(x24, x19);
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // x25 is the reserved per-worker execution-state base register
+    // (kExecutionStateRegister, &thread_local_top_ on the serial path). It is
+    // not a JS callee-save scratch register, so it must not be reseeded to
+    // undefined: doing so would destroy the exec-state base that generated code
+    // reads execution fields through (AsMemOperand / LoadExecutionField). It
+    // addresses a cage-outside base the conservative GC scanner rejects (like
+    // kRootRegister/x26), so leaving it alone is GC-safe.
+#else
     __ Mov(x25, x19);
+#endif
 #ifndef V8_COMPRESS_POINTERS
     __ Mov(x28, x19);
 #endif
     // Don't initialize the reserved registers.
     // x26 : root register (kRootRegister).
+    // x25 : execution-state base register (kExecutionStateRegister) -- reserved
+    //       in the flag-on build above; absent (ordinary allocatable) otherwise.
     // x27 : context pointer (cp).
     // x28 : pointer cage base register (kPtrComprCageBaseRegister).
     // x29 : frame pointer (fp).
@@ -4451,6 +4475,24 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
                                ArgvMode argv_mode, bool builtin_exit_frame,
                                bool switch_to_central_stack) {
   ASM_LOCATION("CEntry::Generate entry");
+
+  // Arm the execution-state base register (x25) and root register (x26) at the
+  // top of the C entry. CEntry is reached two ways: (a) from a generated JS or
+  // runtime routine whose prologue already armed them via InitializeRootRegister,
+  // and (b) directly from JITted wasm code via an unadorned "blr", which runs no
+  // JS/routine prologue. Under V8_ENABLE_GREEN_WORKER_EXECUTION_STATE the exit
+  // frame (EnterExitFrame below) stores c_entry_fp and js_entry_sp through
+  // AsMemOperand(kCEntryFP/kContext) -> the execution fields of THIS worker's
+  // ExecutionState block ([x25]), and ER::isolate_address() (line ~4566) is a
+  // root-relative load needing x26 armed. On the wasm path x25/x26 hold stale
+  // JIT scratch, so those stores fault (EXC_BAD_ACCESS on [x25] -- the SIGSEGV
+  // observed in builtins-wasm CEntry). Arming here is idempotent for path (a) and
+  // mandatory for path (b), mirroring the JS entry path in this file. x26/x25 are
+  // not the CEntry input args (x0=argc, x1=target, x11=argv), so incoming args
+  // are not disturbed.
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  __ InitializeRootRegister();
+#endif
 
   using ER = ExternalReference;
 

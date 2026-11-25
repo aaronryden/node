@@ -134,6 +134,7 @@
 #include "src/tracing/trace-event.h"
 #include "src/utils/utils-inl.h"
 #include "src/utils/utils.h"
+#include "third_party/rapidhash-v8/secret.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-engine.h"
@@ -593,7 +594,35 @@ bool Heap::HasBeenSetUp() const {
   return old_space_ != nullptr;
 }
 
+// Declared in src/execution/green-thread-cow.cc. Returns true while a
+// green-thread copy-on-write view is active (i.e. at least one CoW green
+// thread is running).
+//
+// The CoW model (see green-thread-cow.cc) assumes a single execution thread:
+// the embedding thread performs every heap mutation for a green-thread's
+// isolated view, and GC is expected to run on that same thread. Node embeds
+// V8 with concurrent GC enabled, so V8 runs the young-GC scavenger, mark-compact
+// markers, and array-buffer sweeper on separate OS worker threads. Those
+// workers race the embedding thread's CoW clones and in-place slot rewrites
+// (CowCheckBeforeStore / COWWriteBarrierCheck) and read torn or freed pointers
+// -- which surfaces as an EXC_BAD_ACCESS in Scavenger::EvacuateObject.
+//
+// Rather than add a Heap member (which would shift Heap layout and destabilize
+// mksnapshot incremental builds), the heap queries this hook: while a CoW view
+// is active it returns true and ShouldUseBackgroundThreads() returns false,
+// suppressing every concurrent-GC worker path so GC stays serial on the
+// embedding thread, restoring the single-execution-thread invariant the CoW
+// design relies on. It returns true again once the last view is torn down.
+#if V8_ENABLE_GREEN_THREADS
+extern bool GreenThreadCOWSuspendedConcurrentGC();
+#endif
+
 bool Heap::ShouldUseBackgroundThreads() const {
+#if V8_ENABLE_GREEN_THREADS
+  if (GreenThreadCOWSuspendedConcurrentGC()) {
+    return false;
+  }
+#endif
   return !v8_flags.single_threaded_gc_in_background ||
          !isolate()->EfficiencyModeEnabled();
 }
@@ -4719,13 +4748,16 @@ void Heap::IterateRoots(RootVisitor* v, base::EnumSet<SkipRoot> options,
       v->Synchronize(VisitorSynchronization::kStackRoots);
     }
 
-    // Iterate over main thread handles in handle scopes.
-    if (!options.contains(SkipRoot::kMainThreadHandles)) {
-      // Clear main thread handles with stale references to left-trimmed
-      // objects. The GC would crash on such stale references.
-      ClearStaleLeftTrimmedPointerVisitor left_trim_visitor(this, v);
-      isolate_->handle_scope_implementer()->Iterate(&left_trim_visitor);
-    }
+      // Iterate over main thread / live-worker handles in handle scopes. Under
+      // green multi-worker mode every OS worker owns its own handle state, so
+      // route through IterateHandleRoots (which roots all live workers); off-green
+      // this is the single shared HandleScopeImplementer.
+      if (!options.contains(SkipRoot::kMainThreadHandles)) {
+        // Clear main thread handles with stale references to left-trimmed
+        // objects. The GC would crash on such stale references.
+        ClearStaleLeftTrimmedPointerVisitor left_trim_visitor(this, v);
+        isolate_->IterateHandleRoots(&left_trim_visitor);
+      }
     // Iterate local handles for all local heaps.
     safepoint_->Iterate(v);
     // Iterates all persistent handles.
@@ -4869,7 +4901,7 @@ void Heap::IterateConservativeStackRoots(
 
 void Heap::IterateRootsForPrecisePinning(RootVisitor* visitor) {
   IterateStackRoots(visitor);
-  isolate()->handle_scope_implementer()->Iterate(visitor);
+  isolate()->IterateHandleRoots(visitor);
 }
 
 #if V8_OS_ANDROID
@@ -6204,6 +6236,31 @@ void Heap::SetUpSpaces() {
   if (v8_flags.memory_balancer) {
     mb_.reset(new MemoryBalancer(this, startup_time));
   }
+}
+
+void Heap::InitializeHashSeed() {
+  DCHECK(!deserialization_complete_);
+  uint64_t new_hash_seed;
+  if (v8_flags.hash_seed == 0) {
+    int64_t rnd = isolate()->random_number_generator()->NextInt64();
+    new_hash_seed = static_cast<uint64_t>(rnd);
+  } else {
+    new_hash_seed = static_cast<uint64_t>(v8_flags.hash_seed);
+  }
+
+  Tagged<ByteArray> hash_seed = ReadOnlyRoots(this).hash_seed();
+
+  MemCopy(hash_seed->begin(), reinterpret_cast<uint8_t*>(&new_hash_seed),
+          kInt64Size);
+
+#if V8_USE_DEFAULT_HASHER_SECRET
+  MemCopy(hash_seed->begin() + kInt64Size,
+          reinterpret_cast<const uint8_t*>(RAPIDHASH_DEFAULT_SECRET),
+          kInt64Size * 3);
+#else
+  rapidhash_make_secret(new_hash_seed, reinterpret_cast<uint64_t*>(
+                                           hash_seed->begin() + kInt64Size));
+#endif  // V8_USE_DEFAULT_HASHER_SECRET
 }
 
 std::shared_ptr<v8::TaskRunner> Heap::GetForegroundTaskRunner(

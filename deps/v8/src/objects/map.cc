@@ -14,6 +14,12 @@
 #include "src/handles/maybe-handles.h"
 #include "src/heap/heap-layout-inl.h"
 #include "src/heap/heap-write-barrier-inl.h"
+#ifdef V8_ENABLE_GREEN_THREADS
+// Pulls in GreenThreadCow::ActiveCount(): see the CoW note on the ShareDescriptor
+// gate below. Placed here (map.cc has no transitive green-thread-cow.h include
+// the way map-inl.h does) before the map-growth paths that consult it.
+#include "src/execution/green-thread-cow.h"
+#endif
 #include "src/init/bootstrapper.h"
 #include "src/logging/log.h"
 #include "src/logging/runtime-call-stats-scope.h"
@@ -2257,9 +2263,23 @@ Handle<Map> Map::CopyAddDescriptor(Isolate* isolate, DirectHandle<Map> map,
                                             isolate);
 
   // Share descriptors only if map owns descriptors and is not an initial map.
+  //
+  // When CoW is active several OS workers grow the *same* shared/initial map's
+  // descriptor array concurrently (e.g. the four parallel-disjoint bodies share
+  // the p0..p2 prefix, so their literal construction all start from the shallow
+  // shared map and call ShareDescriptor on it). ShareDescriptor reuses that
+  // array and APPENDS to it in place (map.cc ShareDescriptor: EnsureDescriptorSlack
+  // + DescriptorArray::Append), so two workers collide on the shared array -- the
+  // "LinearSearch != NotFound" / "index < size()" descriptor-fatal and the
+  // downstream null-StackFrame / torn-pointer corruption seen under
+  // GT_M2_PARALLEL. Each worker therefore needs its own private descriptor array;
+  // force the CopyUpTo+Append path (which already hands out a freshly allocated,
+  // worker-private array) instead. No-op serial path: ActiveCount()==0 here, so
+  // the optimization is unchanged for the single-mutator / CONTROL case.
   if (flag == INSERT_TRANSITION && map->owns_descriptors() &&
       !IsUndefined(map->GetBackPointer(), isolate) &&
-      TransitionsAccessor::CanHaveMoreTransitions(isolate, map)) {
+      TransitionsAccessor::CanHaveMoreTransitions(isolate, map) &&
+      !GreenThreadCow::ActiveCount()) {
     return ShareDescriptor(isolate, map, descriptors, descriptor);
   }
 

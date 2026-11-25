@@ -182,7 +182,20 @@ class MarkCompactCollector final {
   WeakObjects::Local* local_weak_objects() { return local_weak_objects_.get(); }
 
   bool UseBackgroundThreadsInCycle() const {
-    return use_background_threads_in_cycle_;
+    bool use = use_background_threads_in_cycle_;
+#if V8_ENABLE_GREEN_THREADS
+    // During a CoW green-thread view the embedding thread is rewriting the
+    // shared heap, so concurrent mark/sweep chunks must not run. This flag was
+    // captured at StartMarking() (before any view activated); a view that
+    // starts mid-cycle must force the whole cycle serial rather than leaving a
+    // torn partial mark that a concurrent sweep then reads/free. In the common
+    // no-view case heap_->ShouldUseBackgroundThreads() matches the captured
+    // value, so there is no behavior change.
+    if (!heap_->ShouldUseBackgroundThreads()) {
+      use = false;
+    }
+#endif
+    return use;
   }
 
   void MaybeEnableBackgroundThreadsInCycle(CallOrigin origin);

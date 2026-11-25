@@ -53,6 +53,10 @@
 #include "src/wasm/wasm-js.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+#if V8_ENABLE_GREEN_THREADS
+#include "src/execution/green-thread-cow.h"
+#endif  // V8_ENABLE_GREEN_THREADS
+
 #ifdef V8_INTL_SUPPORT
 #include "src/base/strings.h"
 #include "src/objects/intl-objects.h"
@@ -478,6 +482,24 @@ uint32_t fp16_raw_bits_ieee_to_fp32_raw_bits(uint32_t input) {
   return base::bit_cast<uint32_t, float>(value);
 }
 
+#if V8_ENABLE_GREEN_THREADS
+FUNCTION_REFERENCE(current_execution_state_base,
+                   Isolate::CurrentExecutionStateBase)
+FUNCTION_REFERENCE(handle_scope_implementer_current,
+                   CurrentHandleScopeImplementer)
+
+FUNCTION_REFERENCE(green_thread_cow_clone_if_needed,
+                   GreenThreadCow::CowCloneForGeneratedCode)
+
+// ExternalReference for the concurrent-allocation flag (see
+// green_thread_concurrent_allocation_active), read by the inline allocation
+// fast path to decide whether to defer to the CAS runtime path.
+extern bool green_thread_concurrent_allocation_active;
+ExternalReference
+ExternalReference::green_thread_concurrent_allocation_flag() {
+  return ExternalReference(&green_thread_concurrent_allocation_active);
+}
+#endif  // V8_ENABLE_GREEN_THREADS
 FUNCTION_REFERENCE(ieee754_fp64_raw_bits_to_fp16_raw_bits_for_32bit_arch,
                    fp64_raw_bits_to_fp16_raw_bits_for_32bit_arch)
 

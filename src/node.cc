@@ -1576,7 +1576,46 @@ static ExitCode StartInternal(int argc, char** argv) {
   return main_instance.Run();
 }
 
+// One-time green-thread configuration banner, printed to stderr at node boot.
+// It reports whether the GT parallel flags are actually compiled into this
+// binary (the V8_ENABLE_GREEN_* compile-time macros) and which runtime switches
+// are set (GT_SHARED_HEAP / GT_M2_PARALLEL / GT_NUM_WORKERS / GT_M2_FORCE_GC).
+// Every .JS test we launch runs through this binary, so a single grep of its
+// stderr confirms the build and flags are correct and catches an "flag off in
+// the build" regression without digging through ninja logs.
+#if V8_ENABLE_GREEN_THREADS || V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+static void PrintGreenThreadConfig() {
+  int compiled_gt =
+#if V8_ENABLE_GREEN_THREADS
+      1;
+#else
+      0;
+#endif
+  int compiled_wes =
+#if V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+      1;
+#else
+      0;
+#endif
+  auto env_or_unset = [](const char* name) -> const char* {
+    const char* v = ::getenv(name);
+    return v ? v : "(unset)";
+  };
+  fprintf(
+      stderr,
+      "[GT-CONFIG] compiled: GREEN_THREADS=%d GREEN_WORKER_EXEC_STATE=%d | "
+      "env: GT_SHARED_HEAP=%s GT_M2_PARALLEL=%s GT_NUM_WORKERS=%s "
+      "GT_M2_FORCE_GC=%s\n",
+      compiled_gt, compiled_wes,
+      env_or_unset("GT_SHARED_HEAP"), env_or_unset("GT_M2_PARALLEL"),
+      env_or_unset("GT_NUM_WORKERS"), env_or_unset("GT_M2_FORCE_GC"));
+}
+#endif
+
 int Start(int argc, char** argv) {
+#if V8_ENABLE_GREEN_THREADS || V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  PrintGreenThreadConfig();
+#endif
 #ifndef DISABLE_SINGLE_EXECUTABLE_APPLICATION
   std::tie(argc, argv) = sea::FixupArgsForSEA(argc, argv);
 #endif

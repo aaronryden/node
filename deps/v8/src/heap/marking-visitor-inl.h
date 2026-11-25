@@ -498,6 +498,22 @@ bool MarkingVisitorBase<ConcreteVisitor>::HasBytecodeArrayForFlushing(
   // check if it is old. Note, this is done this way since this function can be
   // called by the concurrent marker.
   Tagged<Object> data = sfi->GetTrustedData(heap_->isolate());
+  if (::getenv("GT_GC_DIAG")) {
+    // Surface SFIs whose trusted data is not a real HeapObject, or whose data is
+    // not a recognized bytecode/artifact. An uninitialized interpreter_data
+    // (0x100000000) is not a HeapObject; if such an SFI still reaches the flush
+    // queue it later FATALs in GetActiveBytecodeArray.
+    const bool is_heap = Is<HeapObject>(data);
+    if (!is_heap || (!IsBytecodeArray(data) && !IsCode(data))) {
+      fprintf(stderr,
+              "[GT-GATE] SFI=0x%tx data=0x%tx is_heap=%d bc=%d code=%d "
+              "kind=%d allows_lazy=%d\n",
+              sfi->address(), data.ptr(), is_heap ? 1 : 0,
+              IsBytecodeArray(data) ? 1 : 0, IsCode(data) ? 1 : 0, sfi->kind(),
+              sfi->allows_lazy_compilation() ? 1 : 0);
+      fflush(stderr);
+    }
+  }
   if (IsCode(data)) {
     Tagged<Code> baseline_code = TrustedCast<Code>(data);
     DCHECK_EQ(baseline_code->kind(), CodeKind::BASELINE);

@@ -33,8 +33,10 @@ namespace internal {
  * - x23     : Points to tip of backtrack stack.
  * - w24     : Position of the first character minus one: non_position_value.
  *             Used to initialize capture registers.
- * - x25     : Address at the end of the input string: input_end.
- *             Points to byte after last character in input.
+ * - x25 or x19  : Address at the end of the input string: input_end.
+ *                 Points to byte after last character in input. (x19 is used in
+ *                 phase ii when x25 is reserved as kExecutionStateRegister;
+ *                 otherwise x25.)
  * - x26     : Address at the start of the input string: input_start.
  * - w27     : Where to start in the input string.
  * - x28     : Output array pointer.

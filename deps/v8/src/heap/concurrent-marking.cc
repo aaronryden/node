@@ -54,6 +54,18 @@
 namespace v8 {
 namespace internal {
 
+#if V8_ENABLE_GREEN_THREADS
+// CoW suspension-barrier hooks (execution/green-thread-cow.cc). While a
+// green-thread CoW view is active concurrent marking must not run on worker
+// threads -- it walks SharedFunctionInfo / Map / Code objects that the
+// embedding thread is rewriting, reading torn pointers (observed as a null
+// GlobalHandles node during the main-thread young GC). TryScheduleJob() is
+// gated so no new concurrent chunk is scheduled; the Run entry points register
+// so the 0 -> 1 drain waits for the in-flight chunk to finish.
+bool RegisterCOWGCWorker();
+void UnregisterCOWGCWorker();
+#endif
+
 // This class caches page live bytes during concurrent marking. This
 // avoids costly CAS operations on MutablePage::live_byte_count_ for
 // each traced object.
@@ -243,6 +255,13 @@ class ConcurrentMarking::JobTaskMajor : public v8::JobTask {
 
   // v8::JobTask overrides.
   void Run(JobDelegate* delegate) override {
+    // Register with the CoW suspension barrier. During a view TryScheduleJob()
+    // returns early, so a scheduled chunk bails here before touching the heap;
+    // a chunk already running when the view activated is drained by the 0 -> 1
+    // barrier before the embedding thread's rewrites begin.
+    if (!RegisterCOWGCWorker()) {
+      return;
+    }
     // Set the current isolate such that trusted pointer tables etc are
     // available and the cage base is set correctly for multi-cage mode.
     SetCurrentIsolateScope isolate_scope(concurrent_marking_->heap_->isolate());
@@ -261,6 +280,7 @@ class ConcurrentMarking::JobTaskMajor : public v8::JobTask {
                                     mark_compact_epoch_,
                                     should_keep_ages_unchanged_);
     }
+    UnregisterCOWGCWorker();
   }
 
   size_t GetMaxConcurrency(size_t worker_count) const override {
@@ -290,6 +310,9 @@ class ConcurrentMarking::JobTaskMinor : public v8::JobTask {
 
   // v8::JobTask overrides.
   void Run(JobDelegate* delegate) override {
+    if (!RegisterCOWGCWorker()) {
+      return;
+    }
     // Set the current isolate such that trusted pointer tables etc are
     // available and the cage base is set correctly for multi-cage mode.
     SetCurrentIsolateScope isolate_scope(concurrent_marking_->heap_->isolate());
@@ -307,6 +330,7 @@ class ConcurrentMarking::JobTaskMinor : public v8::JobTask {
                                TRACE_EVENT_FLAG_FLOW_IN);
       concurrent_marking_->RunMinor(delegate);
     }
+    UnregisterCOWGCWorker();
   }
 
   size_t GetMaxConcurrency(size_t worker_count) const override {
@@ -649,6 +673,14 @@ void ConcurrentMarking::TryScheduleJob(GarbageCollector garbage_collector,
          v8_flags.concurrent_minor_ms_marking);
   DCHECK(!heap_->IsTearingDown());
   DCHECK(IsStopped());
+
+  // While a CoW green-thread view is active, do not schedule the next
+  // concurrent marking chunk. The in-flight cycle is paused here (its work is
+  // resumed by the embedding thread's own incremental marking once the view
+  // ends) so no worker touches the heap the embedding thread is rewriting.
+  if (!heap_->ShouldUseBackgroundThreads()) {
+    return;
+  }
 
   DCHECK_NE(garbage_collector, GarbageCollector::SCAVENGER);
   if (garbage_collector == GarbageCollector::MARK_COMPACTOR &&

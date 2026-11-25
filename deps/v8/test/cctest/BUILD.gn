@@ -7,7 +7,13 @@ import("../../gni/v8.gni")
 v8_executable("cctest") {
   testonly = true
 
-  sources = [ "cctest.cc" ]
+  sources = [
+    "cctest.cc",
+  ]
+
+  if (v8_enable_green_threads) {
+    sources += [ "test-green-thread-cow.cc" ]
+  }
 
   deps = [
     ":cctest_sources",
@@ -128,6 +134,7 @@ v8_source_set("cctest_sources") {
     "test-debug.cc",
     "test-disasm-regex-helper.cc",
     "test-disasm-regex-helper.h",
+    "test-external-references.cc",
     "test-field-type-tracking.cc",
     "test-func-name-inference.cc",
     "test-heap-profiler.cc",

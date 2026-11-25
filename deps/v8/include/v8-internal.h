@@ -432,6 +432,19 @@ constexpr size_t kMaxCppHeapPointers = 0;
 // which all subtypes of a given supertype use contiguous tags. This struct can
 // then be used to represent such a type range.
 //
+// As an example, consider the following type hierarchy:
+//
+//          A     F
+//         / \
+//        B   E
+//       / \
+//      C   D
+//
+// A potential type id assignment for range-based type checks is
+// {A: 0, B: 1, C: 2, D: 3, E: 4, F: 5}. With that, the type check for type A
+// would check for the range [A, E], while the check for B would check range
+// [B, D], and for F it would simply check [F, F].
+//
 // In addition, there is an option for performance tweaks: if the size of the
 // type range corresponding to a supertype is a power of two and starts at a
 // power of two (e.g. [0x100, 0x13f]), then the compiler can often optimize
@@ -477,11 +490,7 @@ struct TagRange {
   constexpr TagRange(Tag first, Tag last) : first(first), last(last) {
 #ifdef V8_ENABLE_CHECKS
     // This would typically be a DCHECK, but that's not available here.
-#if V8_HAS_BUILTIN_UNREACHABLE
     if (first > last) __builtin_unreachable();  // Invalid tag range.
-#elif defined(_MSC_VER)
-    if (first > last) __assume(0);  // Invalid tag range.
-#endif
 #endif
   }
 
@@ -903,6 +912,24 @@ struct HandleScopeData final {
 
 static_assert(HandleScopeData::kSizeInBytes == sizeof(HandleScopeData));
 
+// Public-API route to Isolate::handle_scope_data(). The inline v8::HandleScope
+// ctor / v8::HandleScope::CreateHandle / Local::New path resolves the cursor via
+// Internals::GetHandleScopeData, which is pure offset arithmetic to the shared
+// isolate_data_.handle_scope_data_. Under the green "handle-scope phase" (a
+// per-worker HandleScopeImplementer routing bodies across OS workers) that shared
+// cursor is wrong for the public API: the internal allocation path reads the
+// per-worker cursor while the public HandleScope opened on the shared one, leaving
+// the per-worker cursor at level 0 and aborting with "Cannot create a handle
+// without a HandleScope". Routing the public API through the same member
+// (Isolate::handle_scope_data()) the internal path uses unifies them. In the
+// non-routed case it returns &isolate_data_.handle_scope_data_, asserted equal to
+// the offset Internals::GetHandleScopeData used before (isolate.cc), so the common
+// single-threaded path is unchanged. Defined in api.cc (needs the complete Isolate
+// type); declared here because Internals::GetHandleScopeData, in this header, must
+// call it.
+HandleScopeData* GetRoutedHandleScopeData(v8::Isolate* isolate);
+
+
 /**
  * This class exports constants and functionality from within v8 that
  * is necessary to implement inline functions in the v8 api.  Don't
@@ -972,8 +999,13 @@ class Internals {
 
   // IsolateData layout guarantees.
   static const int kIsolateCageBaseOffset = 0;
-  static const int kIsolateStackGuardOffset =
+  // Per-worker ExecutionState base mirror (green-thread multi-mutator). Inserted
+  // right after CageBase so the JS-entry arming can arm x25 to THIS worker's
+  // block under green mode via a small, single-instruction root-relative load.
+  static const int kIsolateExecutionStateBaseOffset =
       kIsolateCageBaseOffset + kApiSystemPointerSize;
+  static const int kIsolateStackGuardOffset =
+      kIsolateExecutionStateBaseOffset + kApiSystemPointerSize;
   static const int kVariousBooleanFlagsOffset =
       kIsolateStackGuardOffset + kStackGuardSize;
   static const int kErrorMessageParamOffset =
@@ -1287,9 +1319,7 @@ class Internals {
   }
 
   V8_INLINE static HandleScopeData* GetHandleScopeData(v8::Isolate* isolate) {
-    Address addr =
-        reinterpret_cast<Address>(isolate) + kIsolateHandleScopeDataOffset;
-    return reinterpret_cast<HandleScopeData*>(addr);
+    return internal::GetRoutedHandleScopeData(isolate);
   }
 
   V8_INLINE static void IncrementLongTasksStatsCounter(v8::Isolate* isolate) {

@@ -2281,7 +2281,7 @@ void HeapObject::RehashBasedOnMap(IsolateT* isolate) {
       Cast<DescriptorArray>(*this)->Sort();
       break;
     case TRANSITION_ARRAY_TYPE:
-      Cast<TransitionArray>(*this)->Sort(true);
+      Cast<TransitionArray>(*this)->Sort();
       break;
     case SMALL_ORDERED_HASH_MAP_TYPE:
       DCHECK_EQ(0, Cast<SmallOrderedHashMap>(*this)->NumberOfElements());
@@ -2382,28 +2382,6 @@ Maybe<bool> Object::SetPropertyInternal(LookupIterator* it,
 
       case LookupIterator::INTERCEPTOR: {
         if (it->HolderIsReceiverOrHiddenPrototype()) {
-          // In case we are executing contextual store to a global object with
-          // an interceptor in strict mode, we need to check that the property
-          // actually exists before calling the setter. See
-          // https://tc39.es/ecma262/#sec-object-environment-records-setmutablebinding-n-v-s
-          if (IsJSGlobalObject(*it->GetReceiver())) {
-            Isolate* isolate = it->isolate();
-            auto should_throw_value = GetShouldThrow(isolate, should_throw);
-            should_throw = Just(should_throw_value);
-            if (should_throw_value == kThrowOnError) {
-              Maybe<PropertyAttributes> maybe_attributes =
-                  JSObject::GetPropertyAttributesWithInterceptor(it);
-              if (maybe_attributes.IsNothing()) return Nothing<bool>();
-              if ((maybe_attributes.FromJust() & READ_ONLY) != 0) {
-                return WriteToReadOnlyProperty(it, value, should_throw);
-              }
-              if (maybe_attributes.FromJust() == ABSENT) {
-                // Interceptor doesn't have the property, continue lookup.
-                continue;
-              }
-            }
-          }
-
           InterceptorResult result;
           if (!JSObject::SetPropertyWithInterceptor(it, should_throw, value)
                    .To(&result)) {
@@ -4884,6 +4862,20 @@ Handle<Object> JSPromise::TriggerPromiseReactions(
                                 .ToHandle(&handler_context);
     }
     if (!has_handler_context) handler_context = isolate->native_context();
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      const bool h_is_fn = IsJSFunction(*primary_handler);
+      const bool hctx_is_undef =
+          h_is_fn ? IsUndefined(Cast<JSFunction>(*primary_handler)->context())
+                  : true;
+      const bool job_is_undef = IsUndefined(*handler_context);
+      ::fprintf(stderr,
+                "[PCTJ] has_ctx=%d is_fn=%d hctx_undef=%d job_undef=%d\n",
+                (int)has_handler_context, (int)h_is_fn,
+                (int)hctx_is_undef, (int)job_is_undef);
+      ::fflush(stderr);
+    }
+#endif
 
     static_assert(static_cast<int>(sizeof(PromiseReaction)) ==
                   static_cast<int>(sizeof(PromiseReactionJobTask)));

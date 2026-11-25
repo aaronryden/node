@@ -623,8 +623,7 @@ Address StringTable::Data::TryStringToIndexOrLookupExisting(
 
   // String could be an array index.
   if (Name::ContainsCachedArrayIndex(raw_hash_field)) {
-    return Smi::FromInt(StringHasher::DecodeArrayIndexFromHashField(
-                            raw_hash_field, seed))
+    return Smi::FromInt(String::ArrayIndexValueBits::decode(raw_hash_field))
         .ptr();
   }
 

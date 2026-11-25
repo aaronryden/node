@@ -3946,9 +3946,6 @@ Handle<JSProxy> Factory::NewJSProxy(DirectHandle<JSReceiver> target,
   result->set_target(*target, SKIP_WRITE_BARRIER);
   result->set_handler(*handler, SKIP_WRITE_BARRIER);
   result->set_flags(JSProxy::IsRevocableBit::encode(revocable));
-#if TAGGED_SIZE_8_BYTES
-  result->set_padding(0);
-#endif
   return handle(result, isolate());
 }
 
@@ -4117,8 +4114,7 @@ Handle<String> Factory::SizeToString(size_t value, bool check_cache) {
     if (value <= JSArray::kMaxArrayIndex &&
         raw->raw_hash_field() == String::kEmptyHashField) {
       uint32_t raw_hash_field = StringHasher::MakeArrayIndexHash(
-          static_cast<uint32_t>(value), raw->length(),
-          HashSeed(read_only_roots()));
+          static_cast<uint32_t>(value), raw->length());
       raw->set_raw_hash_field(raw_hash_field);
     }
   }
@@ -4903,6 +4899,13 @@ Handle<JSFunction> Factory::JSFunctionBuilder::Build() {
   // below can fail to initialize the feedback vector.
   IsCompiledScope is_compiled_scope(sfi_->is_compiled_scope(isolate_));
   Handle<JSFunction> result = BuildRaw(code);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-BIND] iso=%p jsfunc=%p shared=%p sfi=%p\n",
+              (void*)isolate_, (void*)(*result).ptr(),
+              (void*)(*result)->shared().ptr(), (void*)(*sfi_).ptr());
+  }
+#endif
 
   if (code->kind() == CodeKind::BASELINE) {
     JSFunction::EnsureFeedbackVector(isolate_, result, &is_compiled_scope);

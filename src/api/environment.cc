@@ -785,6 +785,29 @@ MaybeLocal<Object> GetPerContextExports(Local<Context> context,
   Local<Object> exports = Object::New(isolate);
   if (context->Global()->SetPrivate(context, key, exports).IsNothing() ||
       InitializePrimordials(context, isolate_data).IsNothing()) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    {
+      Isolate* iso = Isolate::GetCurrent();
+      HandleScope hs(iso);
+      // This fork exposes Isolate::HasPendingException() but not
+      // GetPendingException(), so recover the value via TryCatch (the same
+      // path green_threads.cc uses to carry a body's exception onto the
+      // embedding isolate).
+      if (iso->HasPendingException()) {
+        v8::TryCatch tc(iso);
+        Local<Value> ex = tc.Exception();
+        if (!ex.IsEmpty() && ex->IsString()) {
+          String::Utf8Value utf8(iso, ex);
+          fprintf(stderr, "[GT-THROW-DUMP] pending exception = \"%s\"\n",
+                  *utf8 ? *utf8 : "");
+        } else {
+          fprintf(stderr, "[GT-THROW-DUMP] pending exception = (non-string)\n");
+        }
+      } else {
+        fprintf(stderr, "[GT-THROW-DUMP] pending exception = (none)\n");
+      }
+    }
+#endif
     return MaybeLocal<Object>();
   }
   return handle_scope.Escape(exports);

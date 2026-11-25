@@ -3,6 +3,8 @@
 // found in the LICENSE file.
 
 #include <optional>
+#include <cstdio>
+#include <cstdlib>
 
 #include "src/asmjs/asm-js.h"
 #include "src/codegen/assembler-inl.h"
@@ -398,14 +400,20 @@ bool DeoptAllOsrLoopsContainingDeoptExit(Isolate* isolate,
   return any_marked;
 }
 
-void GetOsrOffsetAndFunctionForOSR(Isolate* isolate, BytecodeOffset* osr_offset,
+bool GetOsrOffsetAndFunctionForOSR(Isolate* isolate, BytecodeOffset* osr_offset,
                                    Handle<JSFunction>* function) {
   DCHECK(osr_offset->IsNone());
   DCHECK(function->is_null());
 
   // Determine the frame that triggered the OSR request.
   JavaScriptStackFrameIterator it(isolate);
+  if (it.done()) return false;
   UnoptimizedJSFrame* frame = UnoptimizedJSFrame::cast(it.frame());
+  if (frame == nullptr) {
+    // No discoverable JS frame (e.g. a green-simulated interpreter frame stack).
+    // Bail out of OSR rather than dereferencing a null frame.
+    return false;
+  }
   DCHECK_IMPLIES(frame->is_interpreted(),
                  frame->LookupCode()->is_interpreter_trampoline_builtin());
   DCHECK_IMPLIES(frame->is_baseline(),
@@ -416,6 +424,7 @@ void GetOsrOffsetAndFunctionForOSR(Isolate* isolate, BytecodeOffset* osr_offset,
 
   DCHECK(!osr_offset->IsNone());
   DCHECK((*function)->shared()->HasBytecodeArray());
+  return true;
 }
 
 Tagged<Object> CompileOptimizedOSR(Isolate* isolate,
@@ -627,7 +636,12 @@ RUNTIME_FUNCTION(Runtime_CompileOptimizedOSR) {
 
   BytecodeOffset osr_offset = BytecodeOffset::None();
   Handle<JSFunction> function;
-  GetOsrOffsetAndFunctionForOSR(isolate, &osr_offset, &function);
+  if (!GetOsrOffsetAndFunctionForOSR(isolate, &osr_offset, &function)) {
+    // No JS frame discoverable (e.g. a green-simulated interpreter frame
+    // stack): signal "no OSR target" so the on-stack-replacement builtin keeps
+    // interpreting, exactly like the empty-concurrent-codepath fallthrough.
+    return Smi::zero();
+  }
 
   return CompileOptimizedOSR(isolate, function, CodeKind::MAGLEV, osr_offset);
 }
@@ -724,7 +738,9 @@ RUNTIME_FUNCTION(Runtime_LogOrTraceOptimizedOSREntry) {
 
   BytecodeOffset osr_offset = BytecodeOffset::None();
   Handle<JSFunction> function;
-  GetOsrOffsetAndFunctionForOSR(isolate, &osr_offset, &function);
+  if (!GetOsrOffsetAndFunctionForOSR(isolate, &osr_offset, &function)) {
+    return ReadOnlyRoots(isolate).undefined_value();
+  }
 
   if (v8_flags.trace_osr) {
     PrintF(CodeTracer::Scope{isolate->GetCodeTracer()}.file(),

@@ -1318,6 +1318,16 @@ FrameDescription* Deoptimizer::DoComputeWasmLiftoffFrame(
   output_frame->SetRegister(kPtrComprCageBaseRegister.code(),
                             isolate()->cage_base());
 #endif
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Re-arm the per-worker execution-state register (x25) after deopt so the
+  // resumed optimized frame addresses its own ExecutionState block, not the
+  // shared ThreadLocalTop. The serial path aliases x25 to the shared top
+  // (identical bytes) and generated code reads the same bytes through x25.
+  output_frame->SetRegister(
+      kExecutionStateRegister.code(),
+      reinterpret_cast<intptr_t>(Isolate::CurrentExecutionStateBase()));
+#endif
+
 
   return output_frame;
 }
@@ -1716,6 +1726,16 @@ void Deoptimizer::DoComputeOutputFrames() {
   topmost->GetRegisterValues()->SetRegister(kPtrComprCageBaseRegister.code(),
                                             isolate()->cage_base());
 #endif
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Re-arm the per-worker execution-state register (x25) after deopt so the
+  // resumed optimized frame addresses its own ExecutionState block, not the
+  // shared ThreadLocalTop. The serial path aliases x25 to the shared top
+  // (identical bytes) and generated code reads the same bytes through x25.
+  topmost->GetRegisterValues()->SetRegister(
+      kExecutionStateRegister.code(),
+      reinterpret_cast<intptr_t>(Isolate::CurrentExecutionStateBase()));
+#endif
+
 
 #ifdef V8_ENABLE_CET_SHADOW_STACK
   if (v8_flags.cet_compatible) {

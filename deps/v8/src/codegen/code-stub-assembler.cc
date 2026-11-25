@@ -1521,6 +1521,27 @@ TNode<HeapObject> CodeStubAssembler::AllocateRaw(TNode<IntPtrT> size_in_bytes,
 
   bool needs_double_alignment = flags & AllocationFlag::kDoubleAlignment;
 
+#if V8_ENABLE_GREEN_THREADS
+  // Concurrent-allocation gate (true-parallel green-heap execution, armed via
+  // GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled): several OS workers
+  // allocate concurrently from ONE shared young LinearAllocationArea. The inline
+  // bump-pointer below reads top_/limit_ and bumps top_ with plain (non-atomic)
+  // ops and no LAB-validity check, so it races another worker's forced-GC LAB
+  // reset/re-arm (M2ForceGC -> Heap::FreeLinearAllocationAreas) and can bump to a
+  // bogus, reclaimed/near-null pointer -- the SIGSEGV on the store to that dead
+  // object. When the gate is set, defer to the runtime allocation path below,
+  // which reserves through the lock-free CAS bump-pointer the fork arms for
+  // parallel workers. The flag is a process-global mirror of the gate, only ever
+  // set by the green-threads bridge, so this is byte-for-byte unchanged for
+  // standard V8, the snapshot builtins (gate off during mksnapshot), and serial
+  // green execution -- zero overhead in the common case. The check lives in the
+  // generated code, so bodies compiled before the gate is set still defer
+  // correctly at execution time.
+  GotoIf(LoadRuntimeFlag(
+             ExternalReference::green_thread_concurrent_allocation_flag()),
+          &runtime_call);
+#endif  // V8_ENABLE_GREEN_THREADS
+
   {
     Label next(this);
     GotoIf(IsRegularHeapObjectSize(size_in_bytes), &next);
@@ -2066,16 +2087,7 @@ TNode<Code> CodeStubAssembler::LoadCodeObjectFromJSDispatchTable(
   TNode<UintPtrT> shifted_value;
   if (JSDispatchEntry::kObjectPointerOffset == 0) {
     shifted_value =
-#if defined(__illumos__) && defined(V8_HOST_ARCH_64_BIT)
-    // Pointers in illumos span both the low 2^47 range and the high 2^47 range
-    // as well. Checking the high bit being set in illumos means all higher bits
-    // need to be set to 1 after shifting right.
-    // Use WordSar() so any high-bit check wouldn't be necessary.
-        UncheckedCast<UintPtrT>(WordSar(UncheckedCast<IntPtrT>(value),
-            IntPtrConstant(JSDispatchEntry::kObjectPointerShift)));
-#else
         WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift));
-#endif /* __illumos__ and 64-bit */
   } else {
     shifted_value = UintPtrAdd(
         WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift)),
@@ -2710,66 +2722,6 @@ TNode<Uint32T> CodeStubAssembler::LoadJSReceiverIdentityHash(
   }
   return var_hash.value();
 }
-
-#ifdef V8_ENABLE_SEEDED_ARRAY_INDEX_HASH
-// Mirror C++ StringHasher::SeedArrayIndexValue.
-TNode<Uint32T> CodeStubAssembler::SeedArrayIndexValue(TNode<Uint32T> value) {
-  // Load m1, m2 and m3 from the hash seed byte array. In the compiled code
-  // these will always come from the read-only roots.
-  TNode<ByteArray> hash_seed = CAST(LoadRoot(RootIndex::kHashSeed));
-  intptr_t base_offset = OFFSET_OF_DATA_START(ByteArray) - kHeapObjectTag;
-  TNode<Uint32T> m1 = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM1Offset));
-  TNode<Uint32T> m2 = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM2Offset));
-  TNode<Uint32T> m3 = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM3Offset));
-
-  TNode<Word32T> x = value;
-  // 3-round xorshift-multiply.
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m1),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m2),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m3),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-
-  return Unsigned(x);
-}
-
-// Mirror C++ StringHasher::UnseedArrayIndexValue.
-TNode<Uint32T> CodeStubAssembler::UnseedArrayIndexValue(TNode<Uint32T> value) {
-  // Load m1_inv, m2_inv and m3_inv from the hash seed byte array. In the
-  // compiled code these will always come from the read-only roots.
-  TNode<ByteArray> hash_seed = CAST(LoadRoot(RootIndex::kHashSeed));
-  intptr_t base_offset = OFFSET_OF_DATA_START(ByteArray) - kHeapObjectTag;
-  TNode<Uint32T> m1_inv = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM1InvOffset));
-  TNode<Uint32T> m2_inv = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM2InvOffset));
-  TNode<Uint32T> m3_inv = Load<Uint32T>(
-      hash_seed, IntPtrConstant(base_offset + HashSeed::kDerivedM3InvOffset));
-
-  TNode<Word32T> x = value;
-  // 3-round xorshift-multiply (inverse).
-  // Xorshift is an involution when kShift is at least half of the value width.
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m3_inv),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m2_inv),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  x = Word32And(Uint32Mul(Unsigned(x), m1_inv),
-                Uint32Constant(Name::kArrayIndexValueMask));
-  x = Word32Xor(x, Word32Shr(x, Uint32Constant(Name::kArrayIndexHashShift)));
-  return Unsigned(x);
-}
-#endif  // V8_ENABLE_SEEDED_ARRAY_INDEX_HASH
 
 TNode<Uint32T> CodeStubAssembler::LoadNameHashAssumeComputed(TNode<Name> name) {
   TNode<Uint32T> hash_field = LoadNameRawHash(name);
@@ -9464,7 +9416,8 @@ TNode<Number> CodeStubAssembler::StringToNumber(TNode<String> input) {
   GotoIf(IsSetWord32(raw_hash_field, Name::kDoesNotContainCachedArrayIndexMask),
          &runtime);
 
-  var_result = SmiFromUint32(DecodeArrayIndexFromHashField(raw_hash_field));
+  var_result = SmiTag(Signed(
+      DecodeWordFromWord32<String::ArrayIndexValueBits>(raw_hash_field)));
   Goto(&end);
 
   BIND(&runtime);
@@ -10594,8 +10547,9 @@ void CodeStubAssembler::TryToName(TNode<Object> key, Label* if_keyisindex,
 
         BIND(&if_has_cached_index);
         {
-          TNode<IntPtrT> index = Signed(ChangeUint32ToWord(
-              DecodeArrayIndexFromHashField(raw_hash_field)));
+          TNode<IntPtrT> index =
+              Signed(DecodeWordFromWord32<String::ArrayIndexValueBits>(
+                  raw_hash_field));
           CSA_DCHECK(this, IntPtrLessThan(index, IntPtrConstant(INT_MAX)));
           *var_index = index;
           Goto(if_keyisindex);

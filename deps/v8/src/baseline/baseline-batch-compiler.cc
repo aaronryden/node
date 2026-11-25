@@ -19,6 +19,33 @@
 #include "src/objects/js-function-inl.h"
 #include "src/utils/locked-queue-inl.h"
 
+#if V8_ENABLE_GREEN_THREADS
+namespace v8 {
+namespace internal {
+// Cooperating hooks defined in src/execution/green-thread-cow.cc.
+//
+// GreenThreadCOWSuspendedConcurrentGC() returns true while a copy-on-write
+// green-thread view is active. See Heap::ShouldUseBackgroundThreads for the
+// full rationale. Declared in v8::internal (an enclosing namespace of baseline)
+// so the unqualified call below in BaselineBatchCompiler resolves to that
+// definition rather than a mis-mangled baseline-local symbol.
+bool GreenThreadCOWSuspendedConcurrentGC();
+bool GreenThreadConcurrentCompilationSuspended();
+
+// The CoW barrier diagnostic printer, defined in execution/green-thread-cow.cc.
+// Same opt-in gate (V8_GREEN_THREADS_DEBUG) as its caller-side diagnostics.
+extern void GreenThreadDiag(const char* fmt, ...);
+
+// The CoW suspension barrier. RegisterCOWGCWorker() returns false (the worker
+// must not touch the shared heap) when a view is already active, and it counts
+// in-flight workers so the embedding thread can drain them on the 0 -> 1 view
+// boundary; UnregisterCOWGCWorker() matches each registration.
+bool RegisterCOWGCWorker();
+void UnregisterCOWGCWorker();
+}  // namespace internal
+}  // namespace v8
+#endif
+
 namespace v8 {
 namespace internal {
 namespace baseline {
@@ -164,14 +191,42 @@ class ConcurrentBaselineCompiler {
       UnparkedScope unparked_scope(&local_isolate);
       LocalHandleScope handle_scope(&local_isolate);
 
-      while (!incoming_queue_->IsEmpty() && !delegate->ShouldYield()) {
+      // Register with the CoW suspension barrier before touching the shared
+      // heap. A view may have activated between the batch being scheduled and
+      // this worker reaching Run(); if so, bail so we never compile against the
+      // heap the embedding thread is rewriting (torn SharedFunctionInfo /
+      // BytecodeArray reads). The drain on the 0 -> 1 boundary counts this
+      // worker, so it waits for us to drain here.
+      if (!RegisterCOWGCWorker()) {
+        return;
+      }
+
+      bool installed_any = false;
+      // Poll the suspension flag at the top of each iteration: a view may have
+      // activated after the previous batch finished compiling. Bailing leaves
+      // the remaining jobs in the incoming queue to be compiled once the view
+      // ends, rather than reading torn heap state mid-compilation.
+      while (!incoming_queue_->IsEmpty() && !delegate->ShouldYield() &&
+             !GreenThreadCOWSuspendedConcurrentGC() &&
+             !GreenThreadConcurrentCompilationSuspended()) {
         std::unique_ptr<BaselineBatchCompilerJob> job;
         if (!incoming_queue_->Dequeue(&job)) break;
         DCHECK_NOT_NULL(job);
         job->Compile(&local_isolate);
+        installed_any = true;
         outgoing_queue_->Enqueue(std::move(job));
       }
-      isolate_->stack_guard()->RequestInstallBaselineCode();
+      GreenThreadDiag(
+          "sparkplug-unregister suspended=%d",
+          (int)GreenThreadCOWSuspendedConcurrentGC());
+      UnregisterCOWGCWorker();
+      // Install only batches compiled outside a view. Installation is deferred
+      // inside InstallBatch() while a view is active (those jobs stay queued),
+      // so requesting an install here is a no-op during a view; skip it entirely
+      // when we bailed to avoid a cleared-but-empty interrupt.
+      if (installed_any) {
+        isolate_->stack_guard()->RequestInstallBaselineCode();
+      }
     }
 
     size_t GetMaxConcurrency(size_t worker_count) const override {
@@ -252,6 +307,17 @@ BaselineBatchCompiler::~BaselineBatchCompiler() {
 }
 
 bool BaselineBatchCompiler::concurrent() const {
+  // CoW green threads rewrite heap slots for a private view on the embedding
+  // thread; the Sparkplug baseline compiler's concurrent worker threads would
+  // read that torn state -- it surfaces as an is_int26 relocation failure in
+  // RelocateFromDescWriteBarriers. While a view is active, compile serially on
+  // the embedding thread, matching the single-execution-thread CoW assumption.
+#if V8_ENABLE_GREEN_THREADS
+  if (GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) {
+    return false;
+  }
+#endif
   return v8_flags.concurrent_sparkplug && !isolate_->EfficiencyModeEnabled();
 }
 
@@ -278,6 +344,18 @@ void BaselineBatchCompiler::EnqueueFunction(DirectHandle<JSFunction> function) {
 
 void BaselineBatchCompiler::EnqueueSFI(Tagged<SharedFunctionInfo> shared) {
   if (!v8_flags.concurrent_sparkplug || !is_enabled()) return;
+  // While a CoW green-thread view is active, install baseline code serially on
+  // the embedding thread instead of posting concurrent compile jobs; the
+  // workers would otherwise read torn heap state. (The EnqueueFunction entry
+  // already serializes here via concurrent(); this path bypasses it.)
+#if V8_ENABLE_GREEN_THREADS
+  if ((GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) &&
+      ShouldCompileBatch(shared)) {
+    Enqueue(DirectHandle<SharedFunctionInfo>(shared, isolate_));
+    return;
+  }
+#endif
   if (ShouldCompileBatch(shared)) {
     CompileBatchConcurrent(shared);
   } else {
@@ -292,6 +370,16 @@ void BaselineBatchCompiler::Enqueue(DirectHandle<SharedFunctionInfo> shared) {
 
 void BaselineBatchCompiler::InstallBatch() {
   DCHECK(v8_flags.concurrent_sparkplug);
+  // While a CoW green-thread view is active, defer installation of the
+  // concurrently-compiled baseline batches still queued here. The embedding
+  // thread is rewriting the shared heap these jobs reference, so installing
+  // now dereferences torn handle state inside a job's task vector
+  // (EXC_BAD_ACCESS). The batches stay queued and install serially once the
+  // view ends (the next interrupt re-enters InstallBatch).
+  if (GreenThreadCOWSuspendedConcurrentGC() ||
+      GreenThreadConcurrentCompilationSuspended()) {
+    return;
+  }
   concurrent_compiler_->InstallBatch();
 }
 

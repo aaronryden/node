@@ -34,6 +34,13 @@
 #include "src/wasm/wasm-objects-inl.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+// Included explicitly (not transitively via heap-write-barrier-inl.h, whose
+// own include of this header lands after its green-thread-cow.h pull-in) so
+// GreenThreadCowSharedWriterScope is always defined before InobjectSlackTrackingStep.
+#if V8_ENABLE_GREEN_THREADS
+#include "src/execution/green-thread-cow.h"
+#endif  // V8_ENABLE_GREEN_THREADS
+
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
@@ -1109,9 +1116,34 @@ void Map::InobjectSlackTrackingStep(Isolate* isolate) {
   // Slack tracking should only be performed on an initial map.
   DCHECK(IsUndefined(GetBackPointer()));
   if (!this->IsInobjectSlackTrackingInProgress()) return;
-  int counter = construction_counter();
-  set_construction_counter(counter - 1);
-  if (counter == kSlackTrackingCounterEnd) {
+  // Defer the end-transition until after the serialization scope is released,
+  // so CompleteInobjectSlackTracking (which takes the map-updater lock) never
+  // runs while a shared-writer scope is held.
+  bool complete_inobject_slack_tracking = false;
+#if V8_ENABLE_GREEN_THREADS
+  // Literal bodies of the same shape share one cached initial Map, whose
+  // construction_counter is mutated lock-free here -- correct only on the
+  // single-writer path. Multiple writers could both observe the end counter and
+  // drive CompleteInobjectSlackTracking, double-applying the instance-size
+  // shrink and corrupting the shared map (the EXC_BAD_ACCESS this guards).
+  // Serialize the read-decrement-decision against other CoW writers.
+  if (V8_UNLIKELY(GreenThreadCow::ActiveCount() > 0)) {
+    GreenThreadCowSharedWriterScope shared_writer_scope;
+    int counter = construction_counter();
+    set_construction_counter(counter - 1);
+    if (counter == kSlackTrackingCounterEnd) {
+      complete_inobject_slack_tracking = true;
+    }
+  } else
+#endif
+  {
+    int counter = construction_counter();
+    set_construction_counter(counter - 1);
+    if (counter == kSlackTrackingCounterEnd) {
+      complete_inobject_slack_tracking = true;
+    }
+  }
+  if (complete_inobject_slack_tracking) {
     MapUpdater::CompleteInobjectSlackTracking(isolate, *this);
   }
 }

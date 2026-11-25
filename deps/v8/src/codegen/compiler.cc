@@ -80,6 +80,22 @@
 namespace v8 {
 namespace internal {
 
+#if V8_ENABLE_GREEN_THREADS
+// Cooperating hook defined in src/execution/green-thread-cow.cc.
+//
+// GreenThreadCOWSuspendedConcurrentGC() returns true while a copy-on-write
+// green-thread view is active. The single-execution-thread CoW model rewrites
+// the shared heap only on the embedding thread; a concurrently scheduled Maglev
+// job would instead be executed on a background worker after the drain, reading
+// and marking shared SharedFunctionInfo / feedback-vector state that the view is
+// cloning (a torn read). Gating the scheduling decision here (rather than only
+// the background worker's own bail) means no concurrent Maglev job is created
+// while a view is active, so there is nothing to defer or drain. See
+// Heap::ShouldUseBackgroundThreads for the full rationale.
+bool GreenThreadCOWSuspendedConcurrentGC();
+bool GreenThreadConcurrentCompilationSuspended();
+#endif
+
 namespace {
 
 constexpr bool IsOSR(BytecodeOffset osr_offset) { return !osr_offset.IsNone(); }
@@ -1189,6 +1205,23 @@ MaybeHandle<Code> CompileTurbofan(Isolate* isolate, Handle<JSFunction> function,
   }
 
   // Prepare the job and launch concurrent compilation, or compile now.
+  //
+  // While a CoW green-thread view is active the shared heap is rewritten solely
+  // on the embedding thread; concurrent Turbofan would compile on a background
+  // worker against the heap the view is cloning (torn SharedFunctionInfo /
+  // feedback-vector / Map reads). A later deopt from the green body's baseline
+  // frame into that half-written optimized code lands on a dead pointer
+  // (EXC_BAD_ACCESS at 0xbeeddead). Force synchronous compilation, which runs on
+  // the embedding thread and always reads a consistent view. The same holds for
+  // true-parallel body execution (GT_M2_PARALLEL=1), where no CoW view is active
+  // (so GreenThreadCOWSuspendedConcurrentGC() is false) but the workers still
+  // rewrite the heap in place -- hence the GreenThreadConcurrentCompilationSuspended()
+  // check is OR'd in. Mirrors the Maglev gate in CompileMaglev below.
+  if (IsConcurrent(mode) &&
+      (GreenThreadCOWSuspendedConcurrentGC() ||
+       GreenThreadConcurrentCompilationSuspended())) {
+    mode = ConcurrencyMode::kSynchronous;
+  }
   if (IsConcurrent(mode)) {
     if (CompileTurbofan_Concurrent(isolate, std::move(job))) return {};
   } else {
@@ -1244,7 +1277,17 @@ MaybeHandle<Code> CompileMaglev(Isolate* isolate, Handle<JSFunction> function,
   auto job = maglev::MaglevCompilationJob::New(isolate, function, osr_offset);
 
   if (IsConcurrent(mode) &&
-      !isolate->maglev_concurrent_dispatcher()->is_enabled()) {
+      (!isolate->maglev_concurrent_dispatcher()->is_enabled() ||
+       // While a CoW green-thread view is active the shared heap is being
+       // rewritten solely on the embedding thread; concurrent Maglev would
+       // compile on a background worker against the heap the view is cloning
+       // (torn SharedFunctionInfo / feedback-vector reads -> crash). The same
+       // race exists for true-parallel body execution (no CoW view active), so
+       // GreenThreadConcurrentCompilationSuspended() is OR'd in. Fall back to
+       // synchronous compilation, which runs on the embedding thread and
+       // therefore always reads a consistent view.
+       GreenThreadCOWSuspendedConcurrentGC() ||
+       GreenThreadConcurrentCompilationSuspended())) {
     mode = ConcurrencyMode::kSynchronous;
   }
 
@@ -3108,6 +3151,12 @@ bool Compiler::Compile(Isolate* isolate, DirectHandle<JSFunction> function,
   // which means we are compiling after a bytecode flush.
   // TODO(verwaest/mythria): Investigate if allocating feedback vector
   // immediately after a flush would be better.
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_HEAP_DIAG") != nullptr) {
+    ::fprintf(stderr, "[GT-PI3133] LB3133 is_compiled=%d\n",
+              (int)is_compiled_scope->is_compiled());
+  }
+#endif
   JSFunction::InitializeFeedbackCell(isolate, function, is_compiled_scope,
                                      true);
   function->ResetTieringRequests(isolate);
@@ -3405,6 +3454,12 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
                  .Build();
     // TODO(mythria): I don't think we need this here. PostInstantiation
     // already initializes feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI3436] LB3436 has_shared is_compiled=%d\n",
+                (int)is_compiled_scope.is_compiled());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, result, &is_compiled_scope,
                                        true);
     if (allow_eval_cache) {
@@ -3420,6 +3475,12 @@ MaybeDirectHandle<JSFunction> Compiler::GetFunctionFromEval(
                  .Build();
     // TODO(mythria): I don't think we need this here. PostInstantiation
     // already initializes feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI3457] LB3457 else is_compiled=%d\n",
+                (int)is_compiled_scope.is_compiled());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, result, &is_compiled_scope,
                                        true);
     if (allow_eval_cache) {
@@ -4597,12 +4658,26 @@ void Compiler::PostInstantiation(Isolate* isolate,
                                  DirectHandle<JSFunction> function,
                                  IsCompiledScope* is_compiled_scope) {
   DirectHandle<SharedFunctionInfo> shared(function->shared(), isolate);
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-PI] iso=%p jsfunc=%p shared=%p is_compiled=%d shared_valid=%d\n",
+              (void*)isolate, (void*)function.address(), (void*)shared.address(),
+              (int)is_compiled_scope->is_compiled(),
+              (int)(shared.address() != 0 && shared.address() != 0x100000000ull ? 1 : 0));
+  }
+#endif
 
   // If code is compiled to bytecode (i.e., isn't asm.js), then allocate a
   // feedback and check for optimized code.
   if (is_compiled_scope->is_compiled() && shared->HasBytecodeArray()) {
     // Don't reset budget if there is a closure feedback cell array already. We
     // are just creating a new closure that shares the same feedback cell.
+#if V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_HEAP_DIAG") != nullptr) {
+      ::fprintf(stderr, "[GT-PI4648] LB4648 is_compiled=%d has_bc=%d\n",
+                (int)is_compiled_scope->is_compiled(), (int)shared->HasBytecodeArray());
+    }
+#endif
     JSFunction::InitializeFeedbackCell(isolate, function, is_compiled_scope,
                                        false);
   }

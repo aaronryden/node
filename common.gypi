@@ -86,6 +86,21 @@
     'v8_use_perfetto': 0,
     'tsan%': 0,
 
+    # Enable green threads with copy-on-write heap isolation.
+    # Sets -DV8_ENABLE_GREEN_THREADS. When on, the scheduler swaps green
+    # threads on the embedding thread and every COW write barrier rewrites
+    # pointers to the thread-local heap copy.
+    'v8_enable_green_threads%': 1,
+
+    # Per-worker execution-state transport (candidate b). Sets
+    # -DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE. When on, green-thread isolates
+    # route thread_local_top()/execution_state() to each OS worker's own
+    # ExecutionState block (context/exception/handler/c_entry_fp/js_entry_sp
+    # stay per-worker) so several bodies can run concurrently inside one
+    # isolate. ON for this fork: a plain upstream build has no green threads,
+    # so enabling it unconditionally keeps the default build green-native.
+    'v8_enable_green_worker_execution_state%': 1,
+
     ##### end V8 defaults #####
 
     'conditions': [

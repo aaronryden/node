@@ -25,8 +25,17 @@
 #include "src/objects/objects-inl.h"
 #include "src/objects/scope-info-inl.h"
 #include "src/objects/script-inl.h"
+#include "src/execution/frames.h"
 #include "src/objects/string.h"
 #include "src/objects/templates-inl.h"
+
+// Diagnostic-only native unwinding (see [GT-ZOMBIE-BT] below). macOS's hardened
+// SDK removed <execinfo.h>, so unwind via libunwind (_Unwind_Backtrace) and
+// resolve each frame with dladdr.
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+#include <dlfcn.h>
+#include <unwind.h>
+#endif
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-objects.h"
@@ -816,6 +825,21 @@ Tagged<BytecodeArray> SharedFunctionInfo::GetBytecodeArray(
   MutexGuardIfOffThread<IsolateT> mutex_guard(
       isolate->shared_function_info_access(), isolate);
   Isolate* main_isolate = isolate->GetMainThreadIsolateUnsafe();
+  if (::getenv("GT_GC_DIAG")) {
+    // A never-compiled "zombie" SFI (interpreter_data == 0x100000000, i.e. not a
+    // HeapObject) must never be read here; it FATALs in GetActiveBytecodeArray.
+    // Capture whoever is calling on it so the root cause can be located.
+    Tagged<Object> d = GetTrustedData(GetCurrentIsolateForSandbox());
+    if (!Is<HeapObject>(d)) {
+      fprintf(stderr,
+              "[GT-BC-zombie] GetBytecodeArray SFI=0x%tx data=0x%tx "
+              "has_script=%d kind=%d allows_lazy=%d isCompiled=%d ra_caller=0x%tx\n",
+              address(), d.ptr(), has_script(kAcquireLoad) ? 1 : 0, kind(),
+              allows_lazy_compilation() ? 1 : 0, is_compiled() ? 1 : 0,
+              reinterpret_cast<Address>(__builtin_return_address(0)));
+      fflush(stderr);
+    }
+  }
   return GetBytecodeArrayInternal(main_isolate);
 }
 
@@ -823,6 +847,21 @@ Tagged<BytecodeArray> SharedFunctionInfo::GetBytecodeArrayForGC(
     Isolate* isolate) const {
   // Can only be used during GC when all threads are halted.
   DCHECK_EQ(Isolate::Current()->heap()->gc_state(), Heap::MARK_COMPACT);
+  if (::getenv("GT_GC_DIAG")) {
+    // Surface ONLY SFIs whose trusted data is not a real HeapObject — i.e. the
+    // uninitialized interpreter_data (0x100000000) green-heap SFIs that FATAL in
+    // GetActiveBytecodeArray. Fires regardless of which flush path got here.
+    Tagged<Object> d = GetTrustedData(isolate);
+    if (!Is<HeapObject>(d)) {
+      fprintf(stderr,
+              "[GT-BC-for-GC] SFI=0x%tx data=0x%tx has_bc=%d has_uncompiled=%d "
+              "has_baseline=%d kind=%d AllowsLazy=%d\n",
+              address(), d.ptr(), HasBytecodeArray() ? 1 : 0,
+              HasUncompiledData(isolate) ? 1 : 0, HasBaselineCode() ? 1 : 0,
+              kind(), allows_lazy_compilation() ? 1 : 0);
+      fflush(stderr);
+    }
+  }
   return GetBytecodeArrayInternal(isolate);
 }
 
@@ -839,15 +878,240 @@ Tagged<BytecodeArray> SharedFunctionInfo::GetBytecodeArrayInternal(
   return GetActiveBytecodeArray(isolate);
 }
 
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+namespace {
+// Diagnostic-only frame-chain helper for [GT-ZOMBIE-BT]. File-static so each TU
+// that inlines this header gets its own scratch (the walk is env-gated, so it
+// never runs in production).
+//
+// WHY a manual walk: the green thread's execution is a hand-crafted,
+// heap-allocated native stack with NO CFI entries and it is invisible to V8's
+// StackFrameIterator (GetActiveBytecodeArray is entered with total_frames=0).
+// So _Unwind_Backtrace (CFI-based) and StackFrameIterator both yield nothing.
+// What survives is the standard ARM64 SysV frame chain: at each frame,
+//   [fp+0] = saved caller frame pointer, [fp+8] = saved return address (LR).
+// We walk that chain (guarding against corruption: monotonic-upward fp, RA in a
+// plausible code range, cycle cap) and record the return addresses so the
+// native caller chain of GetBytecodeArray can be symbolized.
+struct GtBtState {
+  Address ips[64];
+  Dl_info infos[64];
+  int count = 0;
+};
+GtBtState g_gt_bt;
+
+// Lowest/highest plausible code addresses in the uncaged node image. Used to
+// filter out stack corruption (leaked heap/green pointers) from real RAs.
+bool GtRaLooksLikeCode(Address ra) {
+  return ra >= 0x100000000ULL && ra < 0x110000000ULL;
+}
+
+// Capture the native call chain by walking the frame-pointer chain
+// (most recent first). Returns the number of valid frames captured.
+int GtCaptureNativeBacktrace() {
+  g_gt_bt.count = 0;
+  Address fp =
+      reinterpret_cast<Address>(__builtin_frame_address(0));
+  int guard = 0;
+  while (fp > 0 && guard++ < 64) {
+    Address saved_ra =
+        *reinterpret_cast<Address*>(fp + 8);  // [fp+8] = saved LR
+    Address next_fp =
+        *reinterpret_cast<Address*>(fp + 0);  // [fp+0] = saved caller FP
+    if (GtRaLooksLikeCode(saved_ra) && g_gt_bt.count < 64) {
+      g_gt_bt.ips[g_gt_bt.count] = saved_ra;
+      dladdr(reinterpret_cast<void*>(saved_ra),
+             &g_gt_bt.infos[g_gt_bt.count]);
+      g_gt_bt.count++;
+    }
+    // Walk UP the FP chain: valid next frames are strictly-greater heap
+    // addresses (green stacks grow down; higher fp == earlier frame). Stop on
+    // regression, the bottom (0), or a pointer inside the dead zone (< 0x100000000)
+    // which indicates corruption/sentinel. We still print only code-range RAs.
+    if (next_fp == 0 || next_fp <= fp || next_fp <= 0x100000000ULL) break;
+    fp = next_fp;
+  }
+  return g_gt_bt.count;
+}
+}  // namespace
+#endif  // V8_OS_MACOSX || V8_OS_LINUX || V8_OS_DARWIN
+
+
 Tagged<BytecodeArray> SharedFunctionInfo::GetActiveBytecodeArray(
     Isolate* isolate) const {
+  if (::getenv("GT_HEAP_DIAG")) {
+    // Diagnostic only: classify the SFI trusted-data slot BEFORE the fatal
+    // below dereferences a stale/garbage value. Gated so production is
+    // untouched unless GT_HEAP_DIAG is set. All checks here are tag-only
+    // (no deref) plus one safe read of the object's first word (its map) to
+    // detect a torn map = use-after-free.
+    static int64_t gt_seq = 0;
+    int64_t seq = gt_seq++;
+    Tagged<Object> trusted = GetTrustedData(isolate);
+    Tagged<Code> tc;
+    bool is_code = TryCast(trusted, &tc);
+    bool is_interp = Is<InterpreterData>(trusted);
+    Address raw_map = Is<HeapObject>(trusted)
+                          ? reinterpret_cast<Address*>(trusted.ptr())[0]
+                          : Address(0);
+    Address sfi_map = reinterpret_cast<Address*>(address())[0];
+    Tagged<Object> sfi_name = name_or_scope_info(kAcquireLoad);
+    int name_is_str = Is<String>(sfi_name) ? 1 : 0;
+    int name_is_scope = IsScopeInfo(sfi_name) ? 1 : 0;
+    int name_has = sfi_name != kNoSharedNameSentinel ? 1 : 0;
+    // Builtin classification: builtins are the only script-less SFIs that
+    // carry real data (a builtin id in the untrusted-data slot). A freshly
+    // allocated-but-never-initialized SFI has NO builtin id and an empty
+    // untrusted-data slot. This is the single most decisive identifier for
+    // the crash SFI's category.
+    bool has_builtin = HasBuiltinId();
+    Tagged<Object> untrusted = GetUntrustedData();
+    // Is the interpreter-data indirect pointer ever PUBLISHED (initialized)?
+    // Unpublished = the SFI was allocated but compiler setup never ran on it.
+    bool unpub_data = HasUnpublishedTrustedData(isolate);
+    bool has_bc = HasBytecodeArray();
+    bool has_trusted = HasTrustedData();
+    bool has_untrusted = HasUntrustedData();
+    // Script class: is this a real Script, or none?
+    Tagged<Object> sc = script();
+    int sc_is_script = Is<Script>(sc) ? 1 : 0;
+    fprintf(stderr,
+            "[GT-SLOT] #%04ld SFI=0x%tx SFI_map=0x%tx trusted=0x%tx name=0x%tx "
+            "name_str=%d name_scope=%d name_has=%d has_builtin=%d "
+            "untrusted=0x%tx unpub_data=%d has_bc=%d has_trusted=%d "
+            "has_untrusted=%d sc_is_script=%d IsCode=%d IsHeap=%d "
+            "IsInterpreterData=%d raw_map=0x%tx below_heap=%d\n",
+            seq, address(), sfi_map, trusted.ptr(), sfi_name.ptr(), name_is_str,
+            name_is_scope, name_has, has_builtin ? 1 : 0, untrusted.ptr(),
+            unpub_data ? 1 : 0, has_bc ? 1 : 0, has_trusted ? 1 : 0,
+            has_untrusted ? 1 : 0, sc_is_script ? 1 : 0, is_code ? 1 : 0,
+            Is<HeapObject>(trusted) ? 1 : 0, is_interp ? 1 : 0, raw_map,
+            trusted.ptr() < 0x100000000ULL ? 1 : 0);
+    fflush(stderr);
+  }
   Tagged<Object> data = GetTrustedData(isolate);
+#if defined(V8_OS_MACOSX) || defined(V8_OS_LINUX) || defined(V8_OS_DARWIN)
+  // [GT-ZOMBIE-BT] Diagnostic: for the never-compiled ("zombie") SFI whose
+  // trusted data is not a HeapObject (unpublished interpreter_data == 0x100000000),
+  // unwind the NATIVE call chain so caller X of GetBytecodeArray can be
+  // symbolized. Gated on GT_HEAP_DIAG (read ONLY in this execution path, never in
+  // any GC path, so it does NOT perturb GC timing and cannot shift the race like
+  // GT_GC_DIAG does) and only on the bad-data path, so production is untouched.
+  if (::getenv("GT_HEAP_DIAG") && !Is<HeapObject>(data)) {
+    static int64_t gt_zseq = 0;
+    int64_t zseq = gt_zseq++;
+    GtCaptureNativeBacktrace();
+    fprintf(stderr, "[GT-ZOMBIE-BT] #%ld SFI=0x%tx data=0x%tx non_heap=%d "
+                    "native_frames=%d\n",
+            zseq, address(), data.ptr(), Is<HeapObject>(data) ? 1 : 0,
+            g_gt_bt.count);
+    for (int i = 0; i < g_gt_bt.count && i < 64; ++i) {
+      const Dl_info& info = g_gt_bt.infos[i];
+      fprintf(stderr, "[GT-ZOMBIE-BT]  #%02d pc=0x%tx image=%s base=0x%tx "
+                      "offset=0x%tx\n",
+              i, g_gt_bt.ips[i],
+              info.dli_fname ? info.dli_fname : "?",
+              reinterpret_cast<Address>(info.dli_fbase),
+              reinterpret_cast<Address>(g_gt_bt.ips[i]) -
+                  reinterpret_cast<Address>(info.dli_fbase));
+    }
+    fflush(stderr);
+  }
+#endif
   if (Tagged<Code> baseline_code; TryCast(data, &baseline_code)) {
     data = baseline_code->bytecode_or_interpreter_data();
   }
   if (Tagged<BytecodeArray> bytecode_array; TryCast(data, &bytecode_array)) {
     return bytecode_array;
   }
+  if (::getenv("GT_HEAP_DIAG") && !Is<InterpreterData>(data)) {
+    // About to hit the fatal. Capture the post-reassignment value + its map.
+    static int64_t gt_seq2 = 0;
+    int64_t seq = gt_seq2++;
+    Address raw_map = Is<HeapObject>(data)
+                          ? reinterpret_cast<Address*>(data.ptr())[0]
+                          : Address(0);
+    fprintf(stderr,
+            "[GT-CRASH-SITE] #%04ld SFI=0x%tx data=0x%tx data_IsHeap=%d "
+            "raw_map=0x%tx below_heap=%d script=0x%tx\n",
+            seq, address(), data.ptr(), Is<HeapObject>(data) ? 1 : 0, raw_map,
+            data.ptr() < 0x100000000ULL ? 1 : 0, script().ptr());
+    fflush(stderr);
+  }
+    // NEW: native frame walk naming the caller chain of GetActiveBytecodeArray
+    // on this never-compiled SFI. Green threads run recursively on the
+    // embedding thread here, so a StackFrameIterator over `isolate` reflects
+    // the live green-JS call chain. Prints JS-frame caller SFI addresses + PC
+    // so the exact calling function can be correlated against [GT-SLOT] lines.
+    {
+      static int64_t gt_seqf = 0;
+      int64_t seqf = gt_seqf++;
+      Isolate* cur = Isolate::Current();
+      // Capture several return + frame addresses; a single ra can land in a
+      // non-contiguous region of a release build, so higher levels disambiguate
+      // the real caller chain into GetActiveBytecodeArray.
+      Address ras[5] = {reinterpret_cast<Address>(__builtin_return_address(0)),
+                        reinterpret_cast<Address>(__builtin_return_address(1)),
+                        reinterpret_cast<Address>(__builtin_return_address(2)),
+                        reinterpret_cast<Address>(__builtin_return_address(3)),
+                        reinterpret_cast<Address>(__builtin_return_address(4))};
+      Address frs[5] = {reinterpret_cast<Address>(__builtin_frame_address(0)),
+                        reinterpret_cast<Address>(__builtin_frame_address(1)),
+                        reinterpret_cast<Address>(__builtin_frame_address(2)),
+                        reinterpret_cast<Address>(__builtin_frame_address(3)),
+                        reinterpret_cast<Address>(__builtin_frame_address(4))};
+      fprintf(stderr,
+              "[GT-STK] #%04ld into GetActiveBytecodeArray(on uncompiled "
+              "SFI 0x%tx, own_map=0x%tx) passed_isolate=%p current_isolate=%p "
+              "ra0=0x%tx\n",
+              seqf, address(), reinterpret_cast<Address*>(address())[0],
+              (void*)isolate, (void*)cur, ras[0]);
+      for (int i = 0; i < 5; ++i)
+        fprintf(stderr, "[GT-STK]  ra#%d=0x%tx fr#%d=0x%tx\n", i, ras[i], i,
+                frs[i]);
+      int n = 0, total = 0;
+      for (StackFrameIterator it(cur); !it.done(); it.Advance(), ++total) {
+        if (n < 64) {
+          StackFrame* frame = it.frame();
+          const char* kind = "?";
+          switch (frame->type()) {
+            case StackFrame::INTERPRETED: kind = "INTERPRETED"; break;
+            case StackFrame::BASELINE: kind = "BASELINE"; break;
+            case StackFrame::MAGLEV: kind = "MAGLEV"; break;
+            case StackFrame::TURBOFAN_JS: kind = "TURBOFAN_JS"; break;
+            case StackFrame::BUILTIN: kind = "BUILTIN"; break;
+            case StackFrame::BUILTIN_EXIT: kind = "BUILTIN_EXIT"; break;
+            case StackFrame::API_CALLBACK_EXIT: kind = "API_CALLBACK_EXIT"; break;
+            case StackFrame::API_CONSTRUCT_EXIT: kind = "API_CONSTRUCT_EXIT"; break;
+            case StackFrame::API_NAMED_ACCESSOR_EXIT: kind = "API_NAMED_ACCESSOR_EXIT"; break;
+            case StackFrame::API_INDEXED_ACCESSOR_EXIT: kind = "API_INDEXED_ACCESSOR_EXIT"; break;
+            case StackFrame::NATIVE: kind = "NATIVE"; break;
+            case StackFrame::STUB: kind = "STUB"; break;
+            case StackFrame::CONSTRUCT_ENTRY: kind = "CONSTRUCT_ENTRY"; break;
+            default: break;
+          }
+          bool is_js = (frame->type() == StackFrame::INTERPRETED ||
+                        frame->type() == StackFrame::BASELINE ||
+                        frame->type() == StackFrame::MAGLEV ||
+                        frame->type() == StackFrame::TURBOFAN_JS);
+          Address sfi_addr = Address(0);
+          bool is_this = false;
+          if (is_js) {
+            JavaScriptFrame* jsf = JavaScriptFrame::cast(frame);
+            Tagged<JSFunction> fn = jsf->function();
+            sfi_addr =
+                fn.ptr() ? reinterpret_cast<Address>(fn.ptr()) : Address(0);
+            is_this = sfi_addr != Address(0) &&
+                      sfi_addr == reinterpret_cast<Address>(this);
+          }
+          fprintf(stderr, "[GT-STK]  #%03d kind=%-22s sfi=0x%tx is_this_%s\n",
+                  n, kind, sfi_addr, is_this ? "Y" : "n");
+          n++;
+        }
+      }
+      fprintf(stderr, "[GT-STK] total_frames=%d first_n_printed=%d\n", total, n);
+      fflush(stderr);
+    }
   if (!Is<InterpreterData>(data)) {
     // See https://crbug.com/442277757
     InstanceType type = static_cast<InstanceType>(-1);

@@ -6,6 +6,9 @@
 #define V8_API_API_H_
 
 #include <memory>
+#include <execinfo.h>
+#include <cstdio>
+#include <cstdlib>
 
 #include "include/v8-container.h"
 #include "include/v8-cpp-heap-external.h"
@@ -373,6 +376,8 @@ class HandleScopeImplementer {
   // Returns the last entered context or an empty handle if no
   // contexts have been entered.
   inline DirectHandle<NativeContext> LastEnteredContext();
+  inline DirectHandle<NativeContext> EnteredContextAt(size_t i);
+  inline size_t SavedContextCount() const { return saved_contexts_.size(); }
 
   inline void SaveContext(Tagged<Context> context);
   inline Tagged<Context> RestoreContext();
@@ -381,6 +386,12 @@ class HandleScopeImplementer {
   inline DetachableVector<Address*>* blocks() { return &blocks_; }
   Isolate* isolate() const { return isolate_; }
 
+  // Cursor (next / limit / level) for THIS handle-scope stack. Route to it under
+  // green multi-worker mode from Isolate::handle_scope_data() so each worker's
+  // cursor is separate (the shared isolate_data_ cursor served the single
+  // embedding thread before the handle-scope phase).
+  HandleScopeData* scope_data() { return &handle_scope_data_; }
+
   void ReturnBlock(Address* block) {
     DCHECK_NOT_NULL(block);
     if (spare_ != nullptr) DeleteArray(spare_);
@@ -388,6 +399,13 @@ class HandleScopeImplementer {
   }
 
   static const size_t kEnteredContextsOffset;
+
+  // Roots ONLY this instance's handle blocks / entered-contexts. Used by
+  // ThreadDataTable::Iterate under green multi-worker mode, where every live OS
+  // worker owns its own HandleScopeImplementer: iterating the singleton would
+  // miss every worker except the GC thread's. Reads this instance's own cursor
+  // (which is the live per-worker cursor under green, so no refresh is needed).
+  V8_EXPORT_PRIVATE void IterateSelf(RootVisitor* v) { IterateThis(v); }
 
  private:
   void ResetAfterArchive() {
@@ -447,11 +465,47 @@ const int kHandleBlockSize = i::KB - 2;  // fit in one page
 
 void HandleScopeImplementer::SaveContext(Tagged<Context> context) {
   saved_contexts_.push_back(context);
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      entered_contexts_.size() != saved_contexts_.size()) {
+    static int once = 0;
+    if (++once <= 2) {
+      void* frames[24];
+      int nf = ::backtrace(frames, 24);
+      char** syms = ::backtrace_symbols(frames, nf);
+      ::fprintf(stderr,
+                "[SAVE-DIV-SEED] iso=%p entered=%zu saved=%zu ctx=%p\n",
+                (void*)isolate_, entered_contexts_.size(),
+                saved_contexts_.size(), (void*)context.address());
+      for (int i = 0; i < nf && i < 24; i++) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+      ::free(syms);
+    }
+    ::fflush(stderr);
+  }
 }
 
 Tagged<Context> HandleScopeImplementer::RestoreContext() {
   Tagged<Context> last_context = saved_contexts_.back();
   saved_contexts_.pop_back();
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      entered_contexts_.size() != saved_contexts_.size()) {
+    static int once2 = 0;
+    if (++once2 <= 2) {
+      void* frames[24];
+      int nf = ::backtrace(frames, 24);
+      char** syms = ::backtrace_symbols(frames, nf);
+      ::fprintf(stderr,
+                "[RESTORE-DIV-SEED] iso=%p entered=%zu saved=%zu\n",
+                (void*)isolate_, entered_contexts_.size(),
+                saved_contexts_.size());
+      for (int i = 0; i < nf && i < 24; i++) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+      ::free(syms);
+    }
+    ::fflush(stderr);
+  }
   return last_context;
 }
 
@@ -460,6 +514,20 @@ bool HandleScopeImplementer::HasSavedContexts() {
 }
 
 void HandleScopeImplementer::LeaveContext() {
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr,
+              "[CTX-LEAVE] iso=%p impl=%p tid=0x%lx count=%zu ctx=%p\n",
+              (void*)isolate_, (void*)this, (unsigned long)pthread_self(),
+              entered_contexts_.size(),
+              !entered_contexts_.empty()
+                ? (void*)entered_contexts_.back().address()
+                : (void*)0);
+    ::fprintf(stderr,
+              "  [DBGL] iso=%p entered=%zu saved=%zu\n",
+              (void*)isolate_, entered_contexts_.size() - 1,
+              saved_contexts_.size());
+    ::fflush(stderr);
+  }
   DCHECK(!entered_contexts_.empty());
   entered_contexts_.pop_back();
 }

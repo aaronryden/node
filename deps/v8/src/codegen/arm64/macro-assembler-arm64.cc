@@ -21,6 +21,9 @@
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/execution/frame-constants.h"
 #include "src/execution/frames-inl.h"
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+#include "src/execution/execution-state.h"
+#endif
 #include "src/heap/mutable-page.h"
 #include "src/init/bootstrapper.h"
 #include "src/logging/counters.h"
@@ -2150,6 +2153,31 @@ void MacroAssembler::LoadRootRegisterOffset(Register destination,
     Add(destination, kRootRegister, offset);
   }
 }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+void MacroAssembler::LoadExecutionField(Register destination,
+                                        IsolateFieldId id) {
+  Ldr(destination,
+      MemOperand(kExecutionStateRegister,
+                 static_cast<int32_t>(ExecutionState::FieldOffset(id))));
+}
+
+void MacroAssembler::StoreExecutionField(IsolateFieldId id, Register value) {
+  Str(value,
+      MemOperand(kExecutionStateRegister,
+                 static_cast<int32_t>(ExecutionState::FieldOffset(id))));
+}
+
+void MacroAssembler::LoadExecutionFieldAddress(Register destination,
+                                               IsolateFieldId id) {
+  intptr_t offset = ExecutionState::FieldOffset(id);
+  if (offset == 0) {
+    Mov(destination, kExecutionStateRegister);
+  } else {
+    Add(destination, kExecutionStateRegister, offset);
+  }
+}
+#endif
 
 MemOperand MacroAssembler::ExternalReferenceAsOperand(
     ExternalReference reference, Register scratch) {

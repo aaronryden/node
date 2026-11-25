@@ -51,6 +51,30 @@
       }
     },
     'conditions': [
+      # AddressSanitizer seam. v8.gyp includes only toolchain.gypi +
+      # features.gypi (never common.gypi), and V8's inline sources build into
+      # node's obj/ here, so the config.gypi 'asan' flag only reaches the
+      # green-thread/CoW fault (deps/v8/src) when injected into this own
+      # target_defaults.conditions block. Instrumenting V8 is required for ASan
+      # to report the use-after-free / torn pointer that lives only in V8 TUs.
+      ['asan==1', {
+        'cflags': [
+          '-fno-omit-frame-pointer',
+          '-fsanitize=address',
+          '-fsanitize-address-use-after-scope',
+        ],
+        'cflags_cc': [
+          '-fno-omit-frame-pointer',
+          '-fsanitize=address',
+          '-fsanitize-address-use-after-scope',
+        ],
+        'defines': [
+          'V8_USE_ADDRESS_SANITIZER',
+        ],
+        'ldflags': [
+          '-fsanitize=address',
+        ],
+      }],
       # Build with -fvisibility=hidden and -fvisibility-inlines-hidden to avoid
       # including unnecessary internal symbols, which may lead to run-time fixups.
       # This is not done on AIX where symbols are exported by tools/create_expfile.sh
@@ -1085,6 +1109,16 @@
         ['v8_enable_snapshot_compression==1', {
           'sources': [
             '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "\\"v8_base_without_compiler.*?v8_enable_snapshot_compression.*?sources \\+= ")',
+          ],
+        }],
+        # Green threads: the scheduler + COW write-barrier sources are appended
+        # inside an `if (v8_enable_green_threads)` block at the tail of the
+        # v8_base_without_compiler source set in BUILD.gn. GN-scraper has no
+        # notion of the gate, so scrape the appended list explicitly when the
+        # embedder enabled green threads (see common.gypi / features.gypi).
+        ['v8_enable_green_threads==1', {
+          'sources': [
+            '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "\\"v8_base_without_compiler.*?v8_enable_green_threads.*?sources \\+= ")',
           ],
         }],
         ['v8_enable_temporal_support==1', {

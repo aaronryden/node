@@ -327,7 +327,18 @@
     'v8_advanced_bigint_algorithms%': 1,
 
     # Enable 256-bit long vector re-vectorization pass in WASM compilation pipeline.
-    'v8_enable_wasm_simd256_revec%' : 0
+    'v8_enable_wasm_simd256_revec%' : 0,
+
+    # Enable green threads with copy-on-write heap isolation.
+    # Sets -DV8_ENABLE_GREEN_THREADS.
+    'v8_enable_green_threads%': 1,
+
+    # Enable per-worker execution-state (candidate b) transport proof.
+    # Sets -DV8_ENABLE_GREEN_WORKER_EXECUTION_STATE. The canonical default is in
+    # common.gypi; it is redeclared here so the value is resolvable inside this
+    # file's own target_defaults conditions (common.gypi's variables are not in
+    # scope here). ON for this fork (mirrors v8_enable_green_threads).
+    'v8_enable_green_worker_execution_state%': 1
   },
 
   'target_defaults': {
@@ -545,6 +556,12 @@
       }],
       ['v8_enable_wasm_simd256_revec==1', {
         'defines': ['V8_ENABLE_WASM_SIMD256_REVEC',],
+      }],
+      ['v8_enable_green_threads==1', {
+        'defines': ['V8_ENABLE_GREEN_THREADS',],
+      }],
+      ['v8_enable_green_worker_execution_state==1', {
+        'defines': ['V8_ENABLE_GREEN_WORKER_EXECUTION_STATE',],
       }],
     ],  # conditions
     'defines': [

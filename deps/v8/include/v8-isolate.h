@@ -904,6 +904,17 @@ class V8_EXPORT Isolate {
   void Exit();
 
   /**
+   * Green-thread support. Marks this isolate as a green-thread isolate so that
+   * Enter()/Exit() keep each OS worker thread's EntryStackItem chain in its own
+   * PerIsolateThreadData, letting several worker threads Enter the same isolate
+   * concurrently. Internal-use: the green-thread embedder sets this once at
+   * isolate creation. Every other isolate leaves it untouched, keeping that
+   * isolate's single-threaded entry path byte-for-byte unchanged.
+   */
+  V8_EXPORT void SetGreenThreadMode(bool mode);
+  V8_EXPORT bool isGreenThreadMode() const;
+
+  /**
    * Deinitializes and frees the isolate. The isolate must not be entered by any
    * thread to be disposable.
    */

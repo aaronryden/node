@@ -7,10 +7,32 @@
 
 // This header file is included outside of src/heap/.
 // Avoid including src/heap/ internals.
+#include <atomic>
+
 #include "include/v8-internal.h"
 #include "src/common/checks.h"
 
 namespace v8::internal {
+
+// Single process-wide instance for the concurrent young-gen allocation gate.
+// Must be an inline variable (C++17), NOT a function-local static inside an
+// inline function: a function-local static is permitted to have a distinct
+// instance per translation unit that instantiates the inline function, so the
+// green-threads setter (green-thread-cow.cc) armed one copy while IncrementTop
+// and AllocateFastAligned (other objects in libv8_base_without_compiler) kept
+// reading their own always-false copy -- the parallel young-gen bump then raced
+// the LAB reset. An inline variable has external/weak linkage and the linker
+// deduplicates it to exactly one object across the whole program, so every
+// reader and the single writer always touch the same memory. Zero-overhead for
+// the common (flag-off) case: a relaxed load that the compiler lowers to a
+// plain load on every target.
+inline std::atomic<bool> g_concurrent_allocation_gate{false};
+
+// Reference accessor keeps every existing call site (IncrementTop,
+// AllocateFastAligned, the green setter) unchanged while reading g inline.
+inline std::atomic<bool>& ConcurrentLinearAllocationGate() {
+  return g_concurrent_allocation_gate;
+}
 
 // A linear allocation area to allocate objects from.
 //
@@ -39,10 +61,62 @@ class LinearAllocationArea final {
   }
 
   V8_INLINE Address IncrementTop(size_t bytes) {
+    if (V8_UNLIKELY(
+            ConcurrentLinearAllocationGate().load(std::memory_order_relaxed))) {
+      return TryIncrementTopAtomic(bytes);
+    }
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DUMP")) {
+      ::fprintf(stderr, "[LAB] serial top=%p limit=%p bytes=%zu -> %p\n",
+                (void*)top_, (void*)limit_, bytes, (void*)top_);
+      if (V8_UNLIKELY(top_ < 0x100000)) {
+        ::fprintf(stderr,
+                  "[LAB-SMALL] reserved=%p start=%p limit=%p bytes=%zu "
+                  "top_after=%p\n",
+                  (void*)top_, (void*)start_, (void*)limit_, bytes,
+                  (void*)(top_ + bytes));
+      }
+    }
+#endif
     Address old_top = top_;
     top_ += bytes;
     Verify();
     return old_top;
+  }
+
+  // Lock-free reservation within [top_, limit_). Returns the reserved old top,
+  // or kNullAddress if the region is exhausted, so the caller falls back to
+  // refreshing the LAB / the slow path. CAS retries while another mutator
+  // advances top_; a plain (relaxed) load of limit_ is safe because only the
+  // main thread/refill changes it. top_ stays a plain member (the class must
+  // remain standard-layout for offsetof / IsolateData serialization); the
+  // atomic CAS operates on it through std::atomic_ref.
+  V8_INLINE Address TryIncrementTopAtomic(size_t bytes) {
+    std::atomic_ref<Address> ref(top_);
+    Address current = ref.load(std::memory_order_relaxed);
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_GT_DUMP")) {
+      ::fprintf(stderr, "[CAS] current=%p limit=%p bytes=%zu\n", (void*)current,
+                (void*)limit_, bytes);
+    }
+#endif
+    for (;;) {
+      if (V8_UNLIKELY(current + bytes > limit_)) return kNullAddress;
+      if (ref.compare_exchange_weak(current, current + bytes,
+                                    std::memory_order_relaxed)) {
+        Verify();
+#ifdef V8_ENABLE_GREEN_THREADS
+        if (::getenv("GT_GT_DUMP") && V8_UNLIKELY(current < 0x100000)) {
+          ::fprintf(stderr,
+                    "[CAS-SMALL] reserved=%p start=%p top=%p limit=%p "
+                    "bytes=%zu\n",
+                    (void*)current, (void*)start_, (void*)top_,
+                    (void*)limit_, bytes);
+        }
+#endif
+        return current;
+      }
+    }
   }
 
   V8_INLINE bool DecrementTopIfAdjacent(Address new_top, size_t bytes) {

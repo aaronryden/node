@@ -289,6 +289,7 @@ constexpr bool CanTriggerGC(T... properties) {
   F(FatalInvalidSize, 0, 1)                                \
   F(GetAndResetRuntimeCallStats, -1 /* <= 2 */, 1)         \
   F(GetAndResetTurboProfilingData, 0, 1)                   \
+  F(GetExecutionStateBase, 0, 1)                           \
   F(GetTemplateObject, 3, 1)                               \
   F(IncrementUseCounter, 1, 1)                             \
   F(InvalidateStringWrapperToPrimitiveProtector, 1, 1)     \

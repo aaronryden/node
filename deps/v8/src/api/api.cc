@@ -152,7 +152,6 @@
 #include "src/wasm/value-type.h"
 #include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-js.h"
-#include "src/wasm/wasm-limits.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-result.h"
 #include "src/wasm/wasm-serialization.h"
@@ -903,6 +902,33 @@ void Context::Enter() {
   impl->EnterContext(env);
   impl->SaveContext(i_isolate->context());
   i_isolate->set_context(env);
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      impl->EnteredContextCount() != impl->SavedContextCount()) {
+    void* frames[24];
+    int nf = ::backtrace(frames, 24);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr, "[ENTER-CLEAN-BAD] iso=%p entered=%zu saved=%zu\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              impl->SavedContextCount());
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    E#%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 24; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") ||
+          ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+          ::strstr(syms[i], "CopyValueAcross") ||
+          ::strstr(syms[i], "GreenCapture") ||
+          ::strstr(syms[i], "GreenRebuild") ||
+          ::strstr(syms[i], "Context::Enter")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
 }
 
 void Context::Exit() {
@@ -910,12 +936,65 @@ void Context::Exit() {
   i::Isolate* i_isolate = i::Isolate::Current();
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   i::HandleScopeImplementer* impl = i_isolate->handle_scope_implementer();
-  if (!Utils::ApiCheck(impl->LastEnteredContextWas(*env), "v8::Context::Exit()",
-                       "Cannot exit non-entered context")) {
+  if (!impl->LastEnteredContextWas(*env)) {
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      void* frames[24];
+      int nf = ::backtrace(frames, 24);
+      char** syms = ::backtrace_symbols(frames, nf);
+      ::fprintf(stderr,
+                "[CTX-EXIT-SKIP] iso=%p impl=%p ctx=%p entered=%zu top=%p\n",
+                (void*)i_isolate, (void*)impl, (void*)env->address(),
+                impl->EnteredContextCount(),
+                impl->EnteredContextCount()
+                  ? (void*)impl->LastEnteredContext().address()
+                  : (void*)0);
+      for (int i = 0; i < nf && i < 24; i++) {
+        if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+            ::strstr(syms[i], "RelocateFunction") || ::strstr(syms[i], "InstallGreenAsync") ||
+            ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+            ::strstr(syms[i], "Script::Run") || ::strstr(syms[i], "Context::") ||
+            ::strstr(syms[i], "EnterContext") || ::strstr(syms[i], "RunPartition") ||
+            ::strstr(syms[i], "DriveGreen")) {
+          ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+        }
+      }
+      ::free(syms);
+      ::fflush(stderr);
+    }
     return;
   }
   impl->LeaveContext();
   i_isolate->set_context(impl->RestoreContext());
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      impl->EnteredContextCount() != impl->SavedContextCount()) {
+    void* frames[24];
+    int nf = ::backtrace(frames, 24);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr, "[EXIT-CLEAN-BAD] iso=%p entered=%zu saved=%zu top=%p\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              impl->SavedContextCount(),
+              impl->EnteredContextCount()
+                ? (void*)impl->LastEnteredContext().address()
+                : (void*)0);
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    E#%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 24; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") ||
+          ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+          ::strstr(syms[i], "CopyValueAcross") ||
+          ::strstr(syms[i], "GreenCapture") ||
+          ::strstr(syms[i], "GreenRebuild") ||
+          ::strstr(syms[i], "Context::Exit")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
 }
 
 Context::BackupIncumbentScope::BackupIncumbentScope(
@@ -1884,6 +1963,13 @@ ScriptCompiler::StreamedSource::~StreamedSource() = default;
 Local<Script> UnboundScript::BindToCurrentContext() {
   auto function_info = Utils::OpenDirectHandle(this);
   i::Isolate* i_isolate = i::Isolate::Current();
+#if V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_BIND") != nullptr) {
+    ::fprintf(stderr, "[GTDBG-BIND] iso=%p this=%p api_ext=%p\n",
+              (void*)i_isolate, (void*)this,
+              (void*)i_isolate->api_external_references());
+  }
+#endif
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   i::DirectHandle<i::JSFunction> function =
       i::Factory::JSFunctionBuilder{i_isolate, function_info,
@@ -4752,16 +4838,6 @@ MaybeLocal<Value> v8::Object::GetPrivate(Local<Context> context,
 
 Maybe<PropertyAttribute> v8::Object::GetPropertyAttributes(
     Local<Context> context, Local<Value> key) {
-  PropertyAttribute attributes = PropertyAttribute::None;
-  auto result = GetPropertyAttributes(context, key, &attributes);
-  if (result.IsNothing()) return {};
-  // This will confusingly return None when the property doesn't exist.
-  return Just(attributes);
-}
-
-Maybe<bool> v8::Object::GetPropertyAttributes(
-    Local<Context> context, Local<Value> key,
-    PropertyAttribute* out_attributes) {
   auto i_isolate = i::Isolate::Current();
   EnterV8Scope<> api_scope{i_isolate, context,
                            RCCId::kAPI_Object_GetPropertyAttributes};
@@ -4774,10 +4850,9 @@ Maybe<bool> v8::Object::GetPropertyAttributes(
   auto result = i::JSReceiver::GetPropertyAttributes(i_isolate, self, key_name);
   if (result.IsNothing()) return {};
   if (result.FromJust() == i::ABSENT) {
-    return Just(false);
+    return Just(static_cast<PropertyAttribute>(i::NONE));
   }
-  *out_attributes = static_cast<PropertyAttribute>(result.FromJust());
-  return Just(true);
+  return Just(static_cast<PropertyAttribute>(result.FromJust()));
 }
 
 MaybeLocal<Value> v8::Object::GetOwnPropertyDescriptor(Local<Context> context,
@@ -6370,26 +6445,6 @@ bool TryHandleWebAssemblyTrapWindows(EXCEPTION_POINTERS* exception) {
 }
 #endif
 
-size_t V8::GetWasmMemoryReservationSizeInBytes(WasmMemoryType type,
-                                               size_t byte_capacity) {
-#if V8_ENABLE_WEBASSEMBLY
-  bool is_memory64 = type == WasmMemoryType::kMemory64;
-  uint64_t max_byte_capacity =
-      is_memory64 ? i::wasm::max_mem64_bytes() : i::wasm::max_mem32_bytes();
-  if (byte_capacity > max_byte_capacity) {
-    byte_capacity = static_cast<size_t>(max_byte_capacity);
-  }
-#if V8_TRAP_HANDLER_SUPPORTED
-  if (!is_memory64 || i::v8_flags.wasm_memory64_trap_handling) {
-    return i::BackingStore::GetWasmReservationSize(
-        /* has_guard_regions */ true, byte_capacity,
-        /* is_wasm_memory64 */ is_memory64);
-  }
-#endif  // V8_TRAP_HANDLER_SUPPORTED
-#endif  // V8_ENABLE_WEBASSEMBLY
-  return byte_capacity;
-}
-
 bool V8::EnableWebAssemblyTrapHandler(bool use_v8_signal_handler) {
 #if V8_ENABLE_WEBASSEMBLY
   return i::trap_handler::EnableTrapHandler(use_v8_signal_handler);
@@ -7113,6 +7168,38 @@ void Context::SetMicrotaskQueue(v8::MicrotaskQueue* queue) {
   Utils::ApiCheck(context->microtask_queue()->GetMicrotasksScopeDepth() == 0,
                   "v8::Context::SetMicrotaskQueue",
                   "Must not have microtask scope pushed");
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr,
+              "[GT_DEBUG_ENTCTX] iso=%p impl=%p entered=%zu last=%p\n",
+              (void*)i_isolate, (void*)impl, impl->EnteredContextCount(),
+              impl && impl->EnteredContextCount()
+                ? (void*)impl->LastEnteredContext().address()
+                : (void*)0);
+    ::fflush(stderr);
+  }
+  if (impl->EnteredContextCount() != 0 && ::getenv("GT_DEBUG_ENTCTX")) {
+    void* frames[32];
+    int nf = ::backtrace(frames, 32);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr,
+              "[SETMQ-LEAKED] iso=%p entered=%zu back=%p\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              (void*)impl->LastEnteredContext().address());
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    STACK #%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 32; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") || ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "SpawnAll") || ::strstr(syms[i], "GreenJS") ||
+          ::strstr(syms[i], "SetMicrotaskQueue")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
   Utils::ApiCheck(impl->EnteredContextCount() == 0,
                   "v8::Context::SetMicrotaskQueue()",
                   "Cannot set Microtask Queue with an entered context");
@@ -8115,6 +8202,16 @@ uint32_t GetLength(Tagged<JSArray> array) {
   Tagged<Number> length = array->length();
   if (IsSmi(length)) return Smi::ToInt(length);
   return static_cast<uint32_t>(Object::NumberValue(length));
+}
+
+// Public-API route to Isolate::handle_scope_data() (see the declaration in
+// v8-internal.h). Needed here because it dereferences the complete Isolate type;
+// the inline public path in v8-local-handle.h only has v8::Isolate*. Routed
+// through the member so the public HandleScope / CreateHandle / Local::New see
+// the same per-worker cursor the internal allocation path uses under the green
+// handle-scope phase.
+HandleScopeData* GetRoutedHandleScopeData(v8::Isolate* isolate) {
+  return reinterpret_cast<Isolate*>(isolate)->handle_scope_data();
 }
 
 }  // namespace internal
@@ -10145,6 +10242,17 @@ void Isolate::Enter() {
 void Isolate::Exit() {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   i_isolate->Exit();
+}
+
+void Isolate::SetGreenThreadMode(bool mode) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
+  i_isolate->set_green_thread_mode(mode);
+}
+
+bool Isolate::isGreenThreadMode() const {
+  i::Isolate* i_isolate =
+      reinterpret_cast<i::Isolate*>(const_cast<Isolate*>(this));
+  return i_isolate->is_green_thread_mode();
 }
 
 void Isolate::SetAbortOnUncaughtExceptionCallback(

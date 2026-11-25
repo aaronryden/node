@@ -13,6 +13,12 @@
 #include "src/builtins/builtins-inl.h"
 #include "src/common/code-memory-access-inl.h"
 #include "src/objects/objects-inl.h"
+// green-thread-cow.h is pulled in transitively via objects-inl.h ->
+// heap-write-barrier-inl.h, but that include may not resolve before this TU
+// uses GreenThreadCowSharedWriterScope, so include it explicitly.
+#if V8_ENABLE_GREEN_THREADS
+#include "src/execution/green-thread-cow.h"
+#endif  // V8_ENABLE_GREEN_THREADS
 #include "src/sandbox/external-entity-table-inl.h"
 #include "src/snapshot/embedded/embedded-data.h"
 
@@ -24,7 +30,6 @@ void JSDispatchEntry::MakeJSDispatchEntry(Address object, Address entrypoint,
                                           uint16_t parameter_count,
                                           bool mark_as_alive) {
   DCHECK_EQ(object & kHeapObjectTag, 0);
-#if !defined(__illumos__) || !defined(V8_TARGET_ARCH_64_BIT)
   DCHECK_EQ((((object - kObjectPointerOffset) << kObjectPointerShift) >>
              kObjectPointerShift) +
                 kObjectPointerOffset,
@@ -32,7 +37,6 @@ void JSDispatchEntry::MakeJSDispatchEntry(Address object, Address entrypoint,
   DCHECK_EQ((object - kObjectPointerOffset) + kObjectPointerOffset, object);
   DCHECK_LT((object - kObjectPointerOffset),
             1ULL << ((sizeof(encoded_word_) * 8) - kObjectPointerShift));
-#endif /* __illumos__ & 64-bit */
 
   Address payload = ((object - kObjectPointerOffset) << kObjectPointerShift) |
                     (parameter_count & kParameterCountMask);
@@ -58,16 +62,8 @@ Address JSDispatchEntry::GetCodePointer() const {
   // and so may be 0 or 1 here. As the return value is a tagged pointer, the
   // bit must be 1 when returned, so we need to set it here.
   Address payload = encoded_word_.load(std::memory_order_acquire);
-#if defined(__illumos__) && defined(V8_TARGET_ARCH_64_BIT)
-  // Unsigned types won't sign-extend on shift-right, but we need to do
-  // this with illumos VA48 addressing.
-  DCHECK_EQ(kObjectPointerOffset, 0);
-  return (Address)((intptr_t)payload >> (int)kObjectPointerShift) |
-    kHeapObjectTag;
-#else
   return ((payload >> kObjectPointerShift) + kObjectPointerOffset) |
          kHeapObjectTag;
-#endif /* __illumos__ & 64-bit */
 }
 
 Tagged<Code> JSDispatchEntry::GetCode() const {
@@ -130,6 +126,11 @@ void JSDispatchTable::SetTieringRequest(JSDispatchHandle handle,
   uint32_t index = HandleToIndex(handle);
   DCHECK_GE(index, kEndOfReadOnlyIndex);
   CFIMetadataWriteScope write_scope("JSDispatchTable update");
+#if V8_ENABLE_GREEN_THREADS
+  // The entrypoint store shares this dispatch entry with SetCodeAndEntrypointPointer;
+  // serialize tiering-request writes against other CoW writers too.
+  GreenThreadCowSharedWriterScope shared_writer_scope;
+#endif
   at(index).SetEntrypointPointer(
       isolate->builtin_entry_table()[static_cast<uint32_t>(builtin)]);
 }
@@ -195,6 +196,13 @@ std::optional<JSDispatchHandle> JSDispatchTable::TryAllocateAndInitializeEntry(
 
 void JSDispatchEntry::SetCodeAndEntrypointPointer(Address new_object,
                                                   Address new_entrypoint) {
+#if V8_ENABLE_GREEN_THREADS
+  // Concurrent writers to one JSDispatchTable entry perform a two-field
+  // read-modify-write here (code pointer + entrypoint); the fields are each
+  // atomic but the combined RMW is not, so serialize it against other CoW
+  // writers to avoid interleaving into a corrupt entry.
+  GreenThreadCowSharedWriterScope shared_writer_scope;
+#endif
   Address old_payload = encoded_word_.load(std::memory_order_relaxed);
   Address marking_bit = old_payload & kMarkingBit;
   Address parameter_count = old_payload & kParameterCountMask;
@@ -229,12 +237,7 @@ void JSDispatchEntry::MakeFreelistEntry(uint32_t next_entry_index) {
 bool JSDispatchEntry::IsFreelistEntry() const {
 #ifdef V8_TARGET_ARCH_64_BIT
   auto entrypoint = entrypoint_.load(std::memory_order_relaxed);
-#ifdef __illumos__
-  // See the illumos definition of kFreeEntryTag for why we have to do this.
-  return (entrypoint & 0xffff000000000000ull) == kFreeEntryTag;
-#else
   return (entrypoint & kFreeEntryTag) == kFreeEntryTag;
-#endif /* __illumos__ */
 #else
   return next_free_entry_.load(std::memory_order_relaxed) != 0;
 #endif

@@ -716,6 +716,9 @@ class Heap final {
   // Prepares the heap, setting up for deserialization.
   void InitializeMainThreadLocalHeap(LocalHeap* main_thread_local_heap);
 
+  // (Re-)Initialize hash seed from flag or RNG.
+  void InitializeHashSeed();
+
   // Invoked once for the process from V8::Initialize.
   static void InitializeOncePerProcess();
 
@@ -1996,6 +1999,24 @@ class Heap final {
 
   bool always_allocate() const { return always_allocate_scope_count_ != 0; }
 
+  // Enter/leave a GC-free allocation region WITHOUT the RAII wrapper, so a
+  // coordinator can hold the window across a forced-GC barrier (leave, collect,
+  // re-enter) rather than needing two nested scopes. This mirrors the effect of
+  // AlwaysAllocateScope exactly: while the count is non-zero the heap GROWS
+  // instead of collecting -- the young scavenger, mark-compact, and incremental
+  // marking all skip (see ShouldExpand*OnSlowAllocation and incremental-marking)
+  // -- so a concurrent mutator can never reclaim or relocate an object another
+  // still-reachable mutator references. That is what makes the fast-path map /
+  // dictionary-fallback / heap-object-field reads in a JIT body observe a
+  // consistent heap (without it, a GC reclaim leaves a freed pointer in a live
+  // body -- the SIGSEGV the parallel allocation used to hit). The count is
+  // atomic and may be acquired or released from different threads; GC resumes
+  // normally once it returns to zero.
+  public:
+  inline void EnterAlwaysAllocation() { ++always_allocate_scope_count_; }
+  inline void LeaveAlwaysAllocation() { --always_allocate_scope_count_; }
+
+  private:
   bool ShouldExpandOldGenerationOnSlowAllocation(LocalHeap* local_heap,
                                                  AllocationOrigin origin);
   bool ShouldExpandYoungGenerationOnSlowAllocation(size_t allocation_size);

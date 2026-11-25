@@ -558,6 +558,7 @@ Isolate::PerIsolateThreadData*
 Isolate::FindOrAllocatePerThreadDataForThisThread() {
   ThreadId thread_id = ThreadId::Current();
   PerIsolateThreadData* per_thread = nullptr;
+  bool freshly_allocated = false;
   {
     base::MutexGuard lock_guard(&thread_data_table_mutex_);
     per_thread = thread_data_table_.Lookup(thread_id);
@@ -567,11 +568,92 @@ Isolate::FindOrAllocatePerThreadDataForThisThread() {
       }
       per_thread = new PerIsolateThreadData(this, thread_id);
       thread_data_table_.Insert(per_thread);
+      freshly_allocated = true;
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+    // Handle-scope phase: give this (isolate, OS-thread) its own
+    // HandleScopeImplementer so concurrent green workers each own their handle
+    // blocks / entered-contexts / cursor. Kept off for non-green isolates, which
+    // continue sharing the IsolateData singleton as before.
+    if (green_thread_mode_)
+      per_thread->handle_scope_impl_ = new HandleScopeImplementer(this);
+#endif
     }
     DCHECK(thread_data_table_.Lookup(thread_id) == per_thread);
   }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Green-thread isolates run several OS workers at once, each with its own
+  // PerIsolateThreadData here. Give each worker its own ExecutionState (which
+  // embeds a ThreadLocalTop at offset 0, &es == &top), mirroring
+  // Isolate::InitializeThreadLocal for the shared block (Clear + the_hole
+  // exception/pending_message init), but only the execution state -- handle
+  // scopes stay on the shared isolate_data_.handle_scope_data_ because C++
+  // HandleScopes are managed on the embedding thread across a single
+  // cross-isolate API sequence (e.g. EnsureGreenContext -> Context::New) where
+  // CurrentPerIsolateThreadData() shifts, making a per-worker handle block
+  // inconsistent. Done outside the lock and directly on {per_thread}:
+  // CurrentPerIsolateThreadData() is not this data yet (SetIsolateThreadLocals
+  // installs it afterwards), and routing through the accessor here would touch
+  // the wrong block.
+  // Initialize this worker's ExecutionState only the first time this thread's
+  // PerIsolateThreadData is allocated (freshly_allocated). Re-initializing on every
+  // Enter() would wipe the live context/exception/handler chain of a green body
+  // mid-flight (nested Isolate::Scope / Context::Scope calls re-Enter and route back
+  // through FindOrAllocate) -- the throw-mode regression. A live worker block must
+  // never be re-Cleared. Runs outside the lock, directly on the fresh {per_thread}.
+  if (green_thread_mode_ && per_thread != nullptr) {
+    PerIsolateThreadData* data = per_thread;
+    // The block must be initialized exactly once -- the first time it goes active
+    // in green mode. freshly_allocated is unreliable as the trigger: a block may
+    // be created during isolate init (before SetGreenThreadMode turns green mode
+    // on) and only reach green mode on the first Enter. Detect not-yet-initialized
+    // via unset isolate_ (Clear() leaves it null); a live block carries a non-null
+    // isolate_ and must never be re-Cleared.
+    if (data->execution_state_.top.isolate_ == nullptr) {
+      data->execution_state_.top.Initialize(this);
+    }
+    // Resting exception_/pending_message_ must be the_hole, not their Clear()
+    // defaults: a resting Smi::zero / null is *not* the_hole, so has_exception() /
+    // has_pending_message() read them as "set". That lets ReportPendingMessages
+    // treat an idle worker as carrying an exception+message and Cast a null message
+    // (the spawn SIGSEGV). Idempotent -- only fill while still at the resting 0
+    // value; a live body's exception/message is a real (non-null) object and is
+    // never clobbered.
+    {
+      PtrComprCageAccessScope ptr_compr_cage_access_scope(this);
+      if (data->execution_state_.top.exception_.ptr() == 0) {
+        data->execution_state_.top.exception_ =
+            ReadOnlyRoots(this).the_hole_value();
+      }
+      if (data->execution_state_.top.pending_message_.ptr() == 0) {
+        data->execution_state_.top.pending_message_ =
+            ReadOnlyRoots(this).the_hole_value();
+      }
+    }
+  }
+#endif
   return per_thread;
 }
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+ExecutionState* Isolate::CurrentExecutionStateBase() {
+  // Phase ii per-worker execution-state base. Green-thread isolates run several
+  // OS workers concurrently, so x25 must be armed to THIS worker's block, not
+  // the shared ThreadLocalTop. Use the PerIsolateThreadData registered for the
+  // current thread -- its `isolate_` is *this* green isolate (the code calling
+  // us was generated for it), so `is_green_thread_mode()` is true here even in
+  // the recursive embedding model where TryGetCurrent() would return the
+  // outer isolate and wrongly arm x25 to the shared block, desyncing the JS
+  // entry writes (c_entry_fp / js_entry_sp) from what the unwind walk reads.
+  PerIsolateThreadData* data = CurrentPerIsolateThreadData();
+  if (data && data->isolate()->is_green_thread_mode()) {
+    return &data->execution_state_;
+  }
+  Isolate* iso = data != nullptr ? data->isolate() : TryGetCurrent();
+  return reinterpret_cast<ExecutionState*>(
+      &iso->isolate_data_.thread_local_top_);
+}
+#endif
 
 void Isolate::DiscardPerThreadDataForThisThread() {
   ThreadId thread_id = ThreadId::TryGetCurrent();
@@ -4240,7 +4322,90 @@ Isolate::PerIsolateThreadData::~PerIsolateThreadData() {
 #if defined(USE_SIMULATOR)
   delete simulator_;
 #endif
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  delete handle_scope_impl_;
+#endif
 }
+
+HandleScopeData* Isolate::handle_scope_data() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Handle-scope phase: route the cursor to THIS OS worker's per-thread
+  // HandleScopeImplementer so concurrent bodies do not share the
+  // isolate_data_ cursor (which would corrupt each other's handle stacks).
+  // Routed here (not inline in isolate.h) because scope_data() needs the
+  // complete HandleScopeImplementer type, available only where api-inl.h is
+  // included. Uses WorkerHandleScopeImpl() so the cursor and impl are always the
+  // same instance under green bodies, and the shared cursor is kept for the
+  // cross-isolate setup path.
+  if (HandleScopeImplementer* impl = WorkerHandleScopeImpl()) {
+    HandleScopeData* cur = impl->scope_data();
+    return cur;
+  }
+#endif
+  return &isolate_data_.handle_scope_data_;
+}
+
+HandleScopeImplementer* Isolate::WorkerHandleScopeImpl() {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  const bool opt_in = handle_scope_per_worker() && green_thread_mode_;
+  // Handle-scope phase: route to THIS OS worker's HandleScopeImplementer ONLY
+  // while the embedder has explicitly opted in (set_handle_scope_per_worker true
+  // around multi-worker body dispatch in RunTasks / M2Probe). green_thread_mode_
+  // ensures the per-worker impl exists (allocated in FindOrAllocate with a
+  // non-null handle_scope_impl_); the per-isolate flag is the unambiguous signal
+  // that a live multi-worker body is executing, cleanly separating that from the
+  // single-threaded cross-isolate setup sequence, where handle_state stays on
+  // the shared IsolateData singleton. current_green_thread_ is NOT used here:
+  // it is written via CurrentPerIsolateThreadData() but read across the
+  // cross-isolate setup where that pointer shifts, so it diverges from the
+  // FindPerThreadDataForThisThread() PTD this routing keys on.
+  if (opt_in) {
+    if (PerIsolateThreadData* pd = FindPerThreadDataForThisThread()) {
+      if (pd->handle_scope_impl_ != nullptr) {
+        return pd->handle_scope_impl_;
+      }
+#ifdef V8_ENABLE_GREEN_THREADS
+      if (::getenv("GT_DEBUG_ENTCTX")) {
+        ::fprintf(stderr,
+                  "[WSI] iso=%p opt_in=1 pd=%p handle_scope_impl_=NULL\n",
+                  (void*)this, (void*)pd);
+        ::fflush(stderr);
+      }
+#endif
+    }
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      ::fprintf(stderr,
+                "[WSI] iso=%p opt_in=%d\n",
+                (void*)this, (int)opt_in);
+      ::fflush(stderr);
+    }
+#endif
+  }
+#endif
+  return nullptr;
+}
+
+// Handle-scope phase: embedder-facing entry to toggle per-worker handle-cursor
+// routing on a green-thread isolate. Defined in isolate.cc (which owns the full
+// Isolate type and the flag) and declared in green-thread.h so green_threads.cc
+// can call it without pulling in isolate.h / heap.h.
+void SetIsolateHandleScopePerWorker(Isolate* iso, bool on) {
+  if (iso != nullptr) iso->set_handle_scope_per_worker(on);
+}
+
+// Handle-scope phase: returns THIS OS thread's routed HandleScopeImplementer
+// (per-worker impl under green multi-worker drives, shared impl otherwise),
+// matching what C++ HandleScope / Context::Enter use. Native microtask
+// EnterContext/RewindEnteredContext builtins call this (not the cached shared
+// field) so their entered_contexts_ bookkeeping lands on the same impl and is
+// rewound by the same EnteredContextRewindScope, fixing the divergence that
+// otherwise leaves native-entered contexts unrewound on the shared impl.
+#ifdef V8_ENABLE_GREEN_THREADS
+HandleScopeImplementer* CurrentHandleScopeImplementer() {
+  return Isolate::Current()->handle_scope_implementer();
+}
+#endif
 
 Isolate::PerIsolateThreadData* Isolate::ThreadDataTable::Lookup(
     ThreadId thread_id) {
@@ -4264,6 +4429,29 @@ void Isolate::ThreadDataTable::RemoveAllThreads() {
     delete x.second;
   }
   table_.clear();
+}
+
+void Isolate::ThreadDataTable::Iterate(RootVisitor* v) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // Root every live green worker's own handle state. Each PerIsolateThreadData
+  // owns its HandleScopeImplementer (handle-scope phase); IterateSelf roots only
+  // that instance's blocks/entered-contexts with its own current cursor.
+  for (auto& kv : table_) {
+    HandleScopeImplementer* impl =
+        (kv.second != nullptr) ? kv.second->handle_scope_impl_ : nullptr;
+    if (impl != nullptr) impl->IterateSelf(v);
+  }
+#endif
+}
+
+void Isolate::IterateHandleRoots(RootVisitor* v) {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (green_thread_mode_) {
+    thread_data_table_.Iterate(v);
+    return;
+  }
+#endif
+  handle_scope_implementer()->Iterate(v);
 }
 
 #ifdef DEBUG
@@ -4871,6 +5059,23 @@ void Isolate::SetIsolateThreadLocals(Isolate* isolate,
                             ? isolate->main_thread_local_heap()
                             : nullptr);
   g_current_per_isolate_thread_data_ = data;
+
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (isolate && data) {
+    // Mirror THIS worker's ExecutionState base into IsolateData so the
+    // isolate-independent JS-entry builtins (which only carry the root
+    // register) can arm x25 to the per-worker block under green mode, matching
+    // Isolate::thread_local_top(), via a pure root-relative load -- no runtime
+    // call. A CallRuntime (RuntimeCEntry -> CEntry) from the entry corrupts the
+    // entry frame's c_entry_fp/js_entry_sp/stack state and spuriously trips the
+    // interpreter call-limit (Maximum call stack size) in green bodies.
+    // CurrentExecutionStateBase() lazily initializes this worker's block
+    // (the_hole resting exception/pending_message, context) exactly once, so by
+    // the time the arm reads the mirror the block is already initialized.
+    Address es_base = reinterpret_cast<Address>(isolate->CurrentExecutionStateBase());
+    isolate->isolate_data_.execution_state_base_ = es_base;
+  }
+#endif
 
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
   V8HeapCompressionScheme::InitBase(isolate ? isolate->cage_base()
@@ -6182,12 +6387,24 @@ void Isolate::Enter() {
   // Set the stack start for the main thread that enters the isolate.
   heap()->SetStackStart();
 
+  // Green-thread isolates allow several OS worker threads to be active at once,
+  // so each worker keeps its own EntryStackItem chain (in its per-OS-thread
+  // PerIsolateThreadData); every other isolate keeps the shared entry_stack_.
+  EntryStackItem* entry_stack =
+      (green_thread_mode_ && current_data != nullptr)
+          ? current_data->entry_stack_
+          : entry_stack_.load();
+
+  if (::getenv("GT_ENTER_DEBUG") && green_thread_mode_) {
+    ::fprintf(stderr, "[GTENTER] ENTER iso=%p tid=%d curdata=%p curiso=%p\n", (void*)this, (int)ThreadId::Current().ToInteger(), (void*)current_data, (void*)current_isolate);
+    ::fflush(stderr);
+  }
+
   if (current_data != nullptr) {
     current_isolate = current_data->isolate_;
     DCHECK_NOT_NULL(current_isolate);
     if (current_isolate == this) {
       DCHECK(Current() == this);
-      auto entry_stack = entry_stack_.load();
       DCHECK_NOT_NULL(entry_stack);
       DCHECK(entry_stack->previous_thread_data == nullptr ||
              entry_stack->previous_thread_data->thread_id() ==
@@ -6203,8 +6420,14 @@ void Isolate::Enter() {
   DCHECK(data->isolate_ == this);
 
   EntryStackItem* item =
-      new EntryStackItem(current_data, current_isolate, entry_stack_);
-  entry_stack_ = item;
+      new EntryStackItem(current_data, current_isolate, entry_stack);
+  if (green_thread_mode_) {
+    // Green-thread isolate: each OS worker owns its chain in its own
+    // PerIsolateThreadData so concurrent Enter/Exit never clobbers a sibling.
+    data->entry_stack_ = item;
+  } else {
+    entry_stack_ = item;
+  }
 
   SetIsolateThreadLocals(this, data);
 
@@ -6213,7 +6436,16 @@ void Isolate::Enter() {
 }
 
 void Isolate::Exit() {
-  auto current_entry_stack = entry_stack_.load();
+  // Green-thread isolate: load the worker's own per-thread chain head. Every
+  // other isolate keeps the shared entry_stack_ path.
+  EntryStackItem* current_entry_stack =
+      green_thread_mode_ ? CurrentPerIsolateThreadData()->entry_stack_
+                         : entry_stack_.load();
+
+  if (::getenv("GT_ENTER_DEBUG") && green_thread_mode_) {
+    ::fprintf(stderr, "[GTENTER] EXIT iso=%p tid=%d curdata=%p item=%p count=%d prev_iso=%p prevdata=%p\n", (void*)this, (int)ThreadId::Current().ToInteger(), (void*)CurrentPerIsolateThreadData(), (void*)current_entry_stack, current_entry_stack ? current_entry_stack->entry_count : -1, (void*)current_entry_stack->previous_isolate, (void*)current_entry_stack->previous_thread_data);
+    ::fflush(stderr);
+  }
   DCHECK_NOT_NULL(current_entry_stack);
   DCHECK(current_entry_stack->previous_thread_data == nullptr ||
          current_entry_stack->previous_thread_data->thread_id() ==
@@ -6231,7 +6463,12 @@ void Isolate::Exit() {
   DCHECK(CurrentPerIsolateThreadData()->isolate_ == this);
 
   // Pop the stack.
-  entry_stack_ = current_entry_stack->previous_item;
+  if (green_thread_mode_) {
+    CurrentPerIsolateThreadData()->entry_stack_ =
+        current_entry_stack->previous_item;
+  } else {
+    entry_stack_ = current_entry_stack->previous_item;
+  }
 
   PerIsolateThreadData* previous_thread_data =
       current_entry_stack->previous_thread_data;

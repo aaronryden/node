@@ -1415,8 +1415,24 @@ class ReducerBase : public Next {
                       OptionalV<turboshaft::FrameState> frame_state,
                       base::Vector<const OpIndex> arguments,
                       const TSCallDescriptor* descriptor, OpEffects effects) {
+    {
+      static FILE* dbg = std::fopen("/tmp/tb_call.log", "a");
+      if (dbg != nullptr) {
+        std::fprintf(dbg, "REDUCE(Call) ENTER canThrow=%d\n",
+                     static_cast<int>(descriptor->can_throw));
+        std::fflush(dbg);
+      }
+    }
     V<Any> raw_call =
         Next::ReduceCall(callee, frame_state, arguments, descriptor, effects);
+    {
+      static FILE* dbg = std::fopen("/tmp/tb_call.log", "a");
+      if (dbg != nullptr) {
+        std::fprintf(dbg, "REDUCE(Call) after Next::ReduceCall rawValid=%d\n",
+                     static_cast<int>(raw_call.valid()));
+        std::fflush(dbg);
+      }
+    }
     bool has_catch_block = false;
     if (descriptor->can_throw == CanThrow::kYes ||
         !Asm().effect_handlers_for_next_call().empty()) {
@@ -1426,9 +1442,28 @@ class ReducerBase : public Next {
       // DCHECK(effects.is_required_when_unused());
       effects = effects.RequiredWhenUnused();
       has_catch_block = CatchIfInCatchScope(raw_call);
+      {
+        static FILE* dbg = std::fopen("/tmp/tb_call.log", "a");
+        if (dbg != nullptr) {
+          std::fprintf(dbg,
+                       "REDUCE(Call) after CatchIfInCatchScope hasCatch=%d\n",
+                       static_cast<int>(has_catch_block));
+          std::fflush(dbg);
+        }
+      }
     }
-    return ReduceDidntThrow(raw_call, has_catch_block, &descriptor->out_reps,
-                            effects);
+    V<Any> result =
+        ReduceDidntThrow(raw_call, has_catch_block, &descriptor->out_reps,
+                         effects);
+    {
+      static FILE* dbg = std::fopen("/tmp/tb_call.log", "a");
+      if (dbg != nullptr) {
+        std::fprintf(dbg, "REDUCE(Call) after ReduceDidntThrow valid=%d\n",
+                     static_cast<int>(result.valid()));
+        std::fflush(dbg);
+      }
+    }
+    return result;
   }
 
   OpIndex REDUCE(FastApiCall)(

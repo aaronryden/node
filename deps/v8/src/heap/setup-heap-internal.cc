@@ -16,7 +16,6 @@
 #include "src/init/heap-symbols.h"
 #include "src/init/setup-isolate.h"
 #include "src/interpreter/interpreter.h"
-#include "src/numbers/hash-seed.h"
 #include "src/objects/arguments.h"
 #include "src/objects/call-site-info.h"
 #include "src/objects/cell-inl.h"
@@ -930,10 +929,9 @@ bool Heap::CreateImportantReadOnlyObjects() {
   // Hash seed for strings
 
   Factory* factory = isolate()->factory();
-  set_hash_seed(*factory->NewByteArray(HashSeed::kTotalSize,
-                                       AllocationType::kReadOnly,
-                                       AllocationAlignment::kDoubleAligned));
-  HashSeed::InitializeRoots(isolate());
+  set_hash_seed(
+      *factory->NewByteArray(kInt64Size * 4, AllocationType::kReadOnly));
+  InitializeHashSeed();
 
   // Important strings and symbols
   for (const ConstantStringInit& entry : kImportantConstantStringTable) {

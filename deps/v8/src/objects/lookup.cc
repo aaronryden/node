@@ -4,7 +4,14 @@
 
 #include "src/objects/lookup.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <execinfo.h>
+#include <pthread.h>
 #include <optional>
+
+#include "src/execution/thread-id.h"
+#include "src/heap/local-heap.h"
 
 #include "src/common/globals.h"
 #include "src/deoptimizer/deoptimizer.h"
@@ -26,6 +33,14 @@
 #include "src/objects/struct-inl.h"
 
 namespace v8::internal {
+namespace {
+// M2Probe phase, set via env by node's green_threads.cc; read here so a crash
+// can be attributed to warmup / worker / copy-back. No cross-archive symbol.
+const char* dbg_phase() {
+  const char* p = ::getenv("GT_PHASE");
+  return p ? p : "idle";
+}
+}  // namespace
 
 template <bool is_element>
 void LookupIterator::Start() {
@@ -156,6 +171,92 @@ void LookupIterator::RecheckTypedArrayBounds() {
 }
 
 Tagged<JSReceiver> LookupIterator::GetRootForNonJSReceiver() const {
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  if (::getenv("GT_GT_DEBUG")) {
+    static unsigned long long g_seq = 0;
+    static int g_n;
+    if (g_n++ < 40) {
+      const unsigned long long seq = g_seq++;
+      ThreadLocalTop* t = isolate_->thread_local_top();
+      Address rec = (*lookup_start_object_).ptr();
+      ::fprintf(stderr,
+                "##SEQ%05llu [GTGT-CRASH] #%d phase=%s pthread=0x%lx tid=0x%x "
+                "rec=%p iso_cur=%p is_green=%d\n"
+                "   main_iso=%p main_heap=%p cur_heap=%p tblock=%p\n"
+                "   is_central=%u jes=%p cef=%p cfunc=%p trycatch=%p\n"
+                "   iso_ctx=%p t_ctx=%p t_exc=%p t_topctx=%p\n",
+                seq, g_n, dbg_phase(), pthread_self(),
+                (int)ThreadId::Current().ToInteger(), (void*)rec,
+                (void*)Isolate::Current(),
+                (int)isolate_->is_green_thread_mode(),
+                (void*)isolate_->main_thread_local_isolate(),
+                (void*)isolate_->main_thread_local_heap(),
+                (void*)LocalHeap::TryGetCurrent(), (void*)t,
+                (unsigned)t->is_on_central_stack_flag_, (void*)t->js_entry_sp_,
+                (void*)t->c_entry_fp_, (void*)t->c_function_,
+                (void*)t->try_catch_handler_, (void*)isolate_->context().ptr(),
+                (void*)t->context_.ptr(), (void*)t->exception_.ptr(),
+                (void*)t->topmost_script_having_context_.ptr());
+      {
+        v8::internal::Heap* h =
+            const_cast<v8::internal::Heap*>(isolate_->heap());
+        v8::internal::Tagged<v8::internal::Object> r_obj =
+            *lookup_start_object_;
+        bool is_heap = v8::internal::IsHeapObject(r_obj);
+        int contains = 0, shared = 0, mustshared = 0;
+        if (is_heap) {
+          v8::internal::Tagged<v8::internal::HeapObject> r_h =
+              v8::internal::Cast<v8::internal::HeapObject>(r_obj);
+          contains = h->Contains(r_h);
+          shared = h->SharedHeapContains(r_h);
+          mustshared = h->MustBeInSharedOldSpace(r_h);
+        }
+        Address map = 0;
+        int is_proxy = 0, is_target_null = 0;
+        Address target_proto = 0;
+        if (is_heap) {
+          v8::internal::Tagged<v8::internal::HeapObject> hh =
+              v8::internal::Cast<v8::internal::HeapObject>(r_obj);
+          v8::internal::Tagged<v8::internal::Map> mm = hh->map(isolate_);
+          map = mm.ptr();
+          is_proxy = v8::internal::Is<v8::internal::JSProxy>(*lookup_start_object_);
+          if (is_proxy) {
+            v8::internal::Tagged<v8::internal::JSProxy> p =
+                v8::internal::Cast<v8::internal::JSProxy>(*lookup_start_object_);
+            auto tgt = p->target();
+            is_target_null = tgt.is_null();
+            if (!tgt.is_null()) {
+              v8::internal::Tagged<v8::internal::HeapObject> thh =
+                  v8::internal::Cast<v8::internal::HeapObject>(tgt);
+              target_proto = thh->map(isolate_)->prototype(isolate_).ptr();
+            }
+          }
+        }
+        ::fprintf(stderr,
+                  "   [CORE] iso=%p iso_cur=%p is_green=%d heap=%p isHeap=%d "
+                  "Contains=%d SharedHeap=%d InOld=%d MustSharedOld=%d "
+                  "map=0x%tx is_proxy=%d target_null=%d target_proto=0x%lx\n",
+                  (void*)isolate_, (void*)v8::internal::Isolate::Current(),
+                  (int)isolate_->is_green_thread_mode(), (void*)h, (int)is_heap,
+                  contains, shared, (int)h->InOldSpace(r_obj), mustshared,
+                  map, is_proxy, is_target_null,
+                  (unsigned long)(uintptr_t)target_proto);
+        for (int wi = 0; wi < 8; wi++) {
+          Address w = reinterpret_cast<Address*>(rec)[wi];
+          ::fprintf(stderr, "   rword[%d]=0x%lx\n", wi,
+                    (unsigned long)w);
+        }
+      }
+      static void* bt[64];
+      int nb = ::backtrace(bt, 64);
+      ::fprintf(stderr, "[GTGT-CRASH] seq=%llu backtrace(%d):\n", seq, nb);
+      for (int i = 0; i < nb && i < 40; i++) {
+        ::fprintf(stderr, "  [%02d] %p\n", i, bt[i]);
+      }
+      ::fflush(stderr);
+    }
+  }
+#endif
   // Own property lookup case is handled before calling this method.
   DCHECK(check_prototype_chain());
 
@@ -164,6 +265,51 @@ Tagged<JSReceiver> LookupIterator::GetRootForNonJSReceiver() const {
           ->prototype(isolate_);
 
   if (IsNull(root, isolate_)) {
+    static int g_fatal_n;
+    if (g_fatal_n++ < 2) {
+      ::fprintf(stderr,
+                "===== [FATAL] [%d] GetRootForNonJSReceiver null-root =====\n",
+                g_fatal_n);
+      ::fprintf(stderr,
+                "   iso=%p iso_cur=%p is_green=%d pthread=0x%lx tid=0x%x\n",
+                (void*)isolate_, (void*)v8::internal::Isolate::Current(),
+                (int)isolate_->is_green_thread_mode(),
+                (unsigned long)pthread_self(),
+                (int)ThreadId::Current().ToInteger());
+      bool is_heap = v8::internal::Is<v8::internal::HeapObject>(
+          *lookup_start_object_);
+      v8::internal::Tagged<v8::internal::Map> rm;
+      if (is_heap) {
+        rm = v8::internal::Cast<v8::internal::HeapObject>(
+                 *lookup_start_object_)
+                 ->map(isolate_);
+      } else {
+        rm = v8::internal::UncheckedCast<v8::internal::Map>(*lookup_start_object_);
+      }
+      ::fprintf(stderr,
+                "   IsJSReceiver=%d IsSmi=%d IsJSProxy=%d IsMap=%d is_heap=%d\n",
+                (int)v8::internal::IsJSReceiver(*lookup_start_object_, isolate_),
+                (int)v8::internal::IsSmi(*lookup_start_object_),
+                (int)v8::internal::Is<v8::internal::JSProxy>(
+                    *lookup_start_object_),
+                (int)v8::internal::Is<v8::internal::Map>(*lookup_start_object_),
+                is_heap);
+      ::fprintf(stderr,
+                "   map=%p map_IsJSReceiverMap=%d map_type=0x%x map_proto=%p "
+                "contains=%d\n",
+                (void*)rm.ptr(), (int)v8::internal::IsJSReceiverMap(*rm),
+                (unsigned)rm->instance_type(),
+                (void*)rm->prototype(isolate_).ptr(),
+                (int)(is_heap ? isolate_->heap()->Contains(
+                    v8::internal::Cast<v8::internal::HeapObject>(
+                        *lookup_start_object_))
+                               : 0));
+      void* fb[16];
+      int nfb = ::backtrace(fb, 16);
+      ::fprintf(stderr, "   [FATAL-BT %d]:\n", nfb);
+      for (int i = 0; i < nfb; i++) ::fprintf(stderr, "     [%02d] %p\n", i, fb[i]);
+      ::fflush(stderr);
+    }
     isolate_->PushStackTraceAndDie(
         reinterpret_cast<void*>((*lookup_start_object_).ptr()));
   }
