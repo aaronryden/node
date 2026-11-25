@@ -5061,7 +5061,15 @@ void Isolate::SetIsolateThreadLocals(Isolate* isolate,
   g_current_per_isolate_thread_data_ = data;
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
-  if (isolate && data) {
+  // Stage 2: only the serial (embedding / ordinary-isolate) path writes the
+  // shared execution-state mirror. All green-mode JS-entry readers were moved
+  // off the mirror onto explicit per-worker args in Stage 1 (Phase A), so on
+  // the parallel path NOTHING reads this slot; gating the write on the serial
+  // path eliminates the concurrent non-atomic write-write C++ data race that
+  // would surface the moment the mutator lock is released around
+  // PerformCheckpoint. Ordinary (non-green-mode) isolates -- e.g. the wasm
+  // Store::make isolate -- keep writing it unchanged.
+  if (isolate && data && !isolate->is_green_thread_mode()) {
     // Mirror THIS worker's ExecutionState base into IsolateData so the
     // isolate-independent JS-entry builtins (which only carry the root
     // register) can arm x25 to the per-worker block under green mode, matching

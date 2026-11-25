@@ -1208,12 +1208,24 @@ void MacroAssembler::Uxtw(const Register& rd, const Register& rn) {
   uxtw(rd, rn);
 }
 
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+void MacroAssembler::InitializeRootRegister(bool arm_execution_state) {
+#else
 void MacroAssembler::InitializeRootRegister() {
+#endif
   ExternalReference isolate_root = ExternalReference::isolate_root(isolate());
   Mov(kRootRegister, Operand(isolate_root));
   Fmov(fp_zero, 0.0);
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
-  InitializeExecutionStateRegister();
+  // CEntry passes arm_execution_state=false: it already has the correct
+  // per-worker x25 (JS path: callee-saved; direct-wasm path: x25 excluded from
+  // Liftoff's cache-reg list under this flag, so the blr carries it through).
+  // Reloading from the shared mirror here reintroduces the per-worker desync
+  // under parallel (the only other green-mode mirror read is the isolated
+  // C-API C-to-Wasm path, out of this body's scope). Serial green keeps true.
+  if (arm_execution_state) {
+    InitializeExecutionStateRegister();
+  }
 #endif
 
 #ifdef V8_COMPRESS_POINTERS

@@ -43,12 +43,17 @@
 //   PromiseFulfillReactionJob / AsyncFunctionAwaitResolveClosure on a
 //   `node-V8Worker` thread.
 //
-// The fix holds the coarse green-mutator lock around the driver's per-body
-// mirror-touch + microtask checkpoint so only one worker arms the shared mirror
-// at a time (serialized worker execution -- the "safe correctness baseline N
-// workers run behind" the true-parallel milestone). Reverting the fix makes the
-// child abort mid-run (signal / non-zero exit); the test asserts that does not
-// happen over many concurrent rounds.
+// The desync is fixed by making JS-entry x25 arming per-worker and argument-
+// carried (Stage 1) and gating the shared execution-state mirror WRITE to the
+// serial path only (Stage 2): the microtask runner no longer loads the shared
+// mirror on the green-body path, so concurrent workers each arm their own block
+// without stepping on one another. The coarse mutator lock is now RELEASED
+// around the per-body PerformCheckpoint (the microtask-execution parallel zone)
+// so N OS workers drive disjoint bodies on N CPU cores; correctness rests on
+// disjoint allocation + the GC-free window + per-worker handle-scope routing
+// armed by the driver, not on serialized execution. Reverting a correctness
+// bug here makes the child abort mid-run (signal / non-zero exit); the test
+// asserts that does not happen over many concurrent rounds.
 //
 // Isolation note: like the other green-threads acceptance tests, the load runs
 // in a *child* process (Model A recursive scheduling races node:test bookkeeping),

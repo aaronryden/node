@@ -687,14 +687,27 @@ void Generate_JSEntryVariant(MacroAssembler* masm, StackFrame::Type type,
 
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
   // Arm the per-worker execution-state base register (x25) at JS entry, AFTER
-  // the entry frame (fp + type markers) is built so the green-mode runtime
-  // override call below runs over a valid unwind frame (a call before the frame
-  // is laid out leaves a spurious pending exception that aborts later API
-  // boundaries). The additive serial path stays embeddable (no call); the green
-  // path overrides x25 to THIS worker's ExecutionState block, matching
-  // Isolate::thread_local_top() under green_thread_mode_, else the shared
-  // ThreadLocalTop. x25 stays valid for every execution-field access below.
-  __ InitializeExecutionStateRegister();
+  // the entry frame (fp + type markers) is built so this arm runs over a valid
+  // unwind frame (a runtime call before the frame is laid out would leave a
+  // spurious pending exception that aborts later API boundaries). Under
+  // true-parallel green mode each OS worker carries its OWN ExecutionState* in a
+  // caller register, so x25 is armed to THIS worker's block instead of the
+  // shared IsolateData::execution_state_base_ mirror -- that shared-mirror read
+  // is what desynced x25 across workers and SIGSEGV'd. x2/x6 are caller-saved
+  // but untouched by the prologue below (PushCalleeSavedRegisters saves only
+  // x19-x29 + VFP; the Mov(kRootRegister,x0) and cage load never touch x2/x6),
+  // so they survive to this arm. x25 is callee-saved and stays valid for every
+  // execution-field access below. x2 (kRunMicrotasks) and x6 (kCallable/
+  // kConstruct) are the per-worker blocks passed by Execution::RunMicrotasks /
+  // Execution::Call / Execution::Construct in execution.cc.
+  if (entry_trampoline == Builtin::kRunMicrotasksTrampoline) {
+    __ Mov(kExecutionStateRegister, x2);
+  } else if (entry_trampoline == Builtin::kJSEntryTrampoline ||
+             entry_trampoline == Builtin::kJSConstructEntryTrampoline) {
+    __ Mov(kExecutionStateRegister, x6);
+  } else {
+    __ InitializeExecutionStateRegister();
+  }
 #endif
 
   // x10 = C entry FP.
@@ -4476,22 +4489,27 @@ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
                                bool switch_to_central_stack) {
   ASM_LOCATION("CEntry::Generate entry");
 
-  // Arm the execution-state base register (x25) and root register (x26) at the
-  // top of the C entry. CEntry is reached two ways: (a) from a generated JS or
-  // runtime routine whose prologue already armed them via InitializeRootRegister,
-  // and (b) directly from JITted wasm code via an unadorned "blr", which runs no
-  // JS/routine prologue. Under V8_ENABLE_GREEN_WORKER_EXECUTION_STATE the exit
-  // frame (EnterExitFrame below) stores c_entry_fp and js_entry_sp through
-  // AsMemOperand(kCEntryFP/kContext) -> the execution fields of THIS worker's
-  // ExecutionState block ([x25]), and ER::isolate_address() (line ~4566) is a
-  // root-relative load needing x26 armed. On the wasm path x25/x26 hold stale
-  // JIT scratch, so those stores fault (EXC_BAD_ACCESS on [x25] -- the SIGSEGV
-  // observed in builtins-wasm CEntry). Arming here is idempotent for path (a) and
-  // mandatory for path (b), mirroring the JS entry path in this file. x26/x25 are
-  // not the CEntry input args (x0=argc, x1=target, x11=argv), so incoming args
-  // are not disturbed.
+  // Arm the root register (x26) at the top of the C entry and, under green mode,
+  // PRESERVE the incoming execution-state register (x25) rather than reloading
+  // it from the shared mirror. CEntry is reached two ways: (a) from a generated
+  // JS or runtime routine whose prologue already armed x25 via the JS entry, and
+  // (b) directly from JITted wasm code via an unadorned "blr", which runs no
+  // JS/routine prologue. The exit frame (EnterExitFrame below) stores c_entry_fp
+  // and js_entry_sp through the execution fields of THIS worker's ExecutionState
+  // block ([x25]), and ER::isolate_address() is a root-relative load needing x26
+  // armed. x26 is the isolate root -- identical across every OS worker of one
+  // shared green heap -- so arming it unconditionally is safe and IS mandatory on
+  // the wasm path (where x26 was scratch). x25, however, is per-worker; arming it
+  // from the shared mirror would desync it under parallel -- the reader race the
+  // whole per-worker-arming effort removes. Candidate 1 resolves the wasm path:
+  // x25 is excluded from Liftoff's
+  // cache-reg list under this flag (so a wasm blr carries the caller's x25
+  // through the register), and the JS path keeps x25 callee-saved. Both leave
+  // x25 correct on entry, so CEntry preserves it. x26/x25 are not the CEntry
+  // input args (x0=argc, x1=target, x11=argv), so incoming args are untouched.
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
-  __ InitializeRootRegister();
+  // arm_execution_state=false: keep the incoming per-worker x25, arm only x26.
+  __ InitializeRootRegister(/*arm_execution_state=*/false);
 #endif
 
   using ER = ExternalReference;

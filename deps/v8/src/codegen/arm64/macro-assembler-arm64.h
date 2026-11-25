@@ -229,7 +229,14 @@ class V8_EXPORT_PRIVATE MacroAssembler : public MacroAssemblerBase {
   }
   void LeaveFrame(StackFrame::Type type);
 
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+  // arm_execution_state=false lets CEntry keep its incoming per-worker x25
+  // instead of reloading it from the shared mirror (the reader race that
+  // desyncs x25 under parallel). Default true preserves the serial green path.
+  inline void InitializeRootRegister(bool arm_execution_state = true);
+#else
   inline void InitializeRootRegister();
+#endif
 #ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
   // Arm the per-worker execution-state base register (kExecutionStateRegister,
   // x25) next to the root register. Both are armed together and both are

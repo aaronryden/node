@@ -406,9 +406,17 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
       // clang-format off
       // {new_target}, {target}, {receiver}, return value: tagged pointers
       // {argv}: pointer to array of tagged pointers
+      // {execution_state_base}: THIS OS worker's ExecutionState* (green path)
+#ifdef V8_ENABLE_GREEN_WORKER_EXECUTION_STATE
+      using JSEntryFunction = GeneratedCode<Address(
+          Address root_register_value, Address new_target, Address target,
+          Address receiver, intptr_t argc, Address** argv,
+          ExecutionState* execution_state_base)>;
+#else
       using JSEntryFunction = GeneratedCode<Address(
           Address root_register_value, Address new_target, Address target,
           Address receiver, intptr_t argc, Address** argv)>;
+#endif
       // clang-format on
       JSEntryFunction stub_entry =
           JSEntryFunction::FromAddress(isolate, code->instruction_start());
@@ -439,16 +447,36 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
 
       RCS_SCOPE(isolate, RuntimeCallCounterId::kJS_Execution);
       value = Tagged<Object>(
-          stub_entry.Call(isolate->isolate_data()->isolate_root(), orig_func,
-                          func, recv, JSParameterCount(argc), argv));
+#if defined(V8_ENABLE_GREEN_WORKER_EXECUTION_STATE)
+      // x6: THIS worker's ExecutionState block. This single branch serves both
+      // kCallable and kConstruct (the trampoline is selected by JSEntry() from
+      // params.is_construct at line 398), and both trampolines arm x25 from x6
+      // in Generate_JSEntryVariant -- replacing the shared-mirror read that
+      // desynced x25 across workers. x6 is a plain arm64 C-call arg slot (arg 7);
+      // no stack-pass fallback is needed.
+      stub_entry.Call(isolate->isolate_data()->isolate_root(), orig_func,
+                      func, recv, JSParameterCount(argc), argv,
+                      isolate->CurrentExecutionStateBase())
+#else
+      stub_entry.Call(isolate->isolate_data()->isolate_root(), orig_func,
+                      func, recv, JSParameterCount(argc), argv)
+#endif
+                      );
     } else {
       DCHECK_EQ(Execution::Target::kRunMicrotasks, params.execution_target);
 
       // clang-format off
       // return value: tagged pointers
       // {microtask_queue}: pointer to a C++ object
+      // {execution_state_base}: THIS OS worker's ExecutionState* (green path)
+#if defined(V8_ENABLE_GREEN_WORKER_EXECUTION_STATE)
+      using JSEntryFunction = GeneratedCode<Address(
+          Address root_register_value, MicrotaskQueue* microtask_queue,
+          ExecutionState* execution_state_base)>;
+#else
       using JSEntryFunction = GeneratedCode<Address(
           Address root_register_value, MicrotaskQueue* microtask_queue)>;
+#endif
       // clang-format on
       JSEntryFunction stub_entry =
           JSEntryFunction::FromAddress(isolate, code->instruction_start());
@@ -457,8 +485,22 @@ V8_WARN_UNUSED_RESULT MaybeHandle<Object> Invoke(Isolate* isolate,
       SealHandleScope shs(isolate);
 
       RCS_SCOPE(isolate, RuntimeCallCounterId::kJS_Execution);
-      value = Tagged<Object>(stub_entry.Call(
-          isolate->isolate_data()->isolate_root(), params.microtask_queue));
+      value = Tagged<Object>(
+#if defined(V8_ENABLE_GREEN_WORKER_EXECUTION_STATE)
+          // x2: THIS worker's ExecutionState block. Arm x25 from this explicit
+          // arg at the kRunMicrotasks trampoline instead of the shared
+          // IsolateData::execution_state_base_ mirror, so concurrent OS workers
+          // no longer desync x25 mid-arm (the original SIGSEGV). Current
+          // ExecutionState base is per-thread PerIsolateThreadData, so no
+          // cross-worker race on the value itself.
+          stub_entry.Call(isolate->isolate_data()->isolate_root(),
+                          params.microtask_queue,
+                          isolate->CurrentExecutionStateBase())
+#else
+          stub_entry.Call(isolate->isolate_data()->isolate_root(),
+                          params.microtask_queue)
+#endif
+                      );
     }
   }
 

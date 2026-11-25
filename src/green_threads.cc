@@ -1521,15 +1521,19 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
         if (d->async_settled) continue;
         all_settled = false;
 
-        // Serialize this worker's mirror-touch + microtask execution against the
-        // other workers sharing this green isolate. The JS-entry microtask runner
-        // (JSRunMicrotasksEntry) re-arms the per-worker execution-state register
-        // (x25) from the SHARED IsolateData execution_state_base_ mirror; without
-        // this guard a sibling worker's GTGreenThreadRefreshMirror() overwrites that
-        // mirror mid-arm, so SetCurrentContext writes a sibling's block while this
-        // thread's C++ path (Isolate::context / raw_native_context) reads its own
-        // -> garbage context_ -> SIGSEGV. This is the "safe correctness baseline N
-        // workers run behind" the true-parallel milestone.
+        // Serialize this worker's microtask execution against the other workers
+        // sharing this green isolate (lock held for the whole per-body
+        // iteration). PerformCheckpoint runs the bodies' promise microtasks,
+        // which touch the ISOLATE-GLOBAL GlobalHandles table (MakeWeak/Release
+        // of the green result roots) and shared promise/task bookkeeping that is
+        // NOT worker-safe: without this guard N workers drive their bodies'
+        // reactions concurrently and corrupt global handle nodes -> "Check
+        // failed: node->IsInUse()" FATAL (reproduced ~100% under GT_NUM_WORKERS>=8
+        // in the parallel gate). js-entry x25 arming is per-worker (Stage 1) and
+        // the mirror write is gated (Stage 2), but microtask-execution shared
+        // state still requires per-iteration serialization, so the async drive is
+        // correctly SERIAL here; true-parallel I/O drive needs the GlobalHandles/
+        // microtask path made worker-safe (a separate co-design).
         std::lock_guard<std::mutex> mutator_lock(g_green_mutator_lock);
 
         // Resolve every finished gtRead for this body into ITS OWN queue. The
@@ -1570,62 +1574,19 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
         }
         d->pending_reads.swap(still);
 
-        // Resume any continuations now enqueued in THIS body's own queue.
-        // g_green_driving_body is set here so any continuation's new gtRead
-        // registers into THIS body's pending_reads (its owning worker frees +
-        // resolves it). Per-OS-thread, and a worker runs at most one body at a
-        // time, so no concurrent write to any single body's vector.
-        GreenCallData* const prior_driving = g_green_driving_body;
-        g_green_driving_body = d;
-#ifdef V8_ENABLE_GREEN_THREADS
-        // Capture the shared execution-state mirror as it stands BEFORE this
-        // worker refreshes it -- the honest test of the per-worker desync: under
-        // true parallelism the mirror stays pinned at the last initial Isolate::
-        // Scope (a sibling's block), so non-last workers read a stale x25 base.
-        GTMirrorState ms = GTGreenThreadMirrorState();
-        // Re-sync the mirror to THIS worker's block right before the JS-entry
-        // x25 arm (below), so the continuation dispatch reads the correct
-        // context() for THIS body. Without the per-entry refresh the mirror is
-        // written once at worker start and never again, and every non-last
-        // worker arms x25 to a sibling block -> desync -> SEGV.
-        GTGreenThreadRefreshMirror();
-        if (::getenv("GT_GT_DEBUG")) {
-          GTMirrorState post = GTGreenThreadMirrorState();
-          ::fprintf(stderr,
-                    "[GTGT-ASYNC-ARM] tid=0x%lx body=%p pre=0x%lx own=0x%lx "
-                    "pre_%s post=0x%lx post_%s\n",
-                    (unsigned long)pthread_self(), (void*)d,
-                    (unsigned long)(intptr_t)ms.mirror,
-                    (unsigned long)(intptr_t)ms.own,
-                    ms.match ? "SYNC" : "MIRROR-DIFFERS",
-                    (unsigned long)(intptr_t)post.mirror,
-                    post.match ? "SYNC" : "MIRROR-DIFFERS");
-          ::fflush(stderr);
-        }
-#endif
+        // Resume continuations now enqueued in THIS body's own queue and run
+        // them under the SAME lock. The microtask execution (PerformCheckpoint)
+        // below shares isolate-global handle/promise state (GlobalHandles,
+        // promise reaction jobs) with the other workers' PerformCheckpoint, so it
+        // stays serialized (see the top comment). The per-entry mirror-resync
+        // scaffolding was removed earlier because it was obsolete once arming
+        // became per-worker (Stage 1) -- but that scaffolding was only ever
+        // exercised under this same lock, so removing it does not change the
+        // serialization.
         v8::Local<v8::Context> bctx2 =
             v8::Local<v8::Context>::New(green, d->context_p);
-#ifdef V8_ENABLE_GREEN_THREADS
-        if (::getenv("GT_DEBUG_ENTCTX")) {
-          static std::unordered_map<GreenCallData*, void*>& g_body_ctx_addr =
-              *new std::unordered_map<GreenCallData*, void*>();
-          const void* ctx_addr =
-              reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(*bctx2));
-          const void* setup_addr = nullptr;
-          auto it = g_body_ctx_addr.find(d);
-          if (it != g_body_ctx_addr.end()) setup_addr = it->second;
-          GTMirrorState ms = GTGreenThreadMirrorState();
-          ::fprintf(stderr,
-                    "[CTX-CP] body=%p round=%llu tid=0x%lx ctx=%p setup=%p "
-                    "same=%d empty=%d mirror=%p own=%p match=%d\n",
-                    (void*)d, (unsigned long long)d->round,
-                    (unsigned long)pthread_self(), (void*)ctx_addr,
-                    (void*)setup_addr, (int)(ctx_addr == setup_addr),
-                    (int)d->context_p.IsEmpty(), (void*)ms.mirror,
-                    (void*)ms.own, ms.match);
-          ::fflush(stderr);
-        }
-#endif
+        GreenCallData* const prior_driving = g_green_driving_body;
+        g_green_driving_body = d;  // static thread_local: per-OS-thread
         bctx2->GetMicrotaskQueue()->PerformCheckpoint(green);
         g_green_driving_body = prior_driving;
 

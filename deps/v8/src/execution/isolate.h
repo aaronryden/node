@@ -2045,7 +2045,14 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   }
 
   void IncrementJavascriptExecutionCounter() {
-    javascript_execution_counter_++;
+    // Parallel async bodies each run on a different OS worker but share ONE
+    // green isolate, so this isolate-wide counter would be non-atomically
+    // read-modified-write by every worker (a C++ data race that is also a
+    // correctness bug for any counter-based profiler/sample path). It is a
+    // plain counter, not a rooting slot, so an atomic relaxed fetch-add is the
+    // minimal correct fix -- no layout/snapshot change to the field.
+    std::atomic_ref<uint32_t>(javascript_execution_counter_)
+        .fetch_add(1u, std::memory_order_relaxed);
   }
 
   Address handle_scope_implementer_address() {

@@ -167,28 +167,6 @@ struct GTExecSnap {
 };
 GTExecSnap GTGreenThreadExecSnapshot();
 
-// Mirror debug state for the executing OS worker's green-thread isolate: the
-// shared IsolateData execution_state_base_ that the JS-entry x25 arm loads, and
-// THIS worker's own ExecutionState block. match=1 when they already agree. See
-// GTGreenThreadRefreshMirror for why the async drive re-syncs it per entry.
-struct GTMirrorState {
-  void* mirror;  // isolate_data().execution_state_base_ (shared, stable)
-  void* own;     // CurrentExecutionStateBase() (THIS worker's block)
-  int match;
-};
-GTMirrorState GTGreenThreadMirrorState();
-
-// Refresh THIS OS worker's ExecutionState base into the shared
-// execution_state_base_ mirror, so the next JS-entry x25 arm loads THIS worker's
-// block rather than a stale sibling-worker block (which desyncs x25 from
-// thread_local_top() and corrupts context()/map reads). The mirror is written by
-// SetIsolateThreadLocals at Isolate::Scope; a true-parallel drive whose workers
-// hold overlapping scopes never re-writes it mid-drive, so it stays pinned at the
-// last initial construction -- every other worker's block -- and must be re-synced
-// before each per-body JS re-entry (PerformCheckpoint). Called inside the tight
-// refresh->arm window (no await between), so the arm observes THIS worker's block.
-void GTGreenThreadRefreshMirror();
-
 // Env-gated (GT_GT_DUMP) snapshot of the executing OS thread's ThreadLocalTop
 // entry-state -- the fields a Maglev body reads on first JS entry (c_entry_fp_,
 // context_, topmost_script_having_context_, exception_, handler_, js_entry_sp_,
