@@ -45,13 +45,18 @@ const CHILD = `
 'use strict';
 const g = require('green_threads');
 
+// spawn() always returns a Promise, so the scenarios below await. The whole
+// child body runs inside an async IIFE (a node -e CommonJS string cannot use
+// top-level await); a throwing scenario rejects it, so the child exits non-zero.
+(async () => {
+
 // Captured module-scope state the green bodies must see (scenarios 4 & 5).
 const vals = [2, 3];
 let count = 0; count = 7;
 
 // (A) scenario 4 core: read a captured module \`const\` array.
 {
-  const row = g.spawn(() => {
+  const row = await g.spawn(() => {
     const r = {};
     for (let i = 0; i < vals.length; i++) r['k' + i] = vals[i];
     return r;
@@ -61,19 +66,19 @@ let count = 0; count = 7;
 
 // (B) captured let binding: a fresh per-spawn snapshot sees the latest value.
 {
-  const v = g.spawn(() => count);
+  const v = await g.spawn(() => count);
   if (v !== 7) throw new Error('B: got ' + v);
 }
 
 // (C) mutation inside the body works on the green view (CoW isolation): returns 8.
 {
-  const v = g.spawn(() => ++count);
+  const v = await g.spawn(() => ++count);
   if (v !== 8) throw new Error('C: got ' + v);
 }
 
 // (D) scenario 5 core: the native binding is callable from green.
 {
-  const t = g.spawn(() => typeof g.addrOf);
+  const t = await g.spawn(() => typeof g.addrOf);
   if (t !== 'function') throw new Error('D: got ' + t);
 }
 
@@ -92,7 +97,7 @@ let count = 0; count = 7;
 // assert -- an object this path does not lift -- is never captured by the body.
 {
   const shared = { v: 1 };
-  const greenSaw = g.spawn(() => {
+  const greenSaw = await g.spawn(() => {
     shared.v = 999; // write through the captured alias -> copy-on-write clone
     return shared.v; // the green view must observe its own write
   });
@@ -106,11 +111,12 @@ let count = 0; count = 7;
 
 // (F) regression guard: a locals-only body still works.
 {
-  const v = g.spawn(() => 42);
+  const v = await g.spawn(() => 42);
   if (v !== 42) throw new Error('F: got ' + v);
 }
 
 console.log('green_threads closure repro ok');
+})();
 `;
 
 const runOnce = () => spawnSync(process.execPath, ['-e', CHILD], {

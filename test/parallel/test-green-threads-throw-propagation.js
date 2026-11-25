@@ -36,62 +36,69 @@ const CHILD = `
 const g = require('green_threads');
 const assert = require('node:assert/strict');
 
-let thrown = [];
-function cap(label, fn) {
-  try {
-    const r = fn();
-    thrown.push([label, null, r]);
-  } catch (e) {
-    thrown.push([label, e, undefined]);
+// spawn() ALWAYS returns a Promise. A body that throws yields a *rejected*
+// Promise (not a synchronous throw); a returning body yields a *resolved* one.
+// cap() awaits the spawn result, recording either the resolved value or the
+// rejection error -- preserving the original "does the body's exception reach JS
+// faithfully?" intent under the new Promise contract.
+(async () => {
+  let thrown = [];
+  async function cap(label, fn) {
+    try {
+      const r = await fn();
+      thrown.push([label, null, r]);
+    } catch (e) {
+      thrown.push([label, e, undefined]);
+    }
   }
-}
 
-// 1. An uncaught green throw propagates as a faithful Error.
-cap('throw-Error', () => g.spawn(() => { throw new Error('boom-from-green'); }));
+  // 1. An uncaught green throw propagates as a faithful Error (via rejection).
+  await cap('throw-Error', () => g.spawn(() => { throw new Error('boom-from-green'); }));
 
-// 2. A body that throws (but is re-thrown here) keeps its class.
-cap('throw-TypeError', () => g.spawn(() => { throw new TypeError('bad-type'); }));
+  // 2. A body that throws keeps its error class on rejection.
+  await cap('throw-TypeError', () => g.spawn(() => { throw new TypeError('bad-type'); }));
 
-// 3. A non-Error throw propagates faithfully (primitive).
-cap('throw-string', () => g.spawn(() => { throw 'plain-string-throw'; }));
+  // 3. A non-Error throw propagates faithfully (primitive).
+  await cap('throw-string', () => g.spawn(() => { throw 'plain-string-throw'; }));
 
-// 4. A body that catches internally returns normally.
-cap('catch-inside', () => g.spawn(() => {
-  try { throw new Error('inner'); }
-  catch (e) { return 'caught-inside:' + e.message; }
-}));
+  // 4. A body that catches internally returns normally.
+  await cap('catch-inside', () => g.spawn(() => {
+    try { throw new Error('inner'); }
+    catch (e) { return 'caught-inside:' + e.message; }
+  }));
 
-// 5. A normal return is unaffected by surrounding throws.
-cap('return-42', () => g.spawn(() => 42));
+  // 5. A normal return is unaffected by surrounding throws.
+  await cap('return-42', () => g.spawn(() => 42));
 
-// 6. No leakage: after a throw that propagated to JS, the next task runs clean.
-const after = g.spawn(() => {
-  return { nums: [1, 2, 3], s: 'hi', f: 2.5, n: 1000n };
-});
-cap('after-leak-return', () => after);
+  // 6. No leakage: after throws that propagated to JS, the next task runs clean.
+  const after = () => g.spawn(() => {
+    return { nums: [1, 2, 3], s: 'hi', f: 2.5, n: 1000n };
+  });
+  await cap('after-leak-return', after);
 
-// Assertions all run on the embedding side (assert is not a green-global).
-for (const [label, err, val] of thrown) {
-  if (label === 'throw-Error') {
-    assert.ok(err instanceof Error, 'throw-Error: propagated as Error');
-    assert.equal(err.message, 'boom-from-green', 'throw-Error: message preserved');
-  } else if (label === 'throw-TypeError') {
-    assert.ok(err instanceof TypeError, 'throw-TypeError: class preserved');
-    assert.equal(err.message, 'bad-type', 'throw-TypeError: message preserved');
-  } else if (label === 'throw-string') {
-    assert.equal(err, 'plain-string-throw', 'throw-string: primitive propagated');
-    assert.ok(!(err instanceof Error), 'throw-string: not wrapped as Error');
-  } else if (label === 'catch-inside') {
-    assert.equal(val, 'caught-inside:inner', 'catch-inside: returned normally');
-  } else if (label === 'return-42') {
-    assert.equal(val, 42, 'return-42: returned normally');
-  } else if (label === 'after-leak-return') {
-    assert.deepEqual(val, { nums: [1, 2, 3], s: 'hi', f: 2.5, n: 1000n },
-      'after-leak-return: no leaked exception, structured value intact');
+  // Assertions all run on the embedding side (assert is not a green-global).
+  for (const [label, err, val] of thrown) {
+    if (label === 'throw-Error') {
+      assert.ok(err instanceof Error, 'throw-Error: propagated as Error (rejection)');
+      assert.equal(err.message, 'boom-from-green', 'throw-Error: message preserved');
+    } else if (label === 'throw-TypeError') {
+      assert.ok(err instanceof TypeError, 'throw-TypeError: class preserved');
+      assert.equal(err.message, 'bad-type', 'throw-TypeError: message preserved');
+    } else if (label === 'throw-string') {
+      assert.equal(err, 'plain-string-throw', 'throw-string: primitive propagated');
+      assert.ok(!(err instanceof Error), 'throw-string: not wrapped as Error');
+    } else if (label === 'catch-inside') {
+      assert.equal(val, 'caught-inside:inner', 'catch-inside: returned normally');
+    } else if (label === 'return-42') {
+      assert.equal(val, 42, 'return-42: returned normally');
+    } else if (label === 'after-leak-return') {
+      assert.deepEqual(val, { nums: [1, 2, 3], s: 'hi', f: 2.5, n: 1000n },
+        'after-leak-return: no leaked exception, structured value intact');
+    }
   }
-}
 
-console.log('green_threads throw-propagation repro ok');
+  console.log('green_threads throw-propagation repro ok');
+})();
 `;
 
 const runOnce = (env) => spawnSync(process.execPath, ['-e', CHILD], {

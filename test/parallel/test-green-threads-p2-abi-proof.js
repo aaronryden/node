@@ -60,11 +60,16 @@ function body() {
   return r;
 }
 
-const expected = sentinel();
-const actual = g.spawn(body);
+// spawn() always returns a Promise; the assertions below await it. Wrapped in
+// an async IIFE so this CommonJS file can use `await`.
+(async () => {
+  const expected = sentinel();
+  // spawn() always returns a Promise; await it to the body's value.
+  const actual = await g.spawn(body);
 
-assert.equal(actual, expected,
-  `Stage-1 ABI proof: body returned sentinel ${actual} after yield, expected ${expected}`);
+  assert.equal(actual, expected,
+    `Stage-1 ABI proof: body returned sentinel ${actual} after yield, expected ${expected}`);
 
-console.error(`Stage-1 ABI proof OK: sentinel ${expected} correct after mid-body yield ` +
-  `(GT_NUM_WORKERS=1, per-worker x25 resume verified)`);
+  console.error(`Stage-1 ABI proof OK: sentinel ${expected} correct after mid-body yield ` +
+    `(GT_NUM_WORKERS=1, per-worker x25 resume verified)`);
+})();

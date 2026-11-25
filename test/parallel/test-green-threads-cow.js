@@ -67,13 +67,15 @@ const CHILD_SCENARIOS = `
 const g = require('green_threads');
 const assert = require('node:assert/strict');
 
+(async () => {
+
 // The CoW write barrier is active while a green thread runs. A boxed double
 // (HeapNumber) stored into a double-representation field must survive intact.
 
 // 1. First-write boxed-double store into a fresh fast-object field -- the
 //    TransitionAndWriteDataProperty -> WriteToField path that used to crash.
 {
-  const r = g.spawn(() => {
+  const r = await g.spawn(() => {
     const m = {};
     for (const v of [1e15, 3.14159, -2.5e10, 9007199254740993]) m.link = v;
     return m.link;
@@ -84,7 +86,7 @@ const assert = require('node:assert/strict');
 // 2. Two independent boxed-double properties, including an overwrite of the
 //    first field with another boxed double.
 {
-  const r = g.spawn(() => {
+  const r = await g.spawn(() => {
     const m = {};
     m.a = 1e12;
     m.b = -7.25e8;
@@ -98,7 +100,7 @@ const assert = require('node:assert/strict');
 // 3. Arrays and nested objects holding boxed doubles, plus heap-object
 //    reference stores (the normal CoW-clone path).
 {
-  const r = g.spawn(() => {
+  const r = await g.spawn(() => {
     const arr = [];
     for (const v of [1e15, 3.14159e6, -2.5e10]) arr.push(v);
     const inner = { value: 2.718e9 };
@@ -117,7 +119,7 @@ const assert = require('node:assert/strict');
 // 4. A loop writing boxed doubles into distinct fields.
 {
   const vals = [1e15, 2e15, 3e15, 4e15];
-  const r = g.spawn(() => {
+  const r = await g.spawn(() => {
     const row = {};
     for (let i = 0; i < vals.length; i++) row['k' + i] = vals[i];
     return row;
@@ -130,7 +132,7 @@ const assert = require('node:assert/strict');
 //    reference store, the thread's private copy (cowCloneOf) must have a
 //    different address than the shared main-heap view (addrOf).
 {
-  const r = g.spawn(() => {
+  const r = await g.spawn(() => {
     const target = { kind: 'shared' };
     const m = {};
     m.link = target; // heap-object reference store -> clones target
@@ -142,7 +144,7 @@ const assert = require('node:assert/strict');
   // This assertion is in the PARENT, not the body: green-thread bodies are
   // relocated onto the green isolate (RelocateFunction) and cannot close over
   // module-level bindings -- a body only receives its copied arguments. An
-  // in-body `assert.notEqual` therefore resolves to a non-function (the original
+  // in-body assert.notEqual therefore resolves to a non-function (the original
   // crash here). The body returns the two addresses and the parent asserts them.
   assert.ok(Number.isInteger(r.shared), 'scenario 5: shared address is an integer');
   assert.ok(Number.isInteger(r.copy), 'scenario 5: copy address is an integer');
@@ -169,7 +171,7 @@ const assert = require('node:assert/strict');
 {
   const results = [];
   for (let iter = 0; iter < 400; iter++) {
-    const r = g.spawn(() => {
+    const r = await g.spawn(() => {
       const m = {};
       for (let i = 0; i < 5; i++) m['f' + i] = (i + 1) * 1.5e11;
       m.nested = { x: 42, y: 7e12 };
@@ -188,6 +190,7 @@ const assert = require('node:assert/strict');
 }
 
 console.error('green_threads COW regression: all scenarios passed');
+})();
 `;
 
 const res = spawnSync(process.execPath, ['-e', CHILD_SCENARIOS], {

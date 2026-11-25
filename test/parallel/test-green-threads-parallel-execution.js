@@ -63,9 +63,13 @@ const CHILD = [
   "let base = 0;",
   "for (let j = 0; j < N; j++) { for (let c = 0; c < CHUNKS; c++) base = work(ITERS); }",
   "const baseMs = performance.now() - t0;",
+  // Wrap the green fan-out (and its measurement) in an async IIFE so the
+  // spawnAll await is legal: a `node -e` CommonJS string cannot use top-level
+  // await. A failed assertion rejects the IIFE, so the child exits non-zero.
+  "  (async () => {",
   "// Green fan-out: N bodies on the OS-thread pool.",
   "const t1 = performance.now();",
-  "const res = g.spawnAll(Array.from({ length: N }, () => [body]));",
+  "const res = await g.spawnAll(Array.from({ length: N }, () => [body]));",
   "const greenMs = performance.now() - t1;",
   "console.log(JSON.stringify({",
   "  N, CHUNKS, ITERS,",
@@ -74,6 +78,7 @@ const CHILD = [
   "  speedup: +(baseMs / greenMs).toFixed(3),",
   "  acc_ok: res.every((a) => a === work(ITERS)),",
   "}));",
+  "  })();",
 ].join('\n');
 
 function runChild(n) {

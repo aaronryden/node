@@ -50,11 +50,13 @@ const add = (a, b) => a + b;
 // JSFunction this would still differ, and it crashes either way -- the bug is
 // in scheduling/driving 2+ green threads on the shared green isolate.
 const mul = (a, b) => a * b;
-const r = g.spawnAll([[add, 2, 3], [mul, 4, 5]]);
+(async () => {
+const r = await g.spawnAll([[add, 2, 3], [mul, 4, 5]]);
 if (!Array.isArray(r) || r.length !== 2 || r[0] !== 5 || r[1] !== 20) {
   throw new Error('unexpected result ' + JSON.stringify(r));
 }
 console.log('n2 spawnAll ok: ' + JSON.stringify(r));
+})();
 `;
 
 const runOnce = () => spawnSync(process.execPath, ['-e', CHILD], {

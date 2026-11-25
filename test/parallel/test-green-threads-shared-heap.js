@@ -60,11 +60,16 @@ const add = (a, b) => a + b;
 const mul = (a, b) => a * b;
 const greet = (n) => 'hi ' + n;
 
-assert.equal(g.spawn(add, 2, 3), 5, 'add(2,3)');
-assert.equal(g.spawn(add, 100, 23), 123, 'add(100,23)');
-assert.equal(g.spawn(mul, 6, 7), 42, 'mul(6,7)');
-assert.equal(g.spawn(greet, 'world'), 'hi world', 'greet');
-assert.equal(g.spawn(() => 42), 42, 'literal return');
+// spawn() always returns a Promise, so the assertions below await their results.
+// The whole child body runs inside an async IIFE (a node -e CommonJS string
+// cannot use top-level await); a failed assertion rejects the IIFE, so the child
+// exits non-zero and the parent's status check fails the test.
+(async () => {
+assert.equal(await g.spawn(add, 2, 3), 5, 'add(2,3)');
+assert.equal(await g.spawn(add, 100, 23), 123, 'add(100,23)');
+assert.equal(await g.spawn(mul, 6, 7), 42, 'mul(6,7)');
+assert.equal(await g.spawn(greet, 'world'), 'hi world', 'greet');
+assert.equal(await g.spawn(() => 42), 42, 'literal return');
 
 // Several more sequential bodies force RellocateFunction to re-parse + compile
 // on the same green isolate repeatedly (each spawn is an independent relocate),
@@ -80,6 +85,7 @@ assert.equal(g.spawn(() => 42), 42, 'literal return');
 // with exit 134 -- even though every green body ran correctly. A clean exit
 // below is therefore the assertion for this fix as well.
 console.error('green_threads shared-heap regression: all scenarios passed');
+})();
 `;
 
 const res = spawnSync(process.execPath, ['-e', CHILD], {

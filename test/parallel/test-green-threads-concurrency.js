@@ -115,9 +115,10 @@ function stressBody(parent, fibN) {
 }
 
 const expected = fib(${FIB_N});
+(async () => {
 for (let round = 1; round <= ${ROUNDS}; round++) {
   const parent = { writes: 0, values: [] };
-  const results = g.spawnAll(
+  const results = await g.spawnAll(
     Array.from({ length: ${CONCURRENCY} }, () => [stressBody, parent, ${FIB_N}]),
   );
   assert.equal(results.length, ${CONCURRENCY},
@@ -128,6 +129,7 @@ for (let round = 1; round <= ${ROUNDS}; round++) {
   }
 }
 console.error('green_threads concurrent-race regression: all scenarios passed');
+})();
 `;
 
 const res = spawnSync(process.execPath, ['-e', CHILD_STRESS], {
