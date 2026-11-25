@@ -902,6 +902,33 @@ void Context::Enter() {
   impl->EnterContext(env);
   impl->SaveContext(i_isolate->context());
   i_isolate->set_context(env);
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      impl->EnteredContextCount() != impl->SavedContextCount()) {
+    void* frames[24];
+    int nf = ::backtrace(frames, 24);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr, "[ENTER-CLEAN-BAD] iso=%p entered=%zu saved=%zu\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              impl->SavedContextCount());
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    E#%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 24; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") ||
+          ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+          ::strstr(syms[i], "CopyValueAcross") ||
+          ::strstr(syms[i], "GreenCapture") ||
+          ::strstr(syms[i], "GreenRebuild") ||
+          ::strstr(syms[i], "Context::Enter")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
 }
 
 void Context::Exit() {
@@ -909,12 +936,65 @@ void Context::Exit() {
   i::Isolate* i_isolate = i::Isolate::Current();
   EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
   i::HandleScopeImplementer* impl = i_isolate->handle_scope_implementer();
-  if (!Utils::ApiCheck(impl->LastEnteredContextWas(*env), "v8::Context::Exit()",
-                       "Cannot exit non-entered context")) {
+  if (!impl->LastEnteredContextWas(*env)) {
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      void* frames[24];
+      int nf = ::backtrace(frames, 24);
+      char** syms = ::backtrace_symbols(frames, nf);
+      ::fprintf(stderr,
+                "[CTX-EXIT-SKIP] iso=%p impl=%p ctx=%p entered=%zu top=%p\n",
+                (void*)i_isolate, (void*)impl, (void*)env->address(),
+                impl->EnteredContextCount(),
+                impl->EnteredContextCount()
+                  ? (void*)impl->LastEnteredContext().address()
+                  : (void*)0);
+      for (int i = 0; i < nf && i < 24; i++) {
+        if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+            ::strstr(syms[i], "RelocateFunction") || ::strstr(syms[i], "InstallGreenAsync") ||
+            ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+            ::strstr(syms[i], "Script::Run") || ::strstr(syms[i], "Context::") ||
+            ::strstr(syms[i], "EnterContext") || ::strstr(syms[i], "RunPartition") ||
+            ::strstr(syms[i], "DriveGreen")) {
+          ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+        }
+      }
+      ::free(syms);
+      ::fflush(stderr);
+    }
     return;
   }
   impl->LeaveContext();
   i_isolate->set_context(impl->RestoreContext());
+  if (::getenv("GT_DEBUG_ENTCTX") &&
+      impl->EnteredContextCount() != impl->SavedContextCount()) {
+    void* frames[24];
+    int nf = ::backtrace(frames, 24);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr, "[EXIT-CLEAN-BAD] iso=%p entered=%zu saved=%zu top=%p\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              impl->SavedContextCount(),
+              impl->EnteredContextCount()
+                ? (void*)impl->LastEnteredContext().address()
+                : (void*)0);
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    E#%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 24; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") ||
+          ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+          ::strstr(syms[i], "CopyValueAcross") ||
+          ::strstr(syms[i], "GreenCapture") ||
+          ::strstr(syms[i], "GreenRebuild") ||
+          ::strstr(syms[i], "Context::Exit")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
 }
 
 Context::BackupIncumbentScope::BackupIncumbentScope(
@@ -7088,6 +7168,38 @@ void Context::SetMicrotaskQueue(v8::MicrotaskQueue* queue) {
   Utils::ApiCheck(context->microtask_queue()->GetMicrotasksScopeDepth() == 0,
                   "v8::Context::SetMicrotaskQueue",
                   "Must not have microtask scope pushed");
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr,
+              "[GT_DEBUG_ENTCTX] iso=%p impl=%p entered=%zu last=%p\n",
+              (void*)i_isolate, (void*)impl, impl->EnteredContextCount(),
+              impl && impl->EnteredContextCount()
+                ? (void*)impl->LastEnteredContext().address()
+                : (void*)0);
+    ::fflush(stderr);
+  }
+  if (impl->EnteredContextCount() != 0 && ::getenv("GT_DEBUG_ENTCTX")) {
+    void* frames[32];
+    int nf = ::backtrace(frames, 32);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr,
+              "[SETMQ-LEAKED] iso=%p entered=%zu back=%p\n",
+              (void*)i_isolate, impl->EnteredContextCount(),
+              (void*)impl->LastEnteredContext().address());
+    for (size_t k = 0; k < impl->EnteredContextCount(); k++) {
+      ::fprintf(stderr, "    STACK #%zu ctx=%p\n", k,
+                (void*)impl->EnteredContextAt(k).address());
+    }
+    for (int i = 0; i < nf && i < 32; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") || ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "SpawnAll") || ::strstr(syms[i], "GreenJS") ||
+          ::strstr(syms[i], "SetMicrotaskQueue")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
   Utils::ApiCheck(impl->EnteredContextCount() == 0,
                   "v8::Context::SetMicrotaskQueue()",
                   "Cannot set Microtask Queue with an entered context");

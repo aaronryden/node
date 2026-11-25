@@ -542,6 +542,8 @@ enum class IsolateFieldId : uint8_t;
 #define EXTERNAL_REFERENCE_LIST_GREEN_THREADS(V)                         \
   V(current_execution_state_base,                                        \
     "Isolate::CurrentExecutionStateBase")                               \
+  V(handle_scope_implementer_current,                                    \
+    "CurrentHandleScopeImplementer")                                    \
   V(green_thread_cow_clone_if_needed,                                    \
     "GreenThreadCow::CowCloneForGeneratedCode")                          \
   V(green_thread_concurrent_allocation_flag,                             \

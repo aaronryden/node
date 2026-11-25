@@ -42,6 +42,23 @@ M2ForcedGCMode M2ParseForcedGCEnv() {
   return M2ForcedGCMode::kNone;
 }
 
+// Whether `emb_fn` is a JavaScript async function (async function, async arrow,
+// async generator, or async concise method). Detected from the SharedFunctionInfo's
+// FunctionKind so an async body can be routed to the embedding realm -- where
+// Node's async I/O bindings (setTimeout / process / require) actually live --
+// WITHOUT running it. Running the head just to observe a returned Promise would
+// double-execute the synchronous prefix and steal green-isolate parallelism from
+// genuinely synchronous bodies, so the check is a static FunctionKind read.
+bool GTIsAsyncFunction(v8::Isolate* /*emb_isolate*/,
+                       v8::Local<v8::Function> emb_fn) {
+  v8::Function* emb_fn_ptr = *emb_fn;
+  vi::Tagged<vi::JSFunction> fn_tag =
+      vi::Cast<vi::JSFunction>(*v8::Utils::OpenHandle(emb_fn_ptr));
+  vi::Tagged<vi::SharedFunctionInfo> sfi_tag = fn_tag->shared();
+  if (sfi_tag.is_null()) return false;
+  return vi::IsAsyncFunction(sfi_tag->kind());
+}
+
 // Force a young and/or full collection on the green isolate, gated by `mode`.
 // See green_threads_gc.h for the full rationale. The caller guarantees the active
 // COW green threads are parked + rooted, so a synchronous collection on the green
@@ -325,6 +342,38 @@ void GTGreenThreadEntryDump(v8::Isolate* iso) {
               (void*)v_iso->isolate_data());
   }
   ::fflush(stderr);
+}
+
+GTMirrorState GTGreenThreadMirrorState() {
+  GTMirrorState r{nullptr, nullptr, 0};
+  vi::Isolate* cur = vi::Isolate::TryGetCurrent();
+  if (cur == nullptr || !cur->is_green_thread_mode()) return r;
+  vi::IsolateData* id = cur->isolate_data();
+  vi::Address mirror = *reinterpret_cast<vi::Address*>(
+      id->GetAddress(vi::IsolateFieldId::kExecutionStateBase));
+  r.mirror = reinterpret_cast<void*>(mirror);
+  r.own = reinterpret_cast<void*>(cur->CurrentExecutionStateBase());
+  r.match = (r.mirror == r.own) ? 1 : 0;
+  return r;
+}
+
+void GTGreenThreadRefreshMirror() {
+  vi::Isolate* cur = vi::Isolate::TryGetCurrent();
+  if (cur == nullptr || !cur->is_green_thread_mode()) return;
+  // Rewrite ONLY the shared mirror to THIS worker's block (==
+  // CurrentExecutionStateBase()), reaching the registered IsolateData field
+  // kExecutionStateBase via the public offset table -- the same bytes
+  // SetIsolateThreadLocals writes at Isolate::Scope, but without re-doing the
+  // already-correct SetCurrent/LocalHeap/WriteBarrier bookkeeping. A true-parallel
+  // drive holds one Isolate::Scope per worker for its whole lifetime, so the mirror
+  // is written once at start and then pinned at the last-started worker's block;
+  // every OTHER worker's JS-entry x25 arm would load that stale block, desyncing
+  // x25 from thread_local_top() and corrupting context()/map reads. Re-sync it
+  // before each per-body JS re-entry so the arm loads THIS worker's block.
+  vi::IsolateData* id = cur->isolate_data();
+  *reinterpret_cast<vi::Address*>(
+      id->GetAddress(vi::IsolateFieldId::kExecutionStateBase)) =
+      reinterpret_cast<vi::Address>(cur->CurrentExecutionStateBase());
 }
 
 }  // namespace node

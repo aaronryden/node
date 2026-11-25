@@ -437,8 +437,13 @@ void MicrotaskQueueBuiltinsAssembler::SetCurrentContext(
 }
 
 TNode<IntPtrT> MicrotaskQueueBuiltinsAssembler::GetEnteredContextCount() {
-  auto ref = ExternalReference::handle_scope_implementer_address(isolate());
-  TNode<RawPtrT> hsi = Load<RawPtrT>(ExternalConstant(ref));
+  // Route through CurrentHandleScopeImplementer() (not the cached shared
+  // field) so native enters/leaves land on the same per-worker impl that C++
+  // HandleScope / Context::Enter use under green multi-worker drives -- that
+  // is what lets EnteredContextRewindScope rewind them instead of leaking.
+  TNode<RawPtrT> hsi = UncheckedCast<RawPtrT>(CallCFunction(
+      ExternalConstant(ExternalReference::handle_scope_implementer_current()),
+      MachineType::Pointer()));
 
   using ContextStack = DetachableVector<Context>;
   TNode<IntPtrT> size_offset =
@@ -451,8 +456,13 @@ void MicrotaskQueueBuiltinsAssembler::EnterContext(
     TNode<Context> native_context) {
   CSA_DCHECK(this, IsNativeContext(native_context));
 
-  auto ref = ExternalReference::handle_scope_implementer_address(isolate());
-  TNode<RawPtrT> hsi = Load<RawPtrT>(ExternalConstant(ref));
+  // Route through CurrentHandleScopeImplementer() (not the cached shared
+  // field) so native enters/leaves land on the same per-worker impl that C++
+  // HandleScope / Context::Enter use under green multi-worker drives -- that
+  // is what lets EnteredContextRewindScope rewind them instead of leaking.
+  TNode<RawPtrT> hsi = UncheckedCast<RawPtrT>(CallCFunction(
+      ExternalConstant(ExternalReference::handle_scope_implementer_current()),
+      MachineType::Pointer()));
 
   using ContextStack = DetachableVector<Context>;
   TNode<IntPtrT> capacity_offset =
@@ -498,8 +508,13 @@ void MicrotaskQueueBuiltinsAssembler::EnterContext(
 
 void MicrotaskQueueBuiltinsAssembler::RewindEnteredContext(
     TNode<IntPtrT> saved_entered_context_count) {
-  auto ref = ExternalReference::handle_scope_implementer_address(isolate());
-  TNode<RawPtrT> hsi = Load<RawPtrT>(ExternalConstant(ref));
+  // Route through CurrentHandleScopeImplementer() (not the cached shared
+  // field) so native enters/leaves land on the same per-worker impl that C++
+  // HandleScope / Context::Enter use under green multi-worker drives -- that
+  // is what lets EnteredContextRewindScope rewind them instead of leaking.
+  TNode<RawPtrT> hsi = UncheckedCast<RawPtrT>(CallCFunction(
+      ExternalConstant(ExternalReference::handle_scope_implementer_current()),
+      MachineType::Pointer()));
 
   using ContextStack = DetachableVector<Context>;
   TNode<IntPtrT> size_offset =

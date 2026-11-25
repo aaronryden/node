@@ -19,6 +19,10 @@
 #include "src/objects/foreign-inl.h"
 #include "src/objects/objects-inl.h"
 
+#include <execinfo.h>
+#include <cstring>
+#include <cstdlib>
+
 namespace v8 {
 
 template <typename T, internal::ExternalPointerTag tag>
@@ -506,11 +510,55 @@ namespace internal {
 
 void HandleScopeImplementer::EnterContext(Tagged<NativeContext> context) {
   entered_contexts_.push_back(context);
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr,
+              "  [DBGE] iso=%p entered=%zu saved=%zu ctx=%p\n",
+              (void*)isolate_, entered_contexts_.size(),
+              saved_contexts_.size(), (void*)context.address());
+    ::fflush(stderr);
+  }
+  if (entered_contexts_.size() >= 2 &&
+      entered_contexts_.at(entered_contexts_.size() - 2) == context &&
+      ::getenv("GT_DEBUG_ENTCTX")) {
+    void* frames[24];
+    int nf = ::backtrace(frames, 24);
+    char** syms = ::backtrace_symbols(frames, nf);
+    ::fprintf(stderr, "[CTX-REENTER] iso=%p impl=%p RE-ENTER ctx=%p size=%zu\n",
+              (void*)isolate_, (void*)this, (void*)context.address(),
+              entered_contexts_.size());
+    ::fprintf(stderr, "  [LEAKED-STACK]\n");
+    for (size_t k = 0; k < entered_contexts_.size(); k++) {
+      ::fprintf(stderr, "    #%zu ctx=%p\n", k,
+                (void*)entered_contexts_.at(k).address());
+    }
+    for (int i = 0; i < nf && i < 24; i++) {
+      if (::strstr(syms[i], "RunTasks") || ::strstr(syms[i], "SetupAndRun") ||
+          ::strstr(syms[i], "RelocateFunction") || ::strstr(syms[i], "InstallGreenAsync") ||
+          ::strstr(syms[i], "GreenJSEntry") || ::strstr(syms[i], "SpawnAll") ||
+          ::strstr(syms[i], "Context::Scope") || ::strstr(syms[i], "EnterContext")) {
+        ::fprintf(stderr, "    CALLER %d: %s\n", i, syms[i]);
+      }
+    }
+    ::free(syms);
+    ::fflush(stderr);
+  }
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr,
+              "[CTX-ENTER] iso=%p impl=%p tid=0x%lx count=%zu ctx=%p\n",
+              (void*)isolate_, (void*)this, (unsigned long)pthread_self(),
+              entered_contexts_.size(), (void*)context.address());
+    ::fflush(stderr);
+  }
 }
 
 DirectHandle<NativeContext> HandleScopeImplementer::LastEnteredContext() {
   if (entered_contexts_.empty()) return {};
   return direct_handle(entered_contexts_.back(), isolate_);
+}
+
+DirectHandle<NativeContext> HandleScopeImplementer::EnteredContextAt(size_t i) {
+  if (i >= entered_contexts_.size()) return {};
+  return direct_handle(entered_contexts_.at(i), isolate_);
 }
 
 }  // namespace internal

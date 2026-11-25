@@ -64,8 +64,13 @@
 #include <thread>
 #include <condition_variable>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "node_binding.h"
 #include "util.h"
+
+#include "uv.h"
 
 #include "v8.h"
 
@@ -152,6 +157,10 @@ static void InstallGreenGlobalsShell(v8::Local<v8::Context> green_ctx);
 
 namespace {
 
+// Forward declaration (anonymous-namespace scope, matching the definition below
+// so the mangled names agree). Called by EnsureGreenContext.
+static void InstallGreenAsyncGlobals(v8::Local<v8::Context> green_ctx);
+
 namespace vi = v8::internal;
 
 using v8::Array;
@@ -169,6 +178,7 @@ using v8::Boolean;
 using v8::Number;
 using v8::Object;
 using v8::Persistent;
+using v8::Promise;
 using v8::Script;
 using v8::String;
 using v8::Undefined;
@@ -176,11 +186,33 @@ using v8::Value;
 
 using vi::Address;  // v8::internal::Address (untagged heap pointer)
 
+// Forward declaration: GreenIoWork (defined further below) is referenced by the
+// GreenCallData.pending_reads vector. A declaration suffices -- unique_ptr /
+// vector only need the complete type at destruction, which happens where
+// GreenIoWork is fully defined.
+struct GreenIoWork;
+
 // Per-green-thread JavaScript invocation state. A single instance is shared
 // between the scheduler's C++ entry point and the running spawnAll call.
 struct GreenCallData {
   Isolate* isolate = nullptr;
-  Persistent<Context> context_p;  // The context the body runs in.
+  Persistent<Context> context_p;
+  // Outstanding green-async reads (gtRead) submitted by this body, in
+  // submission order. GreenGtRead appends the GreenIoWork here; the body's
+  // owning drive worker resolves each finished read into the body's own queue
+  // and frees it. Thread-local g_green_driving_body routes each submission to
+  // the correct body; a body's reads are appended only by its setup (embedding
+  // thread) and then its owning drive worker, never concurrently, so the vector
+  // needs no lock. Kept alive on data (freeing it also frees the reads) until
+  // the async teardown loop below clears it.
+  std::vector<std::unique_ptr<GreenIoWork>> pending_reads;
+  // Owned per green-async body: its own MicrotaskQueue. Each async body drives
+  // its continuations from its own queue (via Context::GetMicrotaskQueue), so
+  // N workers can resume disjoint bodies concurrently without racing one shared
+  // queue (DriveGreenAsyncBodiesParallel's per-worker body ownership). The embedder must
+  // keep the queue alive until the context is gone; struct-destruction order
+  // (context_p declared above) disposes the context first, then this.
+  std::unique_ptr<v8::MicrotaskQueue> body_mq_p;
   Persistent<Function> fn_p;      // The user's green-thread body.
   // Isolate that owns fn_p's handle (the embedding isolate in every mode). The
   // body is the embedding Function itself, so its Persistent can only be read
@@ -224,6 +256,59 @@ struct GreenCallData {
   std::string exc_name;
   std::string exc_msg;
   vi::GreenThread* gt = nullptr;  // Underlying green thread descriptor.
+
+  // --- Async (await) support ---
+  // Set for a body whose SharedFunctionInfo is an async function (async fn /
+  // async arrow / async generator / async concise method). Such a body runs on
+  // the EMBEDDING isolate, where Node's async I/O bindings (setTimeout /
+  // process / require) actually live -- the fresh green realm cannot host them
+  // (its lifted setTimeout calls the Node-internal validateFunction, which is
+  // not a global, so it ReferenceErrors). A sync body keeps running green, so
+  // genuine compute still parallelizes on the green isolate; only async bodies
+  // -- which are inherently serial around I/O -- run on embedding. Its result
+  // row in the returned array is a caller-facing Promise resolved (or rejected)
+  // by reactions chained onto the body promise and driven by the normal Node
+  // event loop. No green parking, drain, or resumer is involved.
+  bool awaiting = false;
+  // Rooted on data->isolate (the embedding isolate for an async body): the
+  // Resolver of the caller-facing Promise handed to the JS caller.
+  Persistent<Promise::Resolver> caller_resolver_p;
+  Persistent<Context> caller_ctx_p;
+
+  // --- Green-async (await) support ---
+  // An async body in shared-heap mode runs on the GREEN isolate (not the
+  // embedding isolate). V8 saves an async function's JS stack in its own
+  // closure, so when the body parks at `await`, fn->Call returns a pending
+  // promise and the C++ frame is already gone -- the body is later resumed by
+  // driving the green isolate's microtask queue (RunMicrotasks), with external
+  // triggers (timers / I/O) progressed by running the embedding libuv loop.
+  // The scheduler/pool only ever drives SYNC bodies, so green-async bodies
+  // (async_green) are given no green thread and are driven directly here.
+  // A green-async body (Option C): an async function whose body runs on the
+  // GREEN isolate, so its control flow and compute stay green and `await`
+  // cooperatively parks it (its continuation lives in the async closure while
+  // fn->Call has returned a pending promise). The scheduler/pool only ever
+  // drives SYNC bodies; green-async bodies are parked and resumed directly by
+  // the RunTasks drive loop below. `awaiting` stays true so the pool never
+  // creates a green thread / COW view for one.
+  bool async_green = false;
+  // Rooted on data->isolate (the green isolate): the body's pending promise,
+  // held from fn->Call until the drive phase settles it.
+  Persistent<Promise> async_promise_p;
+  // Rooted on the embedding isolate: the resolver of the caller-facing Promise
+  // handed to the JS caller. The green body promise settles in the drive loop,
+  // at which point a green reaction (GreenGreenCallerResolveFulfilled/Rejected)
+  // Enters this isolate and resolves it. `caller_isolate` records which one.
+  Isolate* caller_isolate = nullptr;
+  // Set once the body promise has settled (a reaction fired and captured the
+  // settle value). The drive loop waits for every green-async body to reach
+  // this before returning so the caller Promises handed out are settled.
+  bool async_settled = false;
+  // The value the green body promise settled with (return value if fulfilled,
+  // rejection reason if rejected) -- captured by the green settle reaction as a
+  // GREEN Persistent (args[0] is a green handle). RunTasks copies it into the
+  // embedding isolate and resolves the caller resolver with it.
+  Persistent<Value> settle_value_p;
 };
 
 // Registry from green thread to its call data. The scheduler entry point is
@@ -282,6 +367,13 @@ static Persistent<Context> g_green_ctx;
 // isolate bookkeeping that might read a shared object. Declared here rather
 // than inline to avoid capturing state across the C call.
 static thread_local bool g_in_green_body = false;
+// Per-OS-thread pointer to the green-async body whose continuation is currently
+// being driven on this thread. GreenGtRead installs each read here so the body's
+// owning worker can find and resolve it in the body's own queue. Set by the
+// embedding setup thread around a body's first await and by each drive worker
+// around that body's continuations; thread-local so distinct workers never
+// clobber each other's target.
+static thread_local GreenCallData* g_green_driving_body = nullptr;
 
 static Isolate* GetGreenIsolate(Isolate* embedding) {
   if (g_green_isolate != nullptr) return g_green_isolate;
@@ -480,6 +572,9 @@ static void EnsureGreenContext(Isolate* embedding, Local<Context> embedding_ctx)
   Local<Context> ctx = Context::New(g_green_isolate);
   Context::Scope ctx_scope(ctx);
   LiftEmbeddingGlobals(embedding, embedding_ctx, ctx);
+  // Install the green async I/O bridge (`gtRead`) on the green global so an
+  // async body can `await` real embedding libuv I/O while it runs green.
+  InstallGreenAsyncGlobals(ctx);
   g_green_ctx.Reset(g_green_isolate, ctx);
 }
 
@@ -489,12 +584,17 @@ static void LiftCapturedValues(Isolate* emb_isolate,
 
 // Relocate an embedding-isolate function onto the green isolate by
 // re-parsing its source, so a green body runs as green Code and free
-// variables resolve against the lifted green global.
+// variables resolve against the lifted green global. `green_ctx` is the context
+// the body's source is compiled against and its captured free variables are
+// lifted onto: for a sync body this is the durable shared g_green_ctx; for a
+// green-async body it is that body's own context (so the body's continuations
+// run with its own lift + its own gtRead).
 // Returns the relocated body rooted in a Persistent on the green isolate. The
 // caller owns this durable handle; no caller handle scope is required because
 // the function is rooted inside this function before its own scope ends.
 static std::unique_ptr<Persistent<Function>> RelocateFunction(Isolate* emb_isolate,
-                                                              Local<Function> emb_fn) {
+                                                              Local<Function> emb_fn,
+                                                              Local<Context> green_ctx) {
   // Capture the source on the embedding isolate.
   std::string src;
   {
@@ -506,17 +606,16 @@ static std::unique_ptr<Persistent<Function>> RelocateFunction(Isolate* emb_isola
     src.assign(*src_utf8, src_utf8.length());
   }
   std::string program = "(function(){ return " + src + "; })();";
-  // Compile + run on the green isolate in green_ctx -- the persistent context
-  // that owns the lifted embedding globals (not a fresh per-function context,
-  // which used to give every body a different native context and left the green
-  // isolate's current context torn for the second body dispatched on it). Free
-  // variables in the body therefore resolve against those lifted globals. The
-  // result is rooted in a Persistent before this scope ends, so no Local
-  // dangles.
+  // Compile + run on the green isolate in green_ctx. For a sync body this is the
+  // durable shared g_green_ctx; for a green-async body it is that body's OWN
+  // context (SetupAndRunGreenAsyncBody hands it in), so the body's captured free
+  // variables lift onto its own realm and its continuations run from its own
+  // microtask queue. Free variables in the body therefore resolve against those
+  // lifted globals. The result is rooted in a Persistent before this scope ends,
+  // so no Local dangles.
   GreenGCPause gc(g_green_isolate);
   v8::Isolate::Scope isolate_scope(g_green_isolate);
   HandleScope scope(g_green_isolate);
-  Local<Context> green_ctx = Local<Context>::New(g_green_isolate, g_green_ctx);
   Context::Scope ctx_scope(green_ctx);
   // Lift captured closure values (module-scope `const`s like `vals`; native
   // bindings like `g` are skipped) onto the green global by name, so the
@@ -967,6 +1066,648 @@ static void PrimeBody(GreenCallData* data) {
   g_in_green_body = was_in_body;
 }
 
+// ====================================================================
+// Async green bodies (await): run on the embedding isolate, Promise bridge
+// --------------------------------------------------------------------
+// A body that is an async function (async fn / async arrow / async generator /
+// async concise method) is detected by its SharedFunctionInfo FunctionKind
+// (GTIsAsyncFunction, in green_threads_gc.cc) and runs on the EMBEDDING isolate,
+// not the fresh green realm. Node's async I/O bindings (setTimeout /
+// setImmediate / process / require) live on the embedding realm; the green
+// realm's lifted setTimeout calls the Node-internal validateFunction, which is
+// not a global there, so async I/O on green ReferenceErrors. Sync bodies keep
+// running green so genuine compute still parallelizes on the green isolate.
+//
+// On the embedding isolate the async body returns a pending Promise from
+// fn->Call. We build the caller-facing Promise+Resolver here and hang
+// fulfill/reject reactions on the body promise via Promise::Then; the caller
+// Promise is set as the task's result row. When Node's event loop settles the
+// body (async I/O completes) the reactions fire ON the embedding isolate and
+// resolve/reject the caller resolver -- no green parking, drain, or resumer, so
+// nothing performs V8 handle work off the embedding thread. The reactions are
+// driven by the normal Node event loop (the JS caller awaits the returned
+// Promise(s)), so no extra scheduling handle is required.
+static void GreenAsyncResolveFulfilled(const FunctionCallbackInfo<Value>& args) {
+  GreenCallData* data = static_cast<GreenCallData*>(
+      v8::External::Cast(*args.Data())->Value());
+  v8::Local<v8::Context> rctx =
+      v8::Local<v8::Context>::New(data->isolate, data->caller_ctx_p);
+  v8::Local<v8::Promise::Resolver> resolver =
+      v8::Local<v8::Promise::Resolver>::New(data->isolate, data->caller_resolver_p);
+  resolver->Resolve(rctx, args[0]);
+  // The body promise has settled and disowned this reaction, so nothing else
+  // references data now: release the rooted handles and free the call data.
+  data->caller_resolver_p.Reset();
+  data->caller_ctx_p.Reset();
+  delete data;
+}
+static void GreenAsyncResolveRejected(const FunctionCallbackInfo<Value>& args) {
+  GreenCallData* data = static_cast<GreenCallData*>(
+      v8::External::Cast(*args.Data())->Value());
+  v8::Local<v8::Context> rctx =
+      v8::Local<v8::Context>::New(data->isolate, data->caller_ctx_p);
+  v8::Local<v8::Promise::Resolver> resolver =
+      v8::Local<v8::Promise::Resolver>::New(data->isolate, data->caller_resolver_p);
+  resolver->Reject(rctx, args[0]);
+  data->caller_resolver_p.Reset();
+  data->caller_ctx_p.Reset();
+  delete data;
+}
+
+// ====================================================================
+// Green async I/O bridge (Option C: async body runs GREEN)
+// --------------------------------------------------------------------
+// A green async body runs on the GREEN isolate, so its control flow and CPU
+// stay green. To await real async I/O -- which only exists on the embedding
+// isolate's libuv -- it awaits the green global gtRead(path, encoding). The
+// call returns a green promise immediately (the body parks) while the bytes are
+// read on the libuv thread pool; on completion the result is resolved back onto
+// that green promise, resuming the parked body via a green microtask.
+//
+// The dedicated green I/O loop is separate from Node's main libuv loop so
+// pumping it inside g.spawnAll() never perturbs Node's event-loop state. The
+// drive loop in RunTasks alternates pumping it with the green microtask
+// checkpoint, so while one green body is parked on gtRead the others keep
+// running -- Go-goroutine-style cooperative parking.
+// ====================================================================
+
+// Dedicated libuv loop for the green I/O bridge. Created lazily on first use
+// (always the drive thread in this path), so no lock is needed.
+uv_loop_t* GreenIOLoop() {
+  static uv_loop_t* loop = nullptr;
+  if (loop == nullptr) {
+    loop = new uv_loop_t;
+    uv_loop_init(loop);
+  }
+  return loop;
+}
+
+// Outstanding green I/O requests, so the drive loop knows when external work is
+// pending (block on it) versus idle (drain non-I/O awaits without blocking).
+static std::atomic<int> g_green_io_active{0};
+
+// Per-outstanding-read work passed to the libuv thread pool: the path, the
+// green resolver to resolve on completion, and the bytes read. uv_work_t has no
+// user-data field, but it is the first (and only) member of this heap struct,
+// so execute/complete reinterpret_cast the req back here.
+struct GreenIoWork {
+  uv_work_t req;
+  std::string path;
+  std::string encoding;
+  Persistent<Promise::Resolver> green_resolver_p;  // resolved by the owning worker
+  // Ownership + completion flags. `owned` is set when GreenGtRead hands the read
+  // to the body's owning worker (data->pending_reads); a non-owned read is
+  // resolved + freed here on GreenIoComplete (a fallback, unreachable for a real
+  // async body). `finished` is set (release) by GreenIoExecute once buf/err are
+  // valid, so the owning worker that reads it (acquire) observes a stable result.
+  bool owned = false;
+  std::atomic<bool> finished{false};
+  char* buf = nullptr;
+  size_t len = 0;
+  int err = 0;
+};
+
+static void GreenIoExecute(uv_work_t* req) {
+  GreenIoWork* w = reinterpret_cast<GreenIoWork*>(req);
+  int fd = ::open(w->path.c_str(), O_RDONLY);
+  if (fd < 0) { w->err = errno; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
+  long sz = 0;
+  struct stat st;
+  if (::fstat(fd, &st) == 0) sz = st.st_size;
+  char* buf = static_cast<char*>(::malloc(sz > 0 ? sz : 1));
+  if (buf == nullptr) { ::close(fd); w->err = ENOMEM; w->len = 0; w->buf = nullptr; w->finished.store(true, std::memory_order_release); g_green_io_active.fetch_sub(1, std::memory_order_relaxed); return; }
+  size_t off = 0;
+  ssize_t r;
+  while (off < static_cast<size_t>(sz) &&
+         (r = ::read(fd, buf + off, static_cast<size_t>(sz) - off)) > 0)
+    off += static_cast<size_t>(r);
+  ::close(fd);
+  w->buf = buf;
+  w->len = off;
+  w->err = 0;
+  w->finished.store(true, std::memory_order_release);
+  g_green_io_active.fetch_sub(1, std::memory_order_relaxed);
+}
+
+static void GreenIoComplete(uv_work_t* req, int status) {
+  GreenIoWork* w = reinterpret_cast<GreenIoWork*>(req);
+  if (w->owned) {
+    // The owning worker owns resolution + freeing (it resolves into the body's
+    // OWN queue, same thread that later checkpoints it -- the lock-free
+    // MicrotaskQueue must never see a concurrent enqueue from here and drain
+    // from a worker). The driver never pumps this loop for owned reads, so the
+    // worker frees w; GreenIoComplete only touches w when it is non-owned.
+    return;
+  }
+  // Non-owned fallback (unreachable for a real green-async body -- the setup and
+  // drive paths always set g_green_driving_body before any gtRead resolves).
+  // Resolve inline and free here, matching the pre-fan-out serial behaviour.
+  {
+    v8::Isolate::Scope iso_scope(g_green_isolate);
+    v8::HandleScope hs(g_green_isolate);
+    v8::Local<v8::Context> ctx =
+        v8::Local<v8::Context>::New(g_green_isolate, g_green_ctx);
+    v8::Context::Scope ctx_scope(ctx);
+    v8::Local<v8::Promise::Resolver> res =
+        v8::Local<v8::Promise::Resolver>::New(g_green_isolate, w->green_resolver_p);
+    if (status != 0 || w->err != 0) {
+      int code = w->err != 0 ? w->err : status;
+      std::string msg = std::string("green_threads gtRead: ") + std::string(strerror(code));
+      res->Reject(ctx, v8::Exception::Error(
+          v8::String::NewFromUtf8(g_green_isolate, msg.c_str(),
+                                  v8::NewStringType::kNormal).ToLocalChecked()));
+    } else {
+      std::string contents(w->buf, w->len);
+      res->Resolve(ctx, v8::String::NewFromUtf8(g_green_isolate, contents.c_str(),
+                                                v8::NewStringType::kNormal).ToLocalChecked());
+    }
+  }
+  ::free(w->buf);
+  delete w;
+}
+
+// gtRead(path, encoding) -- the green global an async body awaits. Runs green;
+// returns a green promise that resolves (or rejects) when the file read, done on
+// the embedding libuv pool, completes.
+static void GreenGtRead(const FunctionCallbackInfo<Value>& args) {
+  v8::Isolate* green = args.GetIsolate();
+  v8::HandleScope hs(green);
+  v8::Local<v8::Context> ctx = green->GetCurrentContext();
+  v8::Local<v8::Promise::Resolver> res;
+  if (!v8::Promise::Resolver::New(ctx).ToLocal(&res)) return;
+
+  GreenIoWork* w = new GreenIoWork();
+  w->buf = nullptr;
+  w->len = 0;
+  w->err = 0;
+  if (args[0]->IsString()) {
+    v8::String::Utf8Value p(green, args[0]);
+    w->path.assign(*p, p.length());
+  }
+  if (args[1]->IsString()) {
+    v8::String::Utf8Value e(green, args[1]);
+    w->encoding.assign(*e, e.length());
+  }
+  g_green_io_active.fetch_add(1, std::memory_order_relaxed);
+  w->green_resolver_p.Reset(green, res);
+  uv_queue_work(GreenIOLoop(), &w->req, GreenIoExecute, GreenIoComplete);
+  if (g_green_driving_body != nullptr) {
+    // Hand the read to the body's OWN drive worker: it owns both the resolution
+    // (into the body's own queue -- same thread that checkpoints that queue, so
+    // the lock-free MicrotaskQueue never sees a concurrent enqueue here and a
+    // drain elsewhere) and the freeing. w->owned stays false for the fallback
+    // path, where GreenIoComplete resolves + frees it.
+    w->owned = true;
+    g_green_driving_body->pending_reads.push_back(
+        std::unique_ptr<GreenIoWork>(w));
+  }
+  args.GetReturnValue().Set(res->GetPromise());
+}
+
+// Install the green async I/O globals on the green context's global object so a
+// relocated async body's gtRead(...) free variable resolves here.
+static void InstallGreenAsyncGlobals(Local<Context> green_ctx) {
+  v8::Isolate::Scope isolate_scope(g_green_isolate);
+  HandleScope scope(g_green_isolate);
+  Context::Scope ctx_scope(green_ctx);
+  GreenGCPause gc(g_green_isolate);  // protect the freshly-installed global
+  Local<Function> gt =
+      FunctionTemplate::New(g_green_isolate, GreenGtRead)->GetFunction(green_ctx)
+          .ToLocalChecked();
+  Local<String> key = String::NewFromUtf8(
+      g_green_isolate, "gtRead", v8::NewStringType::kNormal).ToLocalChecked();
+  green_ctx->Global()->Set(green_ctx, key, gt).Check();
+}
+
+// The reaction chained onto the green-async body promise (installed as BOTH the
+// fulfilled and the rejected handler). It fires ON the green isolate when the
+// body settles, capturing args[0] -- the green-isolate value the body settled
+// with, i.e. its return value if fulfilled or the rejection reason otherwise --
+// into a green Persistent. It deliberately does NOT switch isolate scope or
+// touch the embedding caller resolver: a body settle reaction must stay on the
+// green isolate so the drive loop's green Isolate::Scope stays balanced and so
+// the (green) value handle is read on its own isolate. RunTasks copies the
+// captured value to the embedding isolate and resolves the caller resolver.
+static void GreenGreenCaptureSettle(const FunctionCallbackInfo<Value>& args) {
+  GreenCallData* data = static_cast<GreenCallData*>(
+      v8::External::Cast(*args.Data())->Value());
+  data->settle_value_p.Reset(data->isolate, args[0]);
+}
+
+// Build the data + caller Promise for a green-async body, run it green to its
+// first await (fn->Call returns the pending body promise), and chain the green
+// reactions that resolve the embedding caller Promise on settlement.
+static GreenCallData* SetupAndRunGreenAsyncBody(Isolate* emb, Local<Context> emb_ctx,
+                                                Isolate* green, Local<Function> fn,
+                                                Local<Array> task) {
+  GreenCallData* data = new GreenCallData();
+  data->awaiting = true;
+  data->async_green = true;
+  data->caller_isolate = emb;
+  data->isolate = green;
+  data->fn_isolate = green;
+
+  // Create THIS body's own green context + microtask queue. Each green-async
+  // body gets a private context (not the shared g_green_ctx) so a per-worker
+  // drive can resume one body's continuations from its own queue with no race
+  // on a shared context/queue. The microtask queue is owned by data->body_mq_p
+  // and must outlive the context (struct-destruction order disposes the
+  // context first, then this). gtRead is installed so the body's `await
+  // gtRead(...)` free variable resolves; embedding globals like setTimeout are
+  // intentionally NOT lifted -- a green-async body bridges I/O through gtRead.
+  std::unique_ptr<Persistent<Function>> relocated;
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr, "[ANDAB-START] body=%p iso=%p tid=0x%lx round=%llu\n",
+              (void*)data, (void*)green, (unsigned long)pthread_self(),
+              (unsigned long long)g_green_spawn_round.load(std::memory_order_relaxed));
+    ::fflush(stderr);
+  }
+#endif
+  {
+    v8::Isolate::Scope iso_scope(green);
+    HandleScope hs(green);
+    Local<Context> body_ctx = Context::New(green);
+    data->body_mq_p = v8::MicrotaskQueue::New(green);
+    body_ctx->SetMicrotaskQueue(data->body_mq_p.get());
+    InstallGreenAsyncGlobals(body_ctx);
+    data->context_p.Reset(green, body_ctx);
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      static std::unordered_map<GreenCallData*, void*>& g_body_ctx_addr =
+          *new std::unordered_map<GreenCallData*, void*>();
+      const void* ctx_addr =
+          reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(*body_ctx));
+      ::fprintf(stderr,
+                "[CTX-SETUP] body=%p round=%llu ctx=%p empty=%d\n",
+                (void*)data,
+                (unsigned long long)data->round, (void*)ctx_addr,
+                (int)data->context_p.IsEmpty());
+      ::fflush(stderr);
+      g_body_ctx_addr[data] = const_cast<void*>(ctx_addr);
+    }
+#endif
+    // Relocate the function onto THIS body's context and lift its captured free
+    // variables there, so the body runs green with its own lift + gtRead.
+    relocated = RelocateFunction(emb, fn, body_ctx);
+  }
+#ifdef V8_ENABLE_GREEN_THREADS
+  if (::getenv("GT_DEBUG_ENTCTX")) {
+    ::fprintf(stderr, "[ANDAB] body=%p after-block1 iso=%p tid=0x%lx\n",
+              (void*)data, (void*)green, (unsigned long)pthread_self());
+    ::fflush(stderr);
+  }
+#endif
+
+  // Caller-facing Promise (embedding): handed to the JS caller, resolved once
+  // the green body settles.
+  {
+    v8::Isolate::Scope iso_scope(emb);
+    HandleScope hs(emb);
+    Local<Promise::Resolver> resolver =
+        Promise::Resolver::New(emb_ctx).ToLocalChecked();
+    data->caller_resolver_p.Reset(emb, resolver);
+    data->caller_ctx_p.Reset(emb, emb_ctx);
+  }
+
+  data->fn_p.Reset(green, *relocated);
+  GreenValueCopier args_copier;
+  args_copier.src = emb;
+  args_copier.dst = green;
+  const uint32_t argc = task->Length();
+  for (uint32_t a = 1; a < argc; a++) {
+    Local<Value> arg = task->Get(emb_ctx, a).ToLocalChecked();
+    data->args_p.push_back(CopyValueAcross(args_copier, arg));
+  }
+
+  // Run the body green up to its first await (or to completion if it has none).
+  // An async function always returns a promise, so out is a promise here.
+  {
+    v8::Isolate::Scope iso_scope(green);
+    GreenGCPause gc(green);
+    HandleScope hs(green);
+    Local<Context> gctx = Local<Context>::New(green, data->context_p);
+    Context::Scope ctx_scope(gctx);
+    Local<Function> gfn = Local<Function>::New(green, data->fn_p);
+    // Install this body as the driving body so its first gtRead (phase 1)
+    // registers into data->pending_reads for its owning drive worker to resolve
+    // later. Restored below the body's first await has been captured.
+    GreenCallData* const prior_driving = g_green_driving_body;
+    g_green_driving_body = data;
+    std::vector<Local<Value>> argv;
+    for (auto& arg : data->args_p) argv.push_back(Local<Value>::New(green, *arg));
+    Local<Value> out;
+    if (!gfn->Call(gctx, gctx->Global(), argv.size(), argv.data()).ToLocal(&out) ||
+        !out->IsPromise()) {
+      // Not actually async: reject the caller with a clear error.
+      v8::Isolate::Scope iso_scope2(emb);
+      HandleScope hs2(emb);
+      Local<Promise::Resolver> resolver =
+          Local<Promise::Resolver>::New(emb, data->caller_resolver_p);
+      Local<Context> rctx = Local<Context>::New(emb, data->caller_ctx_p);
+      Local<Value> ty = v8::Exception::TypeError(String::NewFromUtf8(
+          emb, "green_threads body must be an async function",
+          v8::NewStringType::kNormal).ToLocalChecked());
+      resolver->Reject(rctx, ty);
+      return data;
+    }
+    g_green_driving_body = prior_driving;
+    data->async_promise_p.Reset(green, Local<Promise>::Cast(out));
+    // Chain the green reaction that captures the body's settle value. The same
+    // function is installed as both the fulfilled and rejected handler: in
+    // either case args[0] is the value the body settled with and RunTasks must
+    // copy it into the embedding caller resolver.
+    Local<Value> ext = v8::External::New(green, data);
+    Local<Function> settle =
+        Function::New(gctx, GreenGreenCaptureSettle, ext).ToLocalChecked();
+    (void)Local<Promise>::Cast(out)
+        ->Then(gctx, settle, settle)
+        .ToLocalChecked();
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      ::fprintf(stderr, "[ANDAB] body=%p after-block2 iso=%p tid=0x%lx\n",
+                (void*)data, (void*)green, (unsigned long)pthread_self());
+      ::fflush(stderr);
+    }
+#endif
+  }
+  return data;
+}
+
+// Drive every queued green-async body to settlement across an OS worker pool.
+//
+// Each body owns a private green context + MicrotaskQueue (installed in
+// SetupAndRunGreenAsyncBody). A body is resumed by resolving its outstanding
+// gtRead promises -- which enqueue that body's awaited continuation into the
+// body's OWN queue -- then checkpointing that same queue. Because the V8
+// MicrotaskQueue is lock-free, these two steps MUST happen on the SAME thread,
+// so each body is owned by exactly one drive worker that both resolves its
+// finished reads and checkpoints its queue; distinct workers drive disjoint
+// bodies (round-robin partition), so no per-body queue is ever touched by two
+// threads at once.
+//
+// An async worker runs on its own OS thread with a fresh PerIsolateThreadData
+// and never sets CurrentGreenThread(), so CowEnabledThread() returns null and
+// the CoW write barrier is a no-op during the drive -- async bodies allocate
+// only fresh objects, kept disjoint by the CAS bump pointer while RunTasks holds
+// the AlwaysAllocate window (now covering all-async). N workers each holding
+// v8::Isolate::Scope + HandleScope on the green isolate reuses the proven sync
+// true-parallel recipe; per-worker handle-scope routing (SetIsolateHandleScope
+// PerWorker) is armed around the whole window so handle-scope / entered-context
+// state is per-OS-thread.
+//
+// Returns false if the stall limit was hit (a body waits on I/O that never
+// completes).
+//
+// g_green_mutator_lock: coarse green-mutator lock (M2a baseline). Serializes the
+// concurrent green workers so at most ONE OS worker touches the green heap's
+// shared execution-state (the isolate-independent JS-entry microtask runner
+// re-arms x25 from the shared execution_state_base_ mirror; without this guard a
+// sibling worker's refresh clobbers it mid-arm -> cross-worker context desync
+// -> SIGSEGV). True all-mutator parallelism is the later milestone; this is the
+// "mutex-protected" phase N workers run behind. Defined here (near its async
+// driver) though referenced below by the M2Probe pool too.
+static std::mutex g_green_mutator_lock;
+
+static bool DriveGreenAsyncBodiesParallel(Isolate* green,
+                                          std::vector<GreenCallData*>& datas) {
+  // Halt incremental marking for the whole drive: parked async bodies keep their
+  // JS stack inside their async closure (rooted by data->async_promise_p), every
+  // gtRead resolver is a green Persistent, and the settle reaction captures a
+  // green value -- a collection could otherwise relocate/reclaim any of these.
+  // The AlwaysAllocate window armed by RunTasks (now covering all-async too)
+  // already holds marking stopped here; GreenGCPause is the belt-and-suspenders
+  // guard for the all-async case where no window was armed in the mixed path.
+  GreenGCPause gc(green);
+
+  // Async bodies (async_green) hold no green thread; they are driven directly
+  // here. Sync bodies (awaiting) are driven by the pool and have no reads/queue
+  // to drive.
+  std::vector<GreenCallData*> async_bodies;
+  async_bodies.reserve(datas.size());
+  for (GreenCallData* d : datas)
+    if (d->async_green) async_bodies.push_back(d);
+  if (async_bodies.empty()) return true;
+
+  int num_workers = static_cast<int>(std::thread::hardware_concurrency());
+  if (num_workers < 1) num_workers = 1;
+  if (const char* wenv = ::getenv("GT_NUM_WORKERS")) {
+    int requested = atoi(wenv);
+    if (requested > 0 && requested < num_workers) num_workers = requested;
+  }
+  if (num_workers > static_cast<int>(async_bodies.size()))
+    num_workers = static_cast<int>(async_bodies.size());
+
+  // Round-robin partition: body i is owned by worker (i % num_workers).
+  std::vector<std::vector<GreenCallData*>> partitions(num_workers);
+  for (size_t i = 0; i < async_bodies.size(); i++)
+    partitions[i % num_workers].push_back(async_bodies[i]);
+
+  const int max_idle = 2000000;
+  std::vector<std::thread> workers;
+  workers.reserve(num_workers);
+
+  auto run_partition = [&](std::vector<GreenCallData*> bodies) {
+    // Activate the green isolate on THIS OS worker + per-worker handle scope.
+    // The per-thread CurrentGreenThread() slot left null here (no gt for async),
+    // which is what makes the CoW barrier a no-op for async-allocated objects.
+    v8::Isolate::Scope iso_scope(green);
+    v8::HandleScope handle_scope(green);
+    int idle = 0;
+    for (;;) {
+      bool all_settled = true;
+      bool progressed = false;
+      for (GreenCallData* d : bodies) {
+        if (d->async_settled) continue;
+        all_settled = false;
+
+        // Serialize this worker's mirror-touch + microtask execution against the
+        // other workers sharing this green isolate. The JS-entry microtask runner
+        // (JSRunMicrotasksEntry) re-arms the per-worker execution-state register
+        // (x25) from the SHARED IsolateData execution_state_base_ mirror; without
+        // this guard a sibling worker's GTGreenThreadRefreshMirror() overwrites that
+        // mirror mid-arm, so SetCurrentContext writes a sibling's block while this
+        // thread's C++ path (Isolate::context / raw_native_context) reads its own
+        // -> garbage context_ -> SIGSEGV. This is the "safe correctness baseline N
+        // workers run behind" the true-parallel milestone.
+        std::lock_guard<std::mutex> mutator_lock(g_green_mutator_lock);
+
+        // Resolve every finished gtRead for this body into ITS OWN queue. The
+        // resolve runs with the body's context current so the awaited
+        // continuation enqueues into body_mq_p (the lock-free queue we check
+        // point below on this same thread) rather than a shared queue.
+        std::vector<std::unique_ptr<GreenIoWork>> still;
+        still.reserve(d->pending_reads.size());
+        for (auto& rd : d->pending_reads) {
+          if (rd->finished.load(std::memory_order_acquire)) {
+            v8::Local<v8::Context> bctx =
+                v8::Local<v8::Context>::New(green, d->context_p);
+            {
+              v8::Context::Scope ctx_scope(bctx);
+              v8::Local<v8::Promise::Resolver> res =
+                  v8::Local<v8::Promise::Resolver>::New(green, rd->green_resolver_p);
+              if (rd->err != 0) {
+                std::string msg =
+                    std::string("green_threads gtRead: ") +
+                    std::string(strerror(rd->err));
+                res->Reject(bctx, v8::Exception::Error(
+                    v8::String::NewFromUtf8(green, msg.c_str(),
+                                            v8::NewStringType::kNormal)
+                                                .ToLocalChecked()));
+              } else {
+                std::string contents(rd->buf, rd->len);
+                res->Resolve(bctx, v8::String::NewFromUtf8(
+                    green, contents.c_str(), v8::NewStringType::kNormal)
+                                        .ToLocalChecked());
+              }
+            }
+            ::free(rd->buf);
+            delete rd.release();  // owned read: the driver owns its lifetime now
+            progressed = true;
+          } else {
+            still.push_back(std::move(rd));
+          }
+        }
+        d->pending_reads.swap(still);
+
+        // Resume any continuations now enqueued in THIS body's own queue.
+        // g_green_driving_body is set here so any continuation's new gtRead
+        // registers into THIS body's pending_reads (its owning worker frees +
+        // resolves it). Per-OS-thread, and a worker runs at most one body at a
+        // time, so no concurrent write to any single body's vector.
+        GreenCallData* const prior_driving = g_green_driving_body;
+        g_green_driving_body = d;
+#ifdef V8_ENABLE_GREEN_THREADS
+        // Capture the shared execution-state mirror as it stands BEFORE this
+        // worker refreshes it -- the honest test of the per-worker desync: under
+        // true parallelism the mirror stays pinned at the last initial Isolate::
+        // Scope (a sibling's block), so non-last workers read a stale x25 base.
+        GTMirrorState ms = GTGreenThreadMirrorState();
+        // Re-sync the mirror to THIS worker's block right before the JS-entry
+        // x25 arm (below), so the continuation dispatch reads the correct
+        // context() for THIS body. Without the per-entry refresh the mirror is
+        // written once at worker start and never again, and every non-last
+        // worker arms x25 to a sibling block -> desync -> SEGV.
+        GTGreenThreadRefreshMirror();
+        if (::getenv("GT_GT_DEBUG")) {
+          GTMirrorState post = GTGreenThreadMirrorState();
+          ::fprintf(stderr,
+                    "[GTGT-ASYNC-ARM] tid=0x%lx body=%p pre=0x%lx own=0x%lx "
+                    "pre_%s post=0x%lx post_%s\n",
+                    (unsigned long)pthread_self(), (void*)d,
+                    (unsigned long)(intptr_t)ms.mirror,
+                    (unsigned long)(intptr_t)ms.own,
+                    ms.match ? "SYNC" : "MIRROR-DIFFERS",
+                    (unsigned long)(intptr_t)post.mirror,
+                    post.match ? "SYNC" : "MIRROR-DIFFERS");
+          ::fflush(stderr);
+        }
+#endif
+        v8::Local<v8::Context> bctx2 =
+            v8::Local<v8::Context>::New(green, d->context_p);
+#ifdef V8_ENABLE_GREEN_THREADS
+        if (::getenv("GT_DEBUG_ENTCTX")) {
+          static std::unordered_map<GreenCallData*, void*>& g_body_ctx_addr =
+              *new std::unordered_map<GreenCallData*, void*>();
+          const void* ctx_addr =
+              reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(*bctx2));
+          const void* setup_addr = nullptr;
+          auto it = g_body_ctx_addr.find(d);
+          if (it != g_body_ctx_addr.end()) setup_addr = it->second;
+          GTMirrorState ms = GTGreenThreadMirrorState();
+          ::fprintf(stderr,
+                    "[CTX-CP] body=%p round=%llu tid=0x%lx ctx=%p setup=%p "
+                    "same=%d empty=%d mirror=%p own=%p match=%d\n",
+                    (void*)d, (unsigned long long)d->round,
+                    (unsigned long)pthread_self(), (void*)ctx_addr,
+                    (void*)setup_addr, (int)(ctx_addr == setup_addr),
+                    (int)d->context_p.IsEmpty(), (void*)ms.mirror,
+                    (void*)ms.own, ms.match);
+          ::fflush(stderr);
+        }
+#endif
+        bctx2->GetMicrotaskQueue()->PerformCheckpoint(green);
+        g_green_driving_body = prior_driving;
+
+        // Mark settled once the body promise leaves kPending; its reaction then
+        // captured the settle value, and RunTasks resolves the caller Promise.
+        if (!d->async_settled && !d->async_promise_p.IsEmpty()) {
+          v8::Local<v8::Promise> p =
+              v8::Local<v8::Promise>::New(green, d->async_promise_p);
+          if (p->State() != v8::Promise::PromiseState::kPending)
+            d->async_settled = true;
+        }
+        if (d->async_settled) progressed = true;
+      }
+      if (all_settled) break;
+      if (++idle > max_idle) return false;
+      // No read was resolvable this pass: the libuv pool threads progress the
+      // outstanding reads independently, so wait briefly instead of busy-spinning.
+      if (!progressed)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  };
+
+  for (int i = 0; i < num_workers; i++)
+    workers.emplace_back(run_partition, std::move(partitions[i]));
+  for (std::thread& w : workers) w.join();
+
+  return true;
+}
+
+// Build the GreenCallData for an async body and run it on the embedding isolate.
+// The caller-facing Promise is recovered from data->caller_resolver_p at result
+// time. An async function never throws or returns a non-promise, so a failed or
+// non-promise Call here means a non-async Function slipped past GTIsAsyncFunction;
+// we bridge a rejected caller Promise with a clear TypeError instead of leaving
+// the caller with a hanging promise.
+static GreenCallData* SetupAndRunAsyncBody(Isolate* emb, Local<Context> ctx,
+                                           Local<Function> fn, Local<Array> task) {
+  GreenCallData* data = new GreenCallData();
+  data->awaiting = true;
+  data->isolate = emb;
+  data->fn_isolate = emb;
+  data->context_p.Reset(emb, ctx);
+  data->fn_p.Reset(emb, fn);
+  const uint32_t argc = task->Length();
+  for (uint32_t a = 1; a < argc; a++) {
+    data->args_p.push_back(
+        std::make_unique<Persistent<Value>>(emb, task->Get(ctx, a).ToLocalChecked()));
+  }
+  Local<Function> body_fn = Local<Function>::New(emb, data->fn_p);
+  std::vector<Local<Value>> argv;
+  argv.reserve(data->args_p.size());
+  for (auto& arg : data->args_p) argv.push_back(Local<Value>::New(emb, *arg));
+  Local<Value> body_out;
+  if (!body_fn->Call(ctx, ctx->Global(), argv.size(), argv.data()).ToLocal(&body_out) ||
+      !body_out->IsPromise()) {
+    Local<Promise::Resolver> resolver = Promise::Resolver::New(ctx).ToLocalChecked();
+    data->caller_resolver_p.Reset(emb, resolver);
+    data->caller_ctx_p.Reset(emb, ctx);
+    Local<Value> ty = v8::Exception::TypeError(
+        String::NewFromUtf8(emb,
+            "green_threads body must be an async function",
+            v8::NewStringType::kNormal).ToLocalChecked());
+    Local<Context> rctx = Local<Context>::New(emb, data->caller_ctx_p);
+    Local<Promise::Resolver>::New(emb, data->caller_resolver_p)->Reject(rctx, ty);
+    return data;
+  }
+  // Chain fulfill/reject reactions onto the body promise so its settled
+  // value/reason resolves/rejects the caller resolver on the embedding isolate.
+  Local<Promise::Resolver> resolver = Promise::Resolver::New(ctx).ToLocalChecked();
+  data->caller_resolver_p.Reset(emb, resolver);
+  data->caller_ctx_p.Reset(emb, ctx);
+  Local<Value> ext = v8::External::New(emb, data);
+  Local<Function> fulfill =
+      Function::New(ctx, GreenAsyncResolveFulfilled, ext).ToLocalChecked();
+  Local<Function> reject =
+      Function::New(ctx, GreenAsyncResolveRejected, ext).ToLocalChecked();
+  (void)Local<Promise>::Cast(body_out)
+      ->Then(ctx, fulfill, reject)
+      .ToLocalChecked();
+  return data;
+}
+
 // Green scheduler entry point: drives a single green thread's JavaScript body.
 //
 // @param isolate The V8 internal isolate the green thread was created with.
@@ -1172,17 +1913,25 @@ void GreenJSEntry(vi::Isolate* vi_isolate, void* arg) {
     gt->set_state(vi::GreenThreadState::kComplete);
     return;
   }
-  data->result_p.Reset(data->isolate, out);
+   if (out->IsPromise()) {
+     data->threw = true;
+     data->exc_is_error = true;
+     data->exc_name = "TypeError";
+     data->exc_msg = "green_threads body that awaits must be an async function";
+     gt->set_state(vi::GreenThreadState::kComplete);
+     return;
+   }
+   data->result_p.Reset(data->isolate, out);
 #ifdef V8_ENABLE_GREEN_THREADS
-  if (::getenv("GT_CRASH_DEBUG")) {
-    ::fprintf(stderr,
-              "[GTDBG-RESULT] round=%u gt=%p data=%p result_p=%p isempty=%d tid=%ld\n",
-              (unsigned)data->round, (void*)gt, (void*)data, (void*)&data->result_p,
-              (int)data->result_p.IsEmpty(), (long)pthread_self());
-    ::fflush(stderr);
-  }
+   if (::getenv("GT_CRASH_DEBUG")) {
+     ::fprintf(stderr,
+               "[GTDBG-RESULT] round=%u gt=%p data=%p result_p=%p isempty=%d tid=%ld\n",
+               (unsigned)data->round, (void*)gt, (void*)data, (void*)&data->result_p,
+               (int)data->result_p.IsEmpty(), (long)pthread_self());
+     ::fflush(stderr);
+   }
 #endif
-  gt->set_state(vi::GreenThreadState::kComplete);
+   gt->set_state(vi::GreenThreadState::kComplete);
 }
 
 // Throws a TypeError and returns from the binding.
@@ -1369,43 +2118,96 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     task_arrays.push_back(task);
   }
 
-  // Phase 2: allocate per-thread state for the now-known-valid tasks.
-  std::vector<GreenCallData*> datas;
-  datas.reserve(n);
-  if (GreenHeapEnabled()) {
-    // Shared-heap mode: route each task onto the dedicated green isolate. The
-    // body is the embedding Function itself; it is called on the green
-    // context (see GreenJSEntry) but kept rooted on the embedding isolate so its
-    // captured lexical scope (closures) survives -- reparsing its source into a
-    // fresh green function would strip the closure and every scenario that
-    // references captured state would throw. Arguments are copied in so bodies
-    // mutate private copies and the shared `parent` in the harness is never
-    // corrupted. COW clones land on the green heap too.
-    green_isolate_ret = GetGreenIsolate(isolate);
-    vi_isolate_for_gt = reinterpret_cast<vi::Isolate*>(green_isolate_ret);
-    // Ensure the green context lives in the durable persistent g_green_ctx
-    // (creating it + lifting embedding globals on first use). Bodies and
-    // argument copies below each root their outputs in a Persistent, so nothing
+  // Phase 2: allocate per-thread state for the now-known-valid tasks. datas[i]
+  // maps to task i so the results array keeps task order. In shared-heap mode a
+  // green async body runs GREEN on the green isolate (Option C) -- its control
+  // flow stays green and `await` parks it cooperatively -- so it is set up by
+  // SetupAndRunGreenAsyncBody and driven by the async drive loop; a sync body
+  // also runs green here for parallelism. In serial mode there is no green
+  // isolate, so an async body runs on the embedding isolate (SetupAndRunAsyncBody)
+  // where Node's async bindings live.
+  std::vector<GreenCallData*> datas(n);
+  const bool shared_heap = GreenHeapEnabled();
+  // Whether any task is a sync body. The green isolate and the always-allocation
+  // (GC-free) window are only meaningful when a sync body will run on it; an
+  // all-async dispatch runs purely on the embedding isolate and must not touch
+  // the green heap or arm always-allocation on the embedding isolate.
+  bool has_sync = false;
+  bool has_async = false;
+  for (uint32_t i = 0; i < n; i++) {
+    if (GTIsAsyncFunction(isolate, fns[i]))
+      has_async = true;
+    else
+      has_sync = true;
+  }
+  if (shared_heap) {
+    // Create the green isolate + context when a sync body OR an async body
+    // needs it. An async body runs green (Option C) and needs the green context
+    // -- which hosts the gtRead I/O bridge global -- and its heap; a body that
+    // is purely async still routes onto the green isolate. Sync bodies and
+    // their argument copies each root their outputs in a Persistent, so nothing
     // dangles across the isolate switch.
-    EnsureGreenContext(isolate, ctx);
+    if (has_sync || has_async) {
+      green_isolate_ret = GetGreenIsolate(isolate);
+      vi_isolate_for_gt = reinterpret_cast<vi::Isolate*>(green_isolate_ret);
+      // Arm the GC-free (AlwaysAllocate) window BEFORE any green-heap context
+      // allocation. SetupAndRunGreenAsyncBody below (and EnsureGreenContext) call
+      // Context::New(green), which runs the Genesis bootstrapper and allocates
+      // Maps/functions; with GC enabled a collection could reclaim a bootstrap
+      // Map still referenced mid-bootstrapping -> SIGSEGV in
+      // JSObject::MigrateToMap (observed: deterministic once the green heap has
+      // grown across several spawnAll rounds). Sync-body setup runs here too, so
+      // the window must cover all of it. Released at the existing Leave site.
+      node::GreenEnterAlwaysAllocation(green_isolate_ret);
+      // Ensure the green context lives in the durable persistent g_green_ctx
+      // (creating it + lifting embedding globals on first use).
+      EnsureGreenContext(isolate, ctx);
+    }
 
     GreenValueCopier args_copier;
     args_copier.src = isolate;
     args_copier.dst = green_isolate_ret;
     for (uint32_t i = 0; i < n; i++) {
+      if (GTIsAsyncFunction(isolate, fns[i])) {
+        // Async body runs GREEN on the green isolate (Option C): its control
+        // flow stays green and `await` parks it cooperatively; the async drive
+        // loop below resumes it. Arguments are copied green (like sync bodies)
+        // so the body touches only the green heap.
+        datas[i] = SetupAndRunGreenAsyncBody(isolate, ctx, green_isolate_ret,
+                                             fns[i], task_arrays[i]);
+        continue;
+      }
+      // A green body: relocate the embedding Function onto the green isolate
+      // (kept rooted on the embedding isolate so its captured closure survives)
+      // and copy its arguments so bodies mutate private copies and the shared
+      // `parent` in the harness is never corrupted. COW clones land on the
+      // green heap too.
       Local<Array> task = task_arrays[i];
       GreenCallData* data = new GreenCallData();
       data->isolate = green_isolate_ret;
       // context_p is rooted from the durable persistent g_green_ctx -- no green
       // handle scope is needed.
       data->context_p.Reset(green_isolate_ret, g_green_ctx);
-      // Relocate the body onto the green isolate. RelocateFunction returns a
-      // durable Persistent rooted inside itself, so no caller handle scope is
-      // needed; Reset copies that handle into data->fn_p (it is not a Persistent
-      // move, which does not exist for this build). fn_isolate is green, so
-      // GreenJSEntry recovers the handle on the green isolate.
-      std::unique_ptr<Persistent<Function>> relocated =
-          RelocateFunction(isolate, fns[i]);
+      // RelocateFunction returns a durable Persistent rooted inside itself, so
+      // no caller handle scope is needed; Reset copies that handle into
+      // data->fn_p. fn_isolate is green, so GreenJSEntry recovers the handle on
+      // the green isolate.
+      // RelocateFunction wants the green body context as a Local. Construct it
+      // inside a green Isolate::Scope + HandleScope: at this point the embedding
+      // thread holds no active HandleScope on the green isolate (EnsureGreenContext's
+      // local HandleScope ended on return), so an unrooted Local<Context>::New(green)
+      // would hit V8's "Cannot create a handle without a HandleScope" fatal -- this
+      // was introduced when RelocateFunction's context argument was changed from a
+      // context it created internally to one the caller builds. RelocateFunction
+      // switches to green again internally; the returned Persistent is durable.
+      std::unique_ptr<Persistent<Function>> relocated;
+      {
+        v8::Isolate::Scope green_iso_scope(green_isolate_ret);
+        HandleScope green_scope(green_isolate_ret);
+        relocated = RelocateFunction(
+            isolate, fns[i],
+            Local<Context>::New(green_isolate_ret, g_green_ctx));
+      }
       data->fn_isolate = green_isolate_ret;
       data->fn_p.Reset(green_isolate_ret, *relocated);
       const uint32_t argc = task->Length();
@@ -1417,10 +2219,16 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
         // isolate; move that handle into the argument vector.
         data->args_p.push_back(CopyValueAcross(args_copier, arg));
       }
-      datas.push_back(data);
+      datas[i] = data;
     }
   } else {
     for (uint32_t i = 0; i < n; i++) {
+      if (GTIsAsyncFunction(isolate, fns[i])) {
+        // Async body: runs on the embedding isolate (no green isolate in this
+        // mode), bridged to the caller Promise.
+        datas[i] = SetupAndRunAsyncBody(isolate, ctx, fns[i], task_arrays[i]);
+        continue;
+      }
       Local<Array> task = task_arrays[i];
       GreenCallData* data = new GreenCallData();
       data->isolate = isolate;
@@ -1430,10 +2238,9 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
       const uint32_t argc = task->Length();
       for (uint32_t a = 1; a < argc; a++) {
         data->args_p.push_back(
-            std::make_unique<Persistent<Value>>(isolate,
-                                                task->Get(ctx, a).ToLocalChecked()));
+            std::make_unique<Persistent<Value>>(isolate, task->Get(ctx, a).ToLocalChecked()));
       }
-      datas.push_back(data);
+      datas[i] = data;
     }
   }
 
@@ -1443,12 +2250,16 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   const uint64_t round = g_green_spawn_round.fetch_add(1, std::memory_order_relaxed);
   for (GreenCallData* data : datas) data->round = round;
 
-  // Create each green thread (which enables COW, allocates its ref table and
-  // registers it as COW-active), register its call data, and collect its
-  // descriptor. The worker pool below partitions them across real OS threads.
+  // Create a green thread for each SYNC body only. Async bodies (data->awaiting)
+  // hold no green thread -- in serial mode they run on the embedding isolate via
+  // SetupAndRunAsyncBody; in shared-heap mode they run GREEN via
+  // SetupAndRunGreenAsyncBody and are driven by the async drive loop below.
+  // Gating CreateGreenThread on !awaiting keeps g_gt_registry, the worker pool,
+  // and the teardown loop below green-only.
   std::vector<vi::GreenThread*> gts;
   gts.reserve(datas.size());
   for (GreenCallData* data : datas) {
+    if (data->awaiting) continue;
     vi::GreenThread* gt = CreateGreenThread(vi_isolate_for_gt);
     data->gt = gt;
     g_gt_registry[gt] = data;
@@ -1475,7 +2286,7 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   // write (which would hand two workers the same address). Restored to the
   // serial fast path once the workers join; the single-threaded result
   // copy-back + teardown below must not pay CAS overhead.
-  const bool enable_cas = GreenHeapEnabled();
+  const bool enable_cas = shared_heap && (has_sync || has_async);
   // GC-free allocation window armed BEFORE the workers spawn so thread creation
   // and every body's first allocation happen-before any collection. While the
   // count is non-zero the heap grows instead of collecting (young scavenger,
@@ -1487,9 +2298,14 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   // torn-context class the __m2_probe dispatcher fixes by holding this window
   // around its own concurrent fan-out. Held only in shared-heap mode, where
   // bodies run on the green isolate concurrently; serial Model-A execution never
-  // needs it.
-  const bool gt_shared = GreenHeapEnabled();
-  if (gt_shared) node::GreenEnterAlwaysAllocation(working_isolate);
+  // needs it. The `(has_sync || has_async)` gate means an all-async dispatch
+  // (no green threads, but N workers still allocating + checkpointing parked
+  // async bodies on the shared green heap) gets this same GC-free window -- its
+  // parked closures, gtRead resolvers, and settle values must be protected just
+  // as sync bodies' are.
+  const bool gt_shared = shared_heap && (has_sync || has_async);
+  // The CAS bump-pointer flag stays here: it only matters once the N workers
+  // allocate concurrently (after AlwaysAllocate is armed above).
   if (enable_cas) vi::GreenThreadCow::SetGreenHeapConcurrentAllocationEnabled(working_isolate, true);
   // Handle-scope phase: this is the ONLY window where N OS workers run bodies
   // concurrently on the green heap, so opt into per-worker handle-state routing
@@ -1545,12 +2361,31 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     }
 
     GreenThreadPool pool;
-    pool.Run(gts, vi_isolate_for_gt, num_workers);
+    if (!gts.empty()) pool.Run(gts, vi_isolate_for_gt, num_workers);
 
     if (true_parallel) {
       vi::GreenThreadCow::SetParallelBodyDispatchActive(false);
       vi::GreenThreadCow::SetConcurrentCompilationSuspended(false);
     }
+  }
+
+  // Drive every green-async body to settlement INSIDE the AlwaysAllocate+CAS+
+  // handle-scope-per-worker window (still armed above; released just below).
+  // Their caller-facing Promises must be resolved (by the green settle reaction)
+  // before results are gathered. Runs on the green isolate; a no-op when there
+  // are no green-async bodies. N OS workers fan the bodies out across the pool,
+  // so the window -- AlwaysAllocate (GC-free) + the CAS bump pointer (disjoint
+  // concurrent allocation) + per-worker handle-scope routing -- must still be
+  // held here. Concurrent compilation is suspended so the workers never compile
+  // the green isolate's code paths at once; each async body has its own relocated
+  // SFI, so CPU work still parallelizes (the bodies run phase-2 bytecode
+  // unoptimized -- a documented perf note; warming them up is impractical since
+  // each awaits I/O). The drive's own GreenGCPause is the belt-and-suspenders GC
+  // guard for the parked bodies' promises and resolvers.
+  if (shared_heap && has_async) {
+    vi::GreenThreadCow::SetConcurrentCompilationSuspended(true);
+    DriveGreenAsyncBodiesParallel(green_isolate_ret, datas);
+    vi::GreenThreadCow::SetConcurrentCompilationSuspended(false);
   }
 
   vi::SetIsolateHandleScopePerWorker(reinterpret_cast<vi::Isolate*>(working_isolate), false);
@@ -1589,6 +2424,50 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
   std::string recon_name;
   std::string recon_msg;
   if (GreenHeapEnabled()) {
+    // Set the async rows first: their caller-facing Promises live on the
+    // embedding isolate, so they must be built OUTSIDE the green Isolate::Scope
+    // below. A green async body settled during the drive loop and captured its
+    // settle value on the green heap; copy that value in here (on the embedding
+    // isolate, whose context is current) into the caller resolver and resolve
+    // it, so GetPromise() then returns the settled caller Promise to the JS
+    // caller. A serial-mode async body's resolver was created in
+    // SetupAndRunAsyncBody and is already resolved by its own reaction.
+    for (uint32_t i = 0; i < m; i++) {
+      if (!datas[i]->awaiting) continue;
+      // The green async body settled during the drive loop; its reaction
+      // captured the settle value as a green Persistent. Copy it to the
+      // embedding isolate and resolve the caller-facing Promise so GetPromise()
+      // returns a settled promise to the JS caller. Runs on the embedding
+      // isolate with its context current (the JS context) -- exactly like the
+      // sync result copy below -- so GreenRebuild lands objects in a valid
+      // realm.
+      Local<Promise::Resolver> resolver =
+          Local<Promise::Resolver>::New(isolate, datas[i]->caller_resolver_p);
+      std::unique_ptr<Persistent<Value>> emb_val;
+      if (!datas[i]->settle_value_p.IsEmpty()) {
+        GreenValueCopier copier;
+        copier.src = green_isolate_ret;
+        copier.dst = isolate;
+        // Root green_val in a handle scope held ACROSS the copy. green_val is a
+        // Local backed by a handle-stack slot; once that scope closes, the slot is
+        // free and CopyValueAcross's own nested HandleScope reclaims it, clobbering
+        // the value mid-copy (observed: a green number rebuilt into an embedding
+        // object). Keep green_scope/green_hs live through CopyValueAcross so the
+        // source handle stays valid.
+        v8::Isolate::Scope green_scope(green_isolate_ret);
+        HandleScope green_hs(green_isolate_ret);
+        Local<Value> green_val =
+            Local<Value>::New(green_isolate_ret, datas[i]->settle_value_p);
+        emb_val = CopyValueAcross(copier, green_val);
+        // Only resolve once the settle value was captured. If the drive loop
+        // stalled (returned false before this body settled), leave the caller
+        // promise pending -- the documented "valid, unsettled" outcome -- and
+        // avoid dereferencing an empty emb_val (a null read).
+        Local<Context> rctx = Local<Context>::New(isolate, datas[i]->caller_ctx_p);
+        resolver->Resolve(rctx, Local<Value>::New(isolate, *emb_val));
+      }
+      results->Set(ctx, i, resolver->GetPromise()).Check();
+    }
     // Results live on the green heap. Hold the green Isolate::Scope +
     // HandleScope for the whole loop so green result handles can be created;
     // CopyValueAcross moves each one into the embedding isolate. The copied
@@ -1600,6 +2479,9 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     out_copier.src = green_isolate_ret;
     out_copier.dst = isolate;
     for (uint32_t i = 0; i < m; i++) {
+      // Async bodies' caller Promises were already Set outside the green scope
+      // above; skip them here (they hold no green result_p).
+      if (datas[i]->awaiting) continue;
       if (datas[i]->threw) {
         threw = true;
         if (datas[i]->exc_is_error) {
@@ -1641,6 +2523,13 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     }
   } else {
     for (uint32_t i = 0; i < m; i++) {
+      // Async bodies' caller Promises are Set below inline (embedding isolate).
+      if (datas[i]->awaiting) {
+        Local<Promise::Resolver> resolver =
+            Local<Promise::Resolver>::New(isolate, datas[i]->caller_resolver_p);
+        results->Set(ctx, i, resolver->GetPromise()).Check();
+        continue;
+      }
       if (datas[i]->threw) {
         threw = true;
         if (datas[i]->exc_is_error) {
@@ -1665,6 +2554,11 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
 
   // Release green threads and call data.
   for (GreenCallData* data : datas) {
+    // Async bodies are owned by their own settle reaction (GreenAsyncResolveFulfilled/
+    // Rejected), which disposes the call data once the caller Promise settles;
+    // deleting them here would use-after-free that pointer. Sync bodies always have
+    // a green thread (shared and serial models alike) to tear down below.
+    if (data->awaiting) continue;
     vi::GreenThreadCow::Teardown(data->gt);
     delete data->gt;
     // clear() destroys each unique_ptr, which Disposes its rooted Persistent.
@@ -1672,6 +2566,24 @@ Local<Array> RunTasks(Isolate* isolate, Local<Context> ctx, Local<Array> tasks,
     data->result_p.Reset();
     data->fn_p.Reset();
     g_gt_registry.erase(data->gt);
+    delete data;
+  }
+
+  // Teardown green-async bodies. They hold no green thread (the pool never
+  // created one for them): the green settle reaction (GreenGreenCaptureSettle)
+  // only captured the body's settle value on the green heap; RunTasks copied it
+  // into the embedding caller resolver in the results loop above. So dispose the
+  // green body promise, the captured settle value, the embedding caller
+  // resolvers, and the copied green args/fn here. This runs after results
+  // gathered the (now settled) caller Promises above.
+  for (GreenCallData* data : datas) {
+    if (!data->async_green) continue;
+    data->async_promise_p.Reset();
+    data->settle_value_p.Reset();
+    data->caller_resolver_p.Reset();
+    data->caller_ctx_p.Reset();
+    data->args_p.clear();
+    data->fn_p.Reset();
     delete data;
   }
 
@@ -1889,17 +2801,20 @@ void ConcurrentEntry(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(report);
 }
 
-// Coarse green-mutator lock (M2a baseline). Serializes concurrent body execution
-// so at most ONE OS worker mutates the green heap's shared state (bump-pointer
-// allocator, cached Maps, and any GC) at a time. Concurrent object-literal
-// creation races here: 8 threads create objects of the same shape, resolve the
-// single cached Map, and mutate it via Map::InobjectSlackTrackingStep while their
-// young-space bump pointers collide -> EXC_BAD_ACCESS in Factory/Map stores.
+// Coarse green-mutator lock (M2a baseline). See the declaration near the async
+// driver (DriveGreenAsyncBodiesParallel) for the full rationale. It serializes
+// concurrent body execution so at most ONE OS worker mutates the green heap's
+// shared state (bump-pointer allocator, cached Maps, and any GC) at a time.
+// Concurrent object-literal creation races here: 8 threads create objects of the
+// same shape, resolve the single cached Map, and mutate it via
+// Map::InobjectSlackTrackingStep while their young-space bump pointers collide
+// -> EXC_BAD_ACCESS in Factory/Map stores.
 // True all-mutator parallelism (I3 stop-the-world GC + I4 serialized allocation)
 // is the later milestone; this lock is the "mutex-protected" phase the plan
 // anticipates and the safe correctness baseline N workers run behind. Kept
 // process-global: there is exactly one green isolate per process.
-static std::mutex g_green_mutator_lock;
+// (Defined next to the async driver; the field below is the declaration site's
+//  companion usage context, not a second definition.)
 
 // One unit of work for the M2Probe worker pool: a green thread and its call
 // data, claimed by an OS worker that runs its body to completion. `idx` is the
@@ -2041,7 +2956,7 @@ void M2Probe(const FunctionCallbackInfo<Value>& args) {
     const int body_arg =
         (static_cast<int>(args.Length()) - 1 > i) ? (i + 1) : 1;
     Local<Function> emb_fn = Local<Function>::Cast(args[body_arg]);
-    std::unique_ptr<Persistent<Function>> relocated = RelocateFunction(isolate, emb_fn);
+    std::unique_ptr<Persistent<Function>> relocated = RelocateFunction(isolate, emb_fn, Local<Context>::New(green, g_green_ctx));
 
     GreenCallData* data = new GreenCallData();
     data->isolate = green;

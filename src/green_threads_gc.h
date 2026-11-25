@@ -59,7 +59,7 @@ class GreenGCPause final {
 std::vector<std::string> CaptureGreenClosureVars(v8::Isolate* emb_isolate,
                                                  v8::Local<v8::Function> emb_fn);
 
-// Read the current values of the free variables `CaptureGreenClosureVars`
+// Read the current values of the free variables
 // discovered for the green body `emb_fn` -- by those exact names -- from the
 // embedding closure-context chain, invoking `yield(name, value)` for each as a
 // public `v8::Local<v8::Value>` on the embedding isolate.
@@ -77,6 +77,13 @@ std::vector<std::string> CaptureGreenClosureVars(v8::Isolate* emb_isolate,
 void CaptureGreenClosureValues(
     v8::Isolate* emb_isolate, v8::Local<v8::Function> emb_fn,
     const std::function<void(const std::string&, v8::Local<v8::Value>)>& yield);
+
+// Whether `emb_fn` is a JavaScript async function (async fn / async arrow /
+// async generator / async concise method). Reads the SharedFunctionInfo's
+// FunctionKind so async bodies can be routed to the embedding realm (which owns
+// Node's async I/O bindings) without running them first -- see green_threads_gc.cc.
+bool GTIsAsyncFunction(v8::Isolate* emb_isolate,
+                       v8::Local<v8::Function> emb_fn);
 
 // Forced GC modes for the M2 forced-GC acceptance test (item 2). The knob is
 // read from the GT_M2_FORCE_GC environment variable so the existing probe path
@@ -160,6 +167,28 @@ struct GTExecSnap {
 };
 GTExecSnap GTGreenThreadExecSnapshot();
 
+// Mirror debug state for the executing OS worker's green-thread isolate: the
+// shared IsolateData execution_state_base_ that the JS-entry x25 arm loads, and
+// THIS worker's own ExecutionState block. match=1 when they already agree. See
+// GTGreenThreadRefreshMirror for why the async drive re-syncs it per entry.
+struct GTMirrorState {
+  void* mirror;  // isolate_data().execution_state_base_ (shared, stable)
+  void* own;     // CurrentExecutionStateBase() (THIS worker's block)
+  int match;
+};
+GTMirrorState GTGreenThreadMirrorState();
+
+// Refresh THIS OS worker's ExecutionState base into the shared
+// execution_state_base_ mirror, so the next JS-entry x25 arm loads THIS worker's
+// block rather than a stale sibling-worker block (which desyncs x25 from
+// thread_local_top() and corrupts context()/map reads). The mirror is written by
+// SetIsolateThreadLocals at Isolate::Scope; a true-parallel drive whose workers
+// hold overlapping scopes never re-writes it mid-drive, so it stays pinned at the
+// last initial construction -- every other worker's block -- and must be re-synced
+// before each per-body JS re-entry (PerformCheckpoint). Called inside the tight
+// refresh->arm window (no await between), so the arm observes THIS worker's block.
+void GTGreenThreadRefreshMirror();
+
 // Env-gated (GT_GT_DUMP) snapshot of the executing OS thread's ThreadLocalTop
 // entry-state -- the fields a Maglev body reads on first JS entry (c_entry_fp_,
 // context_, topmost_script_having_context_, exception_, handler_, js_entry_sp_,
@@ -171,7 +200,6 @@ GTExecSnap GTGreenThreadExecSnapshot();
 // Declared here (not green_threads.cc) because it reads vi::Isolate /
 // vi::ThreadLocalTop internals.
 void GTGreenThreadEntryDump(v8::Isolate* iso);
-
 }  // namespace node
 
 #endif  // GREEN_THREADS_GC_H_

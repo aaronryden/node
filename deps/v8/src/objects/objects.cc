@@ -4862,6 +4862,20 @@ Handle<Object> JSPromise::TriggerPromiseReactions(
                                 .ToHandle(&handler_context);
     }
     if (!has_handler_context) handler_context = isolate->native_context();
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      const bool h_is_fn = IsJSFunction(*primary_handler);
+      const bool hctx_is_undef =
+          h_is_fn ? IsUndefined(Cast<JSFunction>(*primary_handler)->context())
+                  : true;
+      const bool job_is_undef = IsUndefined(*handler_context);
+      ::fprintf(stderr,
+                "[PCTJ] has_ctx=%d is_fn=%d hctx_undef=%d job_undef=%d\n",
+                (int)has_handler_context, (int)h_is_fn,
+                (int)hctx_is_undef, (int)job_is_undef);
+      ::fflush(stderr);
+    }
+#endif
 
     static_assert(static_cast<int>(sizeof(PromiseReaction)) ==
                   static_cast<int>(sizeof(PromiseReactionJobTask)));

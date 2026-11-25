@@ -106,6 +106,16 @@ class AsyncEventDelegate;
 
 namespace internal {
 
+// THIS OS thread's routed HandleScopeImplementer: the per-worker impl under
+// green multi-worker drives (SetIsolateHandleScopePerWorker on), the shared
+// impl otherwise. Native microtask EnterContext / RewindEnteredContext
+// builtins call this (not the cached shared-impl address) so they balance on
+// the same entered_contexts_ stack that C++ HandleScope / Context::Enter use.
+#ifdef V8_ENABLE_GREEN_THREADS
+HandleScopeImplementer* CurrentHandleScopeImplementer();
+#endif
+
+
 void DefaultWasmAsyncResolvePromiseCallback(
     v8::Isolate* isolate, v8::Local<v8::Context> context,
     v8::Local<v8::Promise::Resolver> resolver,
@@ -2041,6 +2051,7 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   Address handle_scope_implementer_address() {
     return reinterpret_cast<Address>(&handle_scope_implementer_);
   }
+
 
   void SetReleaseCppHeapCallback(v8::Isolate::ReleaseCppHeapCallback callback);
 

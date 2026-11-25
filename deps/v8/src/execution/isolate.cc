@@ -4364,7 +4364,23 @@ HandleScopeImplementer* Isolate::WorkerHandleScopeImpl() {
       if (pd->handle_scope_impl_ != nullptr) {
         return pd->handle_scope_impl_;
       }
+#ifdef V8_ENABLE_GREEN_THREADS
+      if (::getenv("GT_DEBUG_ENTCTX")) {
+        ::fprintf(stderr,
+                  "[WSI] iso=%p opt_in=1 pd=%p handle_scope_impl_=NULL\n",
+                  (void*)this, (void*)pd);
+        ::fflush(stderr);
+      }
+#endif
     }
+#ifdef V8_ENABLE_GREEN_THREADS
+    if (::getenv("GT_DEBUG_ENTCTX")) {
+      ::fprintf(stderr,
+                "[WSI] iso=%p opt_in=%d\n",
+                (void*)this, (int)opt_in);
+      ::fflush(stderr);
+    }
+#endif
   }
 #endif
   return nullptr;
@@ -4377,6 +4393,19 @@ HandleScopeImplementer* Isolate::WorkerHandleScopeImpl() {
 void SetIsolateHandleScopePerWorker(Isolate* iso, bool on) {
   if (iso != nullptr) iso->set_handle_scope_per_worker(on);
 }
+
+// Handle-scope phase: returns THIS OS thread's routed HandleScopeImplementer
+// (per-worker impl under green multi-worker drives, shared impl otherwise),
+// matching what C++ HandleScope / Context::Enter use. Native microtask
+// EnterContext/RewindEnteredContext builtins call this (not the cached shared
+// field) so their entered_contexts_ bookkeeping lands on the same impl and is
+// rewound by the same EnteredContextRewindScope, fixing the divergence that
+// otherwise leaves native-entered contexts unrewound on the shared impl.
+#ifdef V8_ENABLE_GREEN_THREADS
+HandleScopeImplementer* CurrentHandleScopeImplementer() {
+  return Isolate::Current()->handle_scope_implementer();
+}
+#endif
 
 Isolate::PerIsolateThreadData* Isolate::ThreadDataTable::Lookup(
     ThreadId thread_id) {
