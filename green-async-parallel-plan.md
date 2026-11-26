@@ -80,6 +80,8 @@ Continuations must leave `PerformCheckpoint(green)` under the global lock. Two r
 2. **De-share the green GlobalHandles / microtask state per-body.** Result roots are already
    owned per-body (`data->async_promise_p`, `context_p` at `:1757`–`:1779`); isolate-global
    bits must be isolated per-worker.
+    > Full design (hazard map + route 1×2 seam + verification + risk register) lives in
+    > `green-async-parallel-p2-design.md`. **No code yet** — this section is design-only.
 
 ### P1 <-> P2 dependency
 - **Independent hazards**, but with the **one-shared-loop** requirement, **P2 needs P1**:
