@@ -191,6 +191,27 @@ using vi::Address;  // v8::internal::Address (untagged heap pointer)
 // vector only need the complete type at destruction, which happens where
 // GreenIoWork is fully defined.
 struct GreenIoWork;
+struct GreenCallData;
+
+// One pending bridged embedding-Promise settle. A green async body awaiting a
+// bridged emb Promise (e.g. `await fs.promises.readFile(...)`) does NOT suspend
+// on an emb Promise directly -- the bridge hands the body a fresh GREEN promise
+// GP and returns it immediately, so the body's await parks on GP. The body's
+// owning drive worker later resolves GP (into its own green queue) once the emb
+// Promise settles. The settle value lives in an emb-rooted Persistent
+// (args[0] of the reaction, which runs on emb where the promise lives); the
+// green resolve + marshal to green happen on the drive worker, matching the
+// gtRead model (GreenIoWork stores buf/err on a libuv pool thread and the
+// owning drive worker reads + resolves it after Reactivate).
+struct GreenEmbReact {
+  GreenCallData* data;             // Owning body (never freed for its lifetime).
+  vi::GreenScheduler* sched;       // Shared async-drive scheduler.
+  Persistent<Context> green_ctx_p; // Body's green context (resolve GP here).
+  Persistent<Promise::Resolver> gp_res_p; // Green resolver GP = gp_res_p->GetPromise().
+  Persistent<Value> settle_val_p;   // emb-rooted: fulfilled value or rejection reason.
+  std::atomic<bool> emb_settled{false}; // release by reaction, acquire by drive worker.
+  bool is_error;                    // Set at creation: false=fulfilled, true=rejected.
+};
 
 // Per-green-thread JavaScript invocation state. A single instance is shared
 // between the scheduler's C++ entry point and the running spawnAll call.
@@ -206,6 +227,12 @@ struct GreenCallData {
   // needs no lock. Kept alive on data (freeing it also frees the reads) until
   // the async teardown loop below clears it.
   std::vector<std::unique_ptr<GreenIoWork>> pending_reads;
+  // Outstanding bridged emb-Promise settles (GreenEmbReact), submitted by this
+  // body when a bridged method returns an emb Promise (e.g. fs.promises.*). The
+  // owning drive worker resolves each settled GP into the body's green queue;
+  // like pending_reads, appended only by the setup/green-thread that owns the
+  // body and drained only by its owning drive worker -- never concurrently.
+  std::vector<std::unique_ptr<GreenEmbReact>> pending_emb;
   // Owned per green-async body: its own MicrotaskQueue. Each async body drives
   // its continuations from its own queue (via Context::GetMicrotaskQueue), so
   // N workers can resume disjoint bodies concurrently without racing one shared
@@ -363,29 +390,381 @@ static Isolate* g_green_isolate = nullptr;
 // bindings synthesize a non-compilable source, which we detect and skip).
 static Persistent<Context> g_green_ctx;
 
+// Embedding loader for the green `require` bridge. `require`/`module` are module
+// scoped (not on the embedding realm global in file-entry), so green bodies have
+// no working require of their own in shared-heap mode. We capture ONE working
+// loader once -- `process.mainModule.require`, which is bound to the entry module
+// and loads node: builtins -- and root it on the embedding isolate. Captured
+// lazily on first GreenBridgeRequire from the embedding realm; the bridge reads
+// it on every call.
+static Isolate* g_green_emb_loader_isolate = nullptr;
+static Persistent<Value> g_green_emb_loader_p;
+// The embedding isolate + realm context captured alongside the loader, so the
+// green bridge can root emb-handles (the emb require-call receiver, the emb
+// promise Then-reactions) and reconstruct the emb context from a persistent.
+static Isolate* g_green_embedding_isolate = nullptr;
+static Persistent<Context> g_green_emb_ctx_p;
+
+// Capture (once) a working embedding loader and root it on the embedding
+// isolate. require/module are module-scoped (not global) in file-entry, so we
+// reach the entry module's own `require` through the always-global `process`:
+// `process.mainModule.require` is `Module.prototype.require` bound to the entry
+// module and loads node: builtins. Returns false (leaving loader unset) only if
+// the chain is somehow unavailable -- GreenBridgeRequire then reports clearly.
+static void GreenCaptureEmbLoader(Isolate* emb, Local<Context> emb_ctx) {
+  if (!g_green_emb_loader_p.IsEmpty()) return;
+  {
+    v8::Isolate::Scope iso_scope(emb);
+    HandleScope hs(emb);
+    v8::Context::Scope cs(emb_ctx);
+    Local<Value> proc;
+    Local<String> pkey =
+        String::NewFromUtf8(emb, "process", v8::NewStringType::kNormal)
+            .ToLocalChecked();
+    if (!emb_ctx->Global()->Get(emb_ctx, pkey).ToLocal(&proc) ||
+        !proc->IsObject())
+      return;
+    // proc.mainModule.require (mainModule may be absent in some runtimes).
+    Local<Value> main_mod;
+    Local<String> mkey =
+        String::NewFromUtf8(emb, "mainModule", v8::NewStringType::kNormal)
+            .ToLocalChecked();
+    if (!Local<Object>::Cast(proc)->Get(emb_ctx, mkey).ToLocal(&main_mod) ||
+        !main_mod->IsObject())
+      return;
+    Local<Value> req;
+    Local<String> rkey =
+        String::NewFromUtf8(emb, "require", v8::NewStringType::kNormal)
+            .ToLocalChecked();
+    if (!Local<Object>::Cast(main_mod)->Get(emb_ctx, rkey).ToLocal(&req) ||
+        !req->IsFunction())
+      return;
+    g_green_emb_loader_isolate = emb;
+    g_green_emb_loader_p.Reset(emb, Local<Function>::Cast(req));
+    g_green_embedding_isolate = emb;
+    g_green_emb_ctx_p.Reset(emb, emb_ctx);
+  }
+}
+
+// Embedding-promise settle reaction. Fires ON the embedding realm (the emb
+// Promise lives there, so its reactions run there when its event loop progresses
+// it). Records the settle value (args[0]) into an emb-rooted Persistent and flags
+// settlement, then Reactivates the owning body's drive worker so the drive loop
+// can resolve the GREEN promise GP the body awaited. Like GreenIoExecute handing
+// buf/err back from a libuv pool thread, this only touches emb state + the
+// reactivation signal -- all green work happens later on the owning drive worker.
+static void GreenEmbPromiseReaction(const FunctionCallbackInfo<Value>& args) {
+  GreenEmbReact* r = static_cast<GreenEmbReact*>(
+      v8::External::Cast(*args.Data())->Value());
+  v8::Isolate* emb = args.GetIsolate();
+  v8::HandleScope hs(emb);
+  r->settle_val_p.Reset(emb, args[0]);
+  r->emb_settled.store(true, std::memory_order_release);
+  if (r->sched != nullptr && r->data->gt != nullptr)
+    r->sched->ReactivateGreenThread(r->data->gt);
+}
+
+// One bridged embedding method, exposed to green as a plain JS function. Its
+// callback marshals args green->emb, calls the real emb method, and marshals the
+// result emb->green. A Promise result is bridged to a fresh GREEN promise (GP)
+// the body awaits (see GreenBridgeRequire/GreenEmbReact): the body suspends on GP
+// while the emb Promise runs its async I/O on emb, and the drive loop resolves GP
+// + Reactivates the body once the emb reaction settles.
+struct GreenBridgeMethod {
+  Persistent<Value> method_p;    // emb: the function to call.
+  Persistent<Value> receiver_p;  // emb: the object it is a property of (this).
+};
+
+  // Per-OS-thread pointer to the green-async body whose continuation is currently
+  // being driven on this thread. GreenGtRead installs each read here so the body's
+  // owning worker can find and resolve it in the body's own queue. Set by the
+  // embedding setup thread around a body's first await and by each drive worker
+  // around that body's continuations; thread-local so distinct workers never
+  // clobber each other's target.
+  static thread_local GreenCallData* g_green_driving_body = nullptr;
+
+  // Process-global pointer to the ONE shared GreenScheduler that drives the
+  // green-async body pool (created by RunTasks and live for the whole spawnAll).
+  // A green-async body's gtRead submits its read against this scheduler and its
+  // completion (a libuv pool thread) reactivates the body through it, so the
+  // drive worker can park until the I/O finishes. It is a plain (not thread-local)
+  // global on purpose: the embedding setup thread, every spawned drive worker, and
+  // GT_TRUE_PARALLEL's warm-up all read the same stable value for the run --
+  // GreenIoExecute needs no global at all, since it reactivates via the per-read
+  // owner pointer captured at submission.
+  static vi::GreenScheduler* g_async_drive_scheduler = nullptr;
+
+struct GreenValueCopier {
+  Isolate* src;  // Isolate the source handle lives on.
+  Isolate* dst;  // Isolate to rebuild the value on.
+};
+
+// Forward declaration: defined below; GreenBridgeMethodCallback (just after)
+// uses it to marshal args/results across the green/embedding isolate boundary.
+static std::unique_ptr<Persistent<Value>> CopyValueAcross(
+    const GreenValueCopier& copier, Local<Value> value);
+
+static void GreenBridgeMethodCallback(const FunctionCallbackInfo<Value>& args) {
+  GreenBridgeMethod* m =
+      static_cast<GreenBridgeMethod*>(v8::External::Cast(*args.Data())->Value());
+  v8::Isolate* green = args.GetIsolate();
+  v8::HandleScope hs(green);
+  Local<Context> gctx = green->GetCurrentContext();
+  const int argc = args.Length();
+
+  Isolate* emb = g_green_emb_loader_isolate;
+  Local<Context> emb_ctx = Local<Context>::New(emb, g_green_emb_ctx_p);
+
+  // Marshal each green arg to embedding and unbox into emb Locals held in
+  // emb_scope (below) so they stay rooted for the whole Call. CopyValueAcross
+  // manages its own isolate/handle scopes internally and returns a durable
+  // emb-rooted Persistent; we unbox it here while emb_scope is live.
+  v8::TryCatch tc(emb);
+  {
+    v8::Isolate::Scope iso_scope(emb);
+    HandleScope emb_hs(emb);
+    v8::Context::Scope emb_ctx_scope(emb_ctx);
+
+    std::vector<Local<Value>> emb_argv;
+    emb_argv.reserve(argc);
+    for (int i = 0; i < argc; i++) {
+      GreenValueCopier copier{green, emb};
+      auto cp = CopyValueAcross(copier, args[i]);
+      emb_argv.push_back(Local<Value>::New(emb, *cp));
+    }
+
+    Local<Function> meth =
+        Local<Function>::Cast(Local<Value>::New(emb, m->method_p));
+    Local<Value> recv = Local<Value>::New(emb, m->receiver_p);
+    Local<Value> result;
+    if (!meth->Call(emb_ctx, recv, argc, emb_argv.data()).ToLocal(&result)) {
+      // Embedding method threw: copy the exception back and rethrow on green.
+      Local<Value> exc = tc.HasCaught() ? tc.Exception() : v8::Undefined(emb);
+      {
+        GreenValueCopier copier{emb, green};
+        auto ep = CopyValueAcross(copier, exc);
+        v8::Isolate::Scope green_scope(green);
+        green->ThrowException(Local<Value>::New(green, *ep));
+        args.GetReturnValue().SetUndefined();
+        return;
+      }
+    }
+
+    // Promise result: bridge GP (green) to the body's await via a pending emb
+    // settle. The body suspends on GP; the drive loop resolves it once the emb
+    // Promise settles.
+    if (result->IsPromise()) {
+      Local<Context> bctx = gctx;
+      Local<Promise::Resolver> gp_res;
+      if (!Promise::Resolver::New(bctx).ToLocal(&gp_res)) {
+        green->ThrowException(v8::Exception::Error(
+            String::NewFromUtf8(green,
+                "green_threads: cannot create green promise resolver",
+                v8::NewStringType::kNormal).ToLocalChecked()));
+        args.GetReturnValue().SetUndefined();
+        return;
+      }
+      Local<Promise> gp = gp_res->GetPromise();
+      Local<Promise> emb_p = Local<Promise>::Cast(result);
+      const bool is_async = (g_green_driving_body != nullptr);
+      if (!is_async) {
+        // No body driving -- cannot suspend an await on GP. Fail clearly rather
+        // than silently drop the async result.
+        Local<Value> e = v8::Exception::Error(String::NewFromUtf8(
+            green, "green_threads: async bridge called without a driving body",
+            v8::NewStringType::kNormal).ToLocalChecked());
+        green->ThrowException(e);
+        args.GetReturnValue().SetUndefined();
+        return;
+      }
+      GreenCallData* data = g_green_driving_body;
+      vi::GreenScheduler* sched = g_async_drive_scheduler;
+      auto make_react = [&](bool is_err) {
+        GreenEmbReact* r = new GreenEmbReact();
+        r->data = data;
+        r->sched = sched;
+        r->is_error = is_err;
+        r->green_ctx_p.Reset(green, bctx);
+        r->gp_res_p.Reset(green, gp_res);
+        return r;
+      };
+      GreenEmbReact* ful = make_react(false);
+      GreenEmbReact* rej = make_react(true);
+      Local<v8::External> ef = v8::External::New(green, ful);
+      Local<v8::External> er = v8::External::New(green, rej);
+      Local<Function> fulfillFn =
+          Function::New(emb_ctx, GreenEmbPromiseReaction, ef).ToLocalChecked();
+      Local<Function> rejectFn =
+          Function::New(emb_ctx, GreenEmbPromiseReaction, er).ToLocalChecked();
+      (void)emb_p->Then(emb_ctx, fulfillFn, rejectFn).ToLocalChecked();
+      data->pending_emb.push_back(
+          std::unique_ptr<GreenEmbReact>(ful));
+      data->pending_emb.push_back(
+          std::unique_ptr<GreenEmbReact>(rej));
+      args.GetReturnValue().Set(gp);
+      return;
+    }
+
+    // Sync result: marshal emb -> green within a green scope, then return it.
+    Local<Value> gres;
+    {
+      GreenValueCopier copier{emb, green};
+      auto cp = CopyValueAcross(copier, result);
+      v8::Isolate::Scope green_scope(green);
+      HandleScope green_hs(green);
+      gres = Local<Value>::New(green, *cp);
+    }
+    args.GetReturnValue().Set(gres);
+    return;
+  }
+}
+
+// Wrap an embedding-isolate value into a green proxy so a green body sees a
+// working Node API. Functions become GreenBridgeMethod-backed green functions
+// (each call round-trips through the embedding isolate); plain objects recurse
+// (so nested namespaces like fs.promises.readFile resolve lazily); everything
+// else (strings/numbers/arrays/primitive objects) copies via CopyValueAcross.
+// `receiver` is the embedding object `v` is a property of and is used as `this`
+// when `v` is a function.
+static Local<Value> GreenEmbWrapValue(Isolate* green, Local<Context> gctx,
+                                      Isolate* emb, Local<Context> emb_ctx,
+                                      Local<Value> v, Local<Value> receiver) {
+  // One green HandleScope roots every handle created in this call and in any
+  // recursion below (including the green proxies returned), so nested results
+  // survive until they are Set into their parent object.
+  HandleScope top(green);
+  v8::Isolate::Scope green_iso(green);
+  v8::Context::Scope gc(gctx);
+  if (v->IsFunction()) {
+    GreenBridgeMethod* m = new GreenBridgeMethod();
+    {
+      v8::Isolate::Scope emb_iso(emb);
+      HandleScope ehe(emb);
+      v8::Context::Scope ecs(emb_ctx);
+      m->method_p.Reset(emb, v);
+      m->receiver_p.Reset(emb, receiver);
+    }
+    Local<v8::External> ext = v8::External::New(green, m);
+    return v8::FunctionTemplate::New(green, GreenBridgeMethodCallback, ext)
+        ->GetFunction(gctx).ToLocalChecked();
+  }
+  // Plain JS object: enumerate on emb, wrapping each child and building the
+  // green object. A method child uses `v` as `this`; a nested object child is
+  // wrapped recursively so its own methods use itself as `this`.
+  if (v->IsObject() && !v->IsArray() && !v->IsDate() && !v->IsRegExp() &&
+      !v->IsMap() && !v->IsSet() && !v->IsTypedArray() &&
+      !v->IsArrayBuffer() && !v->IsPromise()) {
+    Local<Object> gobj = Object::New(green);
+    {
+      v8::Isolate::Scope emb_iso(emb);
+      HandleScope ehe(emb);
+      v8::Context::Scope ecs(emb_ctx);
+      Local<Object> vobj = v.As<Object>();
+      Local<Array> keys = Local<Array>::Cast(
+          vobj->GetPropertyNames(emb_ctx)
+              .ToLocalChecked());
+      for (uint32_t i = 0; i < keys->Length(); i++) {
+        Local<String> key =
+            Local<String>::Cast(keys->Get(emb_ctx, i).ToLocalChecked());
+        Local<Value> child = vobj->Get(emb_ctx, key).ToLocalChecked();
+        Local<Value> wrapped;
+        if (child->IsFunction()) {
+          wrapped = GreenEmbWrapValue(green, gctx, emb, emb_ctx, child, v);
+        } else if (child->IsObject() && !child->IsArray() &&
+                   !child->IsDate() && !child->IsRegExp() && !child->IsMap() &&
+                   !child->IsSet() && !child->IsTypedArray() &&
+                   !child->IsArrayBuffer() && !child->IsPromise()) {
+          wrapped = GreenEmbWrapValue(green, gctx, emb, emb_ctx, child, child);
+        } else {
+          GreenValueCopier copier;
+          copier.src = emb;
+          copier.dst = green;
+          auto p = CopyValueAcross(copier, child);
+          v8::Isolate::Scope green_scope(green);
+          wrapped = Local<Value>::New(green, *p);
+        }
+        gobj->Set(gctx, key, wrapped).Check();
+      }
+    }
+    return gobj;
+  }
+  // Non-function value: copy to green.
+  GreenValueCopier copier;
+  copier.src = emb;
+  copier.dst = green;
+  auto p = CopyValueAcross(copier, v);
+  v8::Isolate::Scope green_scope(green);
+  return Local<Value>::New(green, *p);
+}
+
+// Green global `require(specifier)`: load a Node module on the embedding realm
+// (via the captured process.mainModule.require) and return its exports wrapped
+// as a green proxy. Marshals errors back to green so the body sees the real
+// exception.
+static void GreenBridgeRequire(const FunctionCallbackInfo<Value>& args) {
+  Isolate* green = args.GetIsolate();
+  HandleScope hs(green);
+  Local<Context> gctx = green->GetCurrentContext();
+
+  std::string name;
+  if (args[0]->IsString()) {
+    v8::String::Utf8Value u(green, args[0]);
+    name.assign(*u, u.length());
+  } else {
+    args.GetReturnValue().Set(
+        v8::Exception::TypeError(
+            String::NewFromUtf8(green,
+                "green_threads.require(specifier): specifier must be a string",
+                v8::NewStringType::kNormal).ToLocalChecked()));
+    return;
+  }
+
+  Isolate* emb = g_green_emb_loader_isolate;
+  if (emb == nullptr || g_green_emb_loader_p.IsEmpty()) {
+    GreenCaptureEmbLoader(emb ? emb : green, green->GetCurrentContext());
+    if (emb == nullptr || g_green_emb_loader_p.IsEmpty()) {
+      args.GetReturnValue().Set(v8::Exception::Error(String::NewFromUtf8(
+          green, "green_threads.require: embedding loader unavailable",
+          v8::NewStringType::kNormal).ToLocalChecked()));
+      return;
+    }
+    emb = g_green_emb_loader_isolate;
+  }
+  Local<Context> emb_ctx = Local<Context>::New(emb, g_green_emb_ctx_p);
+
+  Local<Value> mod;
+  v8::TryCatch tc(emb);
+  {
+    v8::Isolate::Scope iso_scope(emb);
+    HandleScope he(emb);
+    v8::Context::Scope ecs(emb_ctx);
+    Local<Function> loader =
+        Local<Function>::Cast(Local<Value>::New(emb, g_green_emb_loader_p));
+    Local<String> nameLocal = String::NewFromUtf8(
+        emb, name.c_str(), v8::NewStringType::kNormal).ToLocalChecked();
+    Local<Value> argv[1] = {nameLocal};
+    if (!loader->Call(emb_ctx, emb_ctx->Global(), 1, argv).ToLocal(&mod)) {
+      Local<Value> exc = tc.HasCaught() ? tc.Exception() : v8::Undefined(emb);
+      {
+        GreenValueCopier copier{emb, green};
+        auto ep = CopyValueAcross(copier, exc);
+        v8::Isolate::Scope green_scope(green);
+        green->ThrowException(Local<Value>::New(green, *ep));
+        args.GetReturnValue().SetUndefined();
+        return;
+      }
+    }
+  }
+
+  args.GetReturnValue().Set(
+      GreenEmbWrapValue(green, gctx, emb, emb_ctx, mod, mod));
+}
+
 // Set (per-OS-thread) while a green body executes inside GreenJSEntry, so the
 // crash diagnostic can tell a body run (green isolate) apart from embedding-
 // isolate bookkeeping that might read a shared object. Declared here rather
 // than inline to avoid capturing state across the C call.
 static thread_local bool g_in_green_body = false;
-// Per-OS-thread pointer to the green-async body whose continuation is currently
-// being driven on this thread. GreenGtRead installs each read here so the body's
-// owning worker can find and resolve it in the body's own queue. Set by the
-// embedding setup thread around a body's first await and by each drive worker
-// around that body's continuations; thread-local so distinct workers never
-// clobber each other's target.
-static thread_local GreenCallData* g_green_driving_body = nullptr;
-
-// Process-global pointer to the ONE shared GreenScheduler that drives the
-// green-async body pool (created by RunTasks and live for the whole spawnAll).
-// A green-async body's gtRead submits its read against this scheduler and its
-// completion (a libuv pool thread) reactivates the body through it, so the
-// drive worker can park until the I/O finishes. It is a plain (not thread-local)
-// global on purpose: the embedding setup thread, every spawned drive worker, and
-// GT_TRUE_PARALLEL's warm-up all read the same stable value for the run --
-// GreenIoExecute needs no global at all, since it reactivates via the per-read
-// owner pointer captured at submission.
-static vi::GreenScheduler* g_async_drive_scheduler = nullptr;
 
 static Isolate* GetGreenIsolate(Isolate* embedding) {
   if (g_green_isolate != nullptr) return g_green_isolate;
@@ -804,12 +1183,6 @@ static Local<Value> GreenRebuild(Isolate* dst, const GreenIR* ir, Local<Context>
   }
   return Undefined(dst);
 }
-
-struct GreenValueCopier {
-  Isolate* src;  // Isolate the source handle lives on.
-  Isolate* dst;  // Isolate to rebuild the value on.
-};
-
 // Retrieve (creating it if necessary) the context to read a value on the given
 // isolate. In shared-heap mode the green isolate owns a green context; other
 // isolates use their current context. NOTE: this returns a handle only -- it
@@ -1235,12 +1608,13 @@ static void GreenIoComplete(uv_work_t* req, int status) {
     // raced with that pool reference (SIGSEGV worker(arg=0x0) on the pool).
     // Defer the free until consumed so a completion pumped before its driver
     // drained it does not free a read the driver still has to resolve.
+    //
+    // P1 (single-loop pump): freeing runs on the dedicated libuv pump thread,
+    // concurrently with the drive workers' green JS. buf is malloc'd and w is a
+    // plain heap struct -- neither touches the green heap, so the green-isolate
+    // Persistent reset moved to the driver (it Resolves, then Resets, here). Only
+    // race-free free/delete remain, so this is safe off the drive workers' lock.
     if (!w->consumed.load(std::memory_order_acquire)) return;
-    {
-      v8::Isolate::Scope iso_scope(g_green_isolate);
-      v8::HandleScope hs(g_green_isolate);
-      w->green_resolver_p.Reset();
-    }
     ::free(w->buf);
     delete w;
     return;
@@ -1333,6 +1707,17 @@ static void InstallGreenAsyncGlobals(Local<Context> green_ctx) {
   Local<String> key = String::NewFromUtf8(
       g_green_isolate, "gtRead", v8::NewStringType::kNormal).ToLocalChecked();
   green_ctx->Global()->Set(green_ctx, key, gt).Check();
+  // Green `require(name)`: load a Node module on the embedding realm and return
+  // its exports as a green proxy, so a green async body can `require('node:*')`.
+  {
+    Local<Function> req =
+        FunctionTemplate::New(g_green_isolate, GreenBridgeRequire)
+            ->GetFunction(green_ctx)
+            .ToLocalChecked();
+    Local<String> req_key = String::NewFromUtf8(
+        g_green_isolate, "require", v8::NewStringType::kNormal).ToLocalChecked();
+    green_ctx->Global()->Set(green_ctx, req_key, req).Check();
+  }
 }
 
 // The reaction chained onto the green-async body promise (installed as BOTH the
@@ -1677,8 +2062,53 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
             }
           }
           rd->consumed.store(true, std::memory_order_release);
+          // P1: the driver owns the green resolver Persistent (GreenIoComplete no
+          // longer touches green-isolate state), so release it here after resolving.
+          rd->green_resolver_p.Reset();
           progressed = true;
         }
+
+        // Resolve bridged emb-Promise settles: GreenEmbPromiseReaction (running
+        // on the embedding realm) set emb_settled and Reactivated this worker.
+        // Drain settled entries and resolve the body's awaited GP with the emb
+        // settle value (marshaled emb->green), mirroring the gtRead
+        // resolve-then-checkpoint pattern so the body's await continuation runs
+        // at the PerformCheckpoint below.
+        {
+          std::vector<std::unique_ptr<GreenEmbReact>> kept;
+          std::vector<GreenEmbReact*> done;
+          for (auto& re : d->pending_emb)
+            if (re->emb_settled.load(std::memory_order_acquire))
+              done.push_back(re.release());
+            else
+              kept.push_back(std::move(re));
+          d->pending_emb.swap(kept);
+          if (!done.empty()) {
+            Isolate* emb = d->caller_isolate;
+            GreenValueCopier copier;
+            copier.src = emb;
+            copier.dst = green;
+            for (auto re : done) {
+              Local<Promise::Resolver> res =
+                  Local<Promise::Resolver>::New(green, re->gp_res_p);
+              Local<Value> emb_val = Local<Value>::New(emb, re->settle_val_p);
+              auto p = CopyValueAcross(copier, emb_val);
+              {
+                Local<Context> rctx =
+                    Local<Context>::New(green, d->context_p);
+                Context::Scope cs(rctx);
+                Local<Value> gval = Local<Value>::New(green, *p);
+                if (re->is_error)
+                  res->Reject(rctx, gval);
+                else
+                  res->Resolve(rctx, gval);
+              }
+              progressed = true;
+              delete re;
+            }
+          }
+        }
+
 
         // Resume continuations now enqueued in THIS body's own queue and run
         // them under the SAME lock. The microtask execution (PerformCheckpoint)
@@ -1692,14 +2122,12 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
         v8::Local<v8::Context> bctx2 =
             v8::Local<v8::Context>::New(green, d->context_p);
         bctx2->GetMicrotaskQueue()->PerformCheckpoint(green);
-        // Drain libuv completion callbacks so each finished read's GreenIoWork is
-        // freed at its race-free after-callback point (see GreenIoComplete). The
-        // pool worker still references w until it queues the completion; GreenIoComplete
-        // runs only then -- on this drive-worker thread -- so freeing is race-free.
-        // Pumped non-blocking (UV_RUN_NOWAIT) and under g_green_mutator_lock:
-        // GreenIOLoop is a single shared loop that libuv only tolerates one uv_run()
-        // caller at a time.
-        uv_run(GreenIOLoop(), UV_RUN_NOWAIT);
+        // The just-enqueued reads are picked up by the libuv thread pool; their
+        // completion callbacks (GreenIoComplete) drain on the dedicated pump
+        // thread (P1), not here, so this worker never calls uv_run. The reads
+        // already have finished+consumed set by the driver's resolve loop above, so
+        // the pump's free is race-free. g_green_driving_body stays pinned to this
+        // body's descriptor while its continuation runs (see the top comment).
         g_green_driving_body = prior_driving;
 
         // Mark settled once the body promise leaves kPending; its reaction then
@@ -1729,7 +2157,7 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
           // call Reactivate for it); block only bodies parked on real I/O, so a
           // genuinely starved body keeps the idle counter spinning to the safety
           // bound instead of parking on a CV that never fires.
-          if (d->pending_reads.empty()) { any_starved = true; continue; }
+          if (d->pending_reads.empty() && d->pending_emb.empty()) { any_starved = true; continue; }
           if (d->gt != nullptr && sched != nullptr)
             sched->BlockGreenThread(d->gt);
         }
@@ -1747,6 +2175,11 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
             if (d->async_settled) continue;
             for (auto& rd : d->pending_reads)
               if (rd->finished.load(std::memory_order_acquire)) return true;
+            // A bridged emb-Promise may have settled (its reaction set
+            // emb_settled + Reactivated); include it so this worker
+            // self-wakes even if the Reactivate notify was drained elsewhere.
+            for (auto& re : d->pending_emb)
+              if (re->emb_settled.load(std::memory_order_acquire)) return true;
           }
           return false;
         };
@@ -1756,9 +2189,36 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
     }
   };
 
+  // P1: dedicated libuv pump thread. The single shared GreenIOLoop must be pumped
+  // by exactly one caller (libuv rule), but that caller must NOT be each drive
+  // worker serialized on g_green_mutator_lock (that was the async ceiling). One
+  // pump thread owns uv_run(GreenIOLoop()) for the whole drive and drains every
+  // completion callback -- GreenIoComplete now only frees malloc'd buf + the plain
+  // GreenIoWork (no green-isolate dynamic state), so it is safe on the pump
+  // concurrently with the workers' green JS. Workers keep uv_queue_work (thread-
+  // safe) to submit reads, then park until Reactivate; the pump frees the completed
+  // reads. UV_RUN_DEFAULT makes it block idle instead of spinning.
+  std::atomic<bool> pump_stop{false};
+  std::thread pump;
+  {
+    uv_loop_t* pump_loop = GreenIOLoop();
+    pump = std::thread([pump_loop, &pump_stop]() {
+      while (!pump_stop.load(std::memory_order_acquire))
+        uv_run(pump_loop, UV_RUN_DEFAULT);
+    });
+  }
+
   for (int i = 0; i < num_workers; i++)
     workers.emplace_back(run_partition, std::move(partitions[i]));
   for (std::thread& w : workers) w.join();
+
+  // Release the pump cleanly: its final UV_RUN_DEFAULT drains + frees every
+  // completion callback already queued (all reads are consumed once the workers
+  // joined), then it sees pump_stop and exits. Only ever one uv_run at a time --
+  // no main-thread pump, no uv_stop (which would discard a pending free instead of
+  // running it).
+  pump_stop.store(true, std::memory_order_release);
+  if (pump.joinable()) pump.join();
 
   return true;
 }
@@ -3640,6 +4100,16 @@ static void InstallGreenGlobalsShell(Local<Context> green_ctx) {
   set_global("g", g_shell);
   set_global("green_threads", g_shell);
   set_global("gt", g_shell);
+  // Green `require(name)` global (sync bodies share this context). Async bodies
+  // also get it via InstallGreenAsyncGlobals. Loads a Node module on the
+  // embedding realm and returns its exports as a green proxy.
+  {
+    Local<Function> req =
+        FunctionTemplate::New(g_green_isolate, GreenBridgeRequire)
+            ->GetFunction(green_ctx)
+            .ToLocalChecked();
+    set_global("require", req);
+  }
   // Green shims for the Node namespaces bodies commonly capture that carry native
   // methods (performance, assert). Without these a body using, say,
   // `assert.notEqual(...)` would hit "assert is not defined". Built as plain

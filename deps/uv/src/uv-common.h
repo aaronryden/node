@@ -241,18 +241,26 @@ void uv__signal_cleanup(void);
 void uv__threadpool_cleanup(void);
 
 #define uv__has_active_reqs(loop)                                             \
-  ((loop)->active_reqs.count > 0)
+  (__atomic_load_n(&((loop)->active_reqs.count), __ATOMIC_ACQUIRE) > 0)
 
 #define uv__req_register(loop)                                                \
   do {                                                                        \
-    (loop)->active_reqs.count++;                                              \
+    /* Atomic: uv_queue_work is called from many driver/worker threads at once, \
+     * and the matching uv__req_unregister happens on the libuv thread-pool     \
+     * completion thread -- two unrelated threads touching one non-static        \
+     * counter. A plain ++/-- lost updates (uv.h active_reqs.count is an         \
+     * unsigned int, never std::atomic) so a fast drain can read 0 and the       \
+     * unregister assert (uv__has_active_reqs) fires. Clang __atomic_* builtins   \
+     * are always available (arm64/x86-64) with no header. Keeps the counter      \
+     * consistent for the whole runtime, not just green threads. */              \
+    __atomic_fetch_add(&((loop)->active_reqs.count), 1u, __ATOMIC_ACQ_REL);      \
   }                                                                           \
   while (0)
 
 #define uv__req_unregister(loop)                                              \
   do {                                                                        \
     assert(uv__has_active_reqs(loop));                                        \
-    (loop)->active_reqs.count--;                                              \
+    __atomic_fetch_sub(&((loop)->active_reqs.count), 1u, __ATOMIC_ACQ_REL);    \
   }                                                                           \
   while (0)
 

@@ -389,6 +389,16 @@ GreenThread* GreenScheduler::DequeueGlobal() {
 
 void GreenScheduler::BlockGreenThread(GreenThread* gt) {
   std::lock_guard<std::mutex> lk(react_mutex_);
+  // Idempotency guard: a green thread must appear in blocked_list_ AT MOST ONCE.
+  // Two consecutive Block()s without an intervening Drain (which unlinks it and
+  // sets kRunnable) happen under the shared scheduler when one worker parks body
+  // d while another worker already drained d's prior Reactivate. Head-inserting
+  // an already-blocked gt makes blocked_list_head_ == gt with gt->blocked_next()
+  // == gt (a self-cycle); every later DrainReactivations scan for a *different*
+  // node then loops forever on the self-cycle, holding react_mutex_ and starving
+  // the pool threads' ReactivateGreenThread + the other workers. GT_NUM_WORKERS
+  // >= 2 async-drive hang 100% in DrainReactivations from exactly this.
+  if (gt->state() == GreenThreadState::kBlocked) return;
   // Stamp the body's architectural registers so a GC root visit during the
   // parked window sees its live state (mirrors the register save in Yield).
   // No-op for a green-async descriptor (processor()==0): it holds no arch stack,
@@ -427,14 +437,21 @@ void GreenScheduler::ReactivateGreenThread(GreenThread* gt) {
 // queue. Worker thread only. Returns true if at least one body was reactivated.
 bool GreenScheduler::DrainReactivations() {
   std::vector<GreenThread*> reactivated;
-  {
-    std::lock_guard<std::mutex> lk(react_mutex_);
-    while (!react_queue_.empty()) {
-      GreenThread* r = react_queue_.front();
-      react_queue_.pop_front();
-      r->set_react_pending(false);  // gate so Reactivate cannot re-add it
-      reactivated.push_back(r);
-    }
+  // Hold react_mutex_ for the ENTIRE function -- react_queue drain AND the
+  // blocked_list_ unlink -- so every blocked_list_ mutation stays serialized
+  // with BlockGreenThread (which inserts to blocked_list_ under this same mutex).
+  // Without this, N drive workers unlink concurrently while a pool-thread
+  // Reactivate or a Block inserts, corrupting the unguarded doubly-linked list
+  // (cyclic/dangling -> the search scan below loops forever). Under GT_NUM_WORKERS
+  // >= 2 the async-drive loop would hang 100% in DrainReactivations.
+  // Reactivate/Block only touch react_queue_ and blocked_list_ (no nested locks),
+  // so holding this one mutex across the scan cannot deadlock.
+  std::lock_guard<std::mutex> lk(react_mutex_);
+  while (!react_queue_.empty()) {
+    GreenThread* r = react_queue_.front();
+    react_queue_.pop_front();
+    r->set_react_pending(false);  // gate so Reactivate cannot re-add it
+    reactivated.push_back(r);
   }
   for (GreenThread* r : reactivated) {
     // Unlink from the (mutex-guarded) blocked list. Track the previous node
@@ -442,7 +459,13 @@ bool GreenScheduler::DrainReactivations() {
     // address of the link slot); set_blocked_next is the muting accessor.
     GreenThread* prev = nullptr;
     GreenThread* node = blocked_list_head_;
+    // Walk the blocked list looking for r. The list is an invariant acyclic
+    // doubly-linked list guarded by react_mutex_ (Block head-inserts, Drain
+    // unlinks); guard the scan against a cycle regardless, so a stray corrupt
+    // link cannot pin this thread (and the mutex) in an endless walk. If the
+    // walk revisits the head after the first step, the list has cycled: stop.
     while (node != nullptr && node != r) {
+      if (prev != nullptr && node == blocked_list_head_) break;
       prev = node;
       node = node->blocked_next();
     }
