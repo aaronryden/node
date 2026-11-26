@@ -2061,10 +2061,17 @@ static bool DriveGreenAsyncBodiesParallel(Isolate* green,
                                       .ToLocalChecked());
             }
           }
-          rd->consumed.store(true, std::memory_order_release);
-          // P1: the driver owns the green resolver Persistent (GreenIoComplete no
-          // longer touches green-isolate state), so release it here after resolving.
+          // Release the green resolver root BEFORE publishing `consumed`: the pump
+          // (GreenIoComplete, libuv uv_run thread) frees w the instant it observes
+          // consumed=true (scheduler.cc:1617). Publishing consumed first would open a
+          // window where the pump deletes rd while the driver is still touching
+          // rd->green_resolver_p above -- a use-after-free. Once consumed=true the
+          // driver must never touch rd again; the resolver `res` Local created at
+          // :2047 is already rooted in an enclosing HandleScope, so Reset() here is
+          // safe (it empties the Persistent but does not free the still-rooted
+          // Resolver).
           rd->green_resolver_p.Reset();
+          rd->consumed.store(true, std::memory_order_release);
           progressed = true;
         }
 
