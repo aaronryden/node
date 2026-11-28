@@ -126,58 +126,6 @@ void M2ForceGC(v8::Isolate* green_isolate, M2ForcedGCMode mode);
 void GreenEnterAlwaysAllocation(v8::Isolate* green_isolate);
 void GreenLeaveAlwaysAllocation(v8::Isolate* green_isolate);
 
-// Debug-only snapshot of the executing OS thread's green-thread execution-state
-// context (reads the per-worker ThreadLocalTop block). Fields: `is_green` =
-// whether the isolate is in green_thread_mode_; `main_iso` = the shared
-// main-thread LocalIsolate; `main_heap` = the shared main-thread LocalHeap;
-// `tblock` = this thread's ThreadLocalTop block. Lets an embedding-thread run
-// (warmup) and a worker run be compared A/B on the very execution-state base a
-// misaligned read points back to. Declared here (not in green_threads.cc) only
-// because it needs the full vi::Isolate type, which is kept out of green_threads.cc
-// to avoid V8's tracing/trace-event.h colliding with node's tracing/trace_event.h.
-struct GTDebugCtx {
-  bool is_green;
-  void* main_iso;
-  void* main_heap;
-  void* tblock;
-};
-GTDebugCtx GTGreenThreadDebugCtx(v8::Isolate* iso);
-
-// The current isolate for the executing OS thread (vi::Isolate::TryGetCurrent),
-// or null. Declared here (not in green_threads.cc) because it needs the full
-// vi::Isolate type; lets GreenJSEntry confirm the body runs on data->isolate
-// (green) rather than some other isolate.
-void* GTGreenThreadCurrentIsolate();
-
-// Rich execution-state snapshot for the executing OS thread: current isolate
-// (TryGetCurrent), whether it is a green-thread isolate, the current
-// PerIsolateThreadData and the isolate it is bound to (and whether that binding
-// is green), the thread-local-top base, and whether that base is the central
-// IsolateData block (is_central) rather than the per-worker block. Lets GreenJSEntry
-// confirm the body executes on the green isolate's per-worker execution state
-// instead of the central/embedding block.
-struct GTExecSnap {
-  void* cur_iso;  // vi::Isolate::TryGetCurrent()
-  int cur_green;  // cur_iso != null && cur_iso->is_green_thread_mode()
-  void* cur_ptd;  // cur_iso ? cur_iso->CurrentPerIsolateThreadData() : null
-  void* ptd_iso;  // cur_ptd ? cur_ptd->isolate() : null
-  int ptd_green;  // ptd_iso != null && ptd_iso->is_green_thread_mode()
-  void* tlt;  // cur_iso ? cur_iso->thread_local_top() : null
-  int central;  // tlt points at the central IsolateData thread_local_top_
-};
-GTExecSnap GTGreenThreadExecSnapshot();
-
-// Env-gated (GT_GT_DUMP) snapshot of the executing OS thread's ThreadLocalTop
-// entry-state -- the fields a Maglev body reads on first JS entry (c_entry_fp_,
-// context_, topmost_script_having_context_, exception_, handler_, js_entry_sp_,
-// central/secondary stack limits, is_on_central_stack_flag_) plus this isolate's
-// root register base (isolate_root()) and young-gen heap top. Lets the warmup
-// (central) block and a fresh per-worker ExecutionState block be compared A/B in
-// ONE run -- which is exactly what exposes why a shared-heap worker body that
-// allocates + keyed-stores crashes while the identical warmup run does not.
-// Declared here (not green_threads.cc) because it reads vi::Isolate /
-// vi::ThreadLocalTop internals.
-void GTGreenThreadEntryDump(v8::Isolate* iso);
 }  // namespace node
 
 #endif  // GREEN_THREADS_GC_H_
